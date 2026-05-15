@@ -129,6 +129,10 @@ def build_overlay(lat, lon):
             g.write(line)
         elif "NETWORK_DEF" in line:
             g.write(line)
+        elif "OBJECT_DEF" in line:
+            g.write(line)
+        elif "STRING_DEF" in line:
+            g.write(line)
         elif "BEGIN_POLYGON" in line:
             if not exclude_set_updated:
                 tmp = set()
@@ -156,6 +160,16 @@ def build_overlay(lat, lon):
             else:
                 while line and ("END_POLYGON" not in line):
                     line = f.readline()
+        elif "BEGIN_OBJECT" in line:
+            while line and ("END_OBJECT" not in line):
+                g.write(line)
+                line = f.readline()
+            g.write(line)
+        elif "BEGIN_STRING" in line:
+            while line and ("END_STRING" not in line):
+                g.write(line)
+                line = f.readline()
+            g.write(line)
         elif "BEGIN_SEGMENT" in line:
             road_type = int(line.split()[2])
             if (
