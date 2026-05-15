@@ -785,25 +785,68 @@ def sort_mesh(tile):
     if not os.path.isfile(mesh_file):
         UI.exit_message_and_bottom_line("\nERROR: Could not find ", mesh_file)
         return 0
-    sort_mesh_cmd_list = [
-        sort_mesh_cmd.strip(),
-        str(tile.default_zl),
-        mesh_file,
-    ]
-    UI.vprint(1, "-> Reorganizing mesh triangles.")
+    
+    UI.vprint(1, "-> Reorganizing mesh triangles (Native Python/NumPy).")
     timer = time.time()
-    moulinette = subprocess.Popen(
-        sort_mesh_cmd_list, stdout=subprocess.PIPE, bufsize=0
-    )
-    while True:
-        line = moulinette.stdout.readline()
-        if not line:
-            break
-        else:
-            print(line.decode("utf-8")[:-1])
+    
+    try:
+        with open(mesh_file, "r") as f:
+            lines = f.readlines()
+        
+        header = lines[:4]
+        ptr = 4
+        
+        # Nodes
+        nbr_nodes = int(lines[ptr].split()[0])
+        ptr += 1
+        nodes_data = numpy.array([l.split()[:4] for l in lines[ptr:ptr+nbr_nodes]])
+        ptr += nbr_nodes
+        
+        # Node attributes skip
+        ptr += 3
+        
+        # UVs
+        nbr_uvs = int(lines[ptr].split()[0])
+        ptr += 1
+        uvs_data = numpy.array([l.split()[:3] for l in lines[ptr:ptr+nbr_uvs]])
+        ptr += nbr_uvs
+        
+        # Mid-file headers skip
+        ptr += 2
+        
+        # Triangles
+        nbr_tris = int(lines[ptr].split()[0])
+        ptr += 1
+        # tris_data: ID, v1, v2, v3, attr
+        tris_data = numpy.array([l.split()[:5] for l in lines[ptr:ptr+nbr_tris]], dtype=int)
+        
+        # Sort triangles by attribute (column index 4)
+        sorted_indices = numpy.argsort(tris_data[:, 4])
+        sorted_tris = tris_data[sorted_indices]
+        
+        # Write back
+        with open(mesh_file, "w") as f:
+            f.writelines(header)
+            f.write(f"{nbr_nodes} 0\n")
+            # Preserve original node lines
+            for i in range(nbr_nodes):
+                f.write(" ".join(nodes_data[i]) + "\n")
+            f.write("0\n0\n0\n")
+            f.write(f"{nbr_uvs} 0\n")
+            for i in range(nbr_uvs):
+                f.write(" ".join(uvs_data[i]) + "\n")
+            f.write("\n\n")
+            f.write(f"{nbr_tris} 0\n")
+            for i in range(nbr_tris):
+                f.write(f"{i+1} {sorted_tris[i,1]} {sorted_tris[i,2]} {sorted_tris[i,3]} {sorted_tris[i,4]}\n")
+            
+    except Exception as e:
+        UI.vprint(1, f"   WARNING: Native sorting failed ({e}), skipping. Scenery might be slightly larger.")
+        return 0
+
     UI.timings_and_bottom_line(timer)
     UI.logprint(
-        "Moulinette applied for tile lat=",
+        "Native Python Moulinette applied for tile lat=",
         tile.lat,
         ", lon=",
         tile.lon,

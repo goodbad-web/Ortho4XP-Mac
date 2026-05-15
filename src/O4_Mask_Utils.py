@@ -430,216 +430,82 @@ def record_water_tris(tile):
     UI.vprint(1, "-> Reading mesh data")
     for mesh_file_name in mesh_list:
         try:
-            f_mesh = open(mesh_file_name, "r")
             UI.vprint(1, "   * ", mesh_file_name)
-        except:
-            UI.lvprint(
-                1, "Mesh file ", mesh_file_name, " could not be read. Skipped."
-            )
+            with open(mesh_file_name, "r") as f:
+                lines = f.readlines()
+            
+            mesh_version = float(lines[0].strip().split()[-1])
+            has_water = 7 if mesh_version >= 1.3 else 3
+            
+            ptr = 4
+            nbr_pt_in = int(lines[ptr].split()[0])
+            ptr += 1
+            # Skip ID column (index 0)
+            pt_in = numpy.array([l.split()[:3] for l in lines[ptr:ptr+nbr_pt_in]], dtype=float)
+            # Original ID is index 0, so coordinates are index 1 and 2
+            ptr += nbr_pt_in
+            
+            # Skip UV headers and data
+            ptr += 3
+            nbr_uvs = int(lines[ptr].split()[0])
+            ptr += 1 + nbr_uvs + 2
+            
+            nbr_tri_in = int(lines[ptr].split()[0])
+            ptr += 1
+            tri_data = numpy.array([l.split()[:5] for l in lines[ptr:ptr+nbr_tri_in]], dtype=int)
+            # tri_data: ID, v1, v2, v3, attr
+        except Exception as e:
+            UI.lvprint(1, f"Mesh file {mesh_file_name} could not be read ({e}). Skipped.")
             continue
-        mesh_version = float(f_mesh.readline().strip().split()[-1])
-        has_water = 7 if mesh_version >= 1.3 else 3
-        for i in range(3):
-            f_mesh.readline()
-        nbr_pt_in = int(f_mesh.readline())
-        pt_in = numpy.zeros(5 * nbr_pt_in, "float")
-        for i in range(0, nbr_pt_in):
-            pt_in[5 * i : 5 * i + 3] = [
-                float(x) for x in f_mesh.readline().split()[:3]
-            ]
-        for i in range(0, 3):
-            f_mesh.readline()
-        for i in range(0, nbr_pt_in):
-            pt_in[5 * i + 3 : 5 * i + 5] = [
-                float(x) for x in f_mesh.readline().split()[:2]
-            ]
-        for i in range(0, 2):  # skip 2 lines
-            f_mesh.readline()
-        nbr_tri_in = int(f_mesh.readline())  # read nbr of tris
-        step_stones = nbr_tri_in // 100
-        percent = -1
-        UI.vprint(
-            2,
-            " Attribution process of masks buffers to water triangles for "
-            + str(mesh_file_name)
-            + ".",
-        )
-        for i in range(0, nbr_tri_in):
-            if i % step_stones == 0:
-                percent += 1
-                UI.progress_bar(1, int(percent * 5 / 10))
-                if UI.red_flag:
-                    UI.exit_message_and_bottom_line()
-                    return 0
-            (n1, n2, n3, tri_type) = [
-                int(x) - 1 for x in f_mesh.readline().split()[:4]
-            ]
-            tri_type += 1
-            if (
-                (not tri_type)
-                or (not (tri_type & has_water))
-                or (
-                    (tri_type & has_water) < 2 and not tile.use_masks_for_inland
-                )
-            ):
-                continue
-            (lon1, lat1) = pt_in[5 * n1 : 5 * n1 + 2]
-            (lon2, lat2) = pt_in[5 * n2 : 5 * n2 + 2]
-            (lon3, lat3) = pt_in[5 * n3 : 5 * n3 + 2]
+
+        # Vectorized water triangle detection
+        # tri_data: ID, v1, v2, v3, attr
+        # attributes are at index 4, add 1 to match original logic
+        attrs = tri_data[:, 4] + 1
+        mask_tris = (attrs & has_water) > 0
+        if not tile.use_masks_for_inland:
+            mask_tris &= (attrs & has_water) >= 2
+        
+        water_indices = numpy.where(mask_tris)[0]
+        for i in water_indices:
+            # v1, v2, v3 are at indices 1, 2, 3. They are 1-based, so subtract 1.
+            n1, n2, n3 = tri_data[i, 1:4] - 1
+            lon1, lat1 = pt_in[n1, 1:3] # Coordinates are at index 1 and 2
+            lon2, lat2 = pt_in[n2, 1:3]
+            lon3, lat3 = pt_in[n3, 1:3]
             bary_lat = (lat1 + lat2 + lat3) / 3
             bary_lon = (lon1 + lon2 + lon3) / 3
-            (til_x, til_y) = GEO.wgs84_to_orthogrid(
-                bary_lat, bary_lon, tile.mask_zl
-            )
-            if (
-                til_x < til_x_min - 16
-                or til_x > til_x_max + 16
-                or til_y < til_y_min - 16
-                or til_y > til_y_max + 16
-            ):
+            (til_x, til_y) = GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mask_zl)
+            if (til_x < til_x_min - 16 or til_x > til_x_max + 16 or 
+                til_y < til_y_min - 16 or til_y > til_y_max + 16):
                 continue
-            (til_x2, til_y2) = GEO.wgs84_to_orthogrid(
-                bary_lat, bary_lon, tile.mask_zl + 2
-            )
+            
+            (til_x2, til_y2) = GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mask_zl + 2)
             a = (til_x2 // 16) % 4
             b = (til_y2 // 16) % 4
-            if (til_x, til_y) in dico_sea:
-                dico_sea[(til_x, til_y)].append(
-                    (lat1, lon1, lat2, lon2, lat3, lon3)
-                )
-            else:
-                dico_sea[(til_x, til_y)] = [
-                    (lat1, lon1, lat2, lon2, lat3, lon3)
-                ]
+            
+            target_dico = dico_sea if (attrs[i] & has_water) >= 2 or tile.use_masks_for_inland else dico_inland
+            
+            # Helper to add triangle to dico
+            def add_to_dico(tx, ty):
+                if (tx, ty) in target_dico:
+                    target_dico[(tx, ty)].append((lat1, lon1, lat2, lon2, lat3, lon3))
+                elif tx == til_x and ty == til_y:
+                    target_dico[(tx, ty)] = [(lat1, lon1, lat2, lon2, lat3, lon3)]
+
+            add_to_dico(til_x, til_y)
             if a == 0:
-                if (til_x - 16, til_y) in dico_sea:
-                    dico_sea[(til_x - 16, til_y)].append(
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    )
-                else:
-                    dico_sea[(til_x - 16, til_y)] = [
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    ]
-                if b == 0:
-                    if (til_x - 16, til_y - 16) in dico_sea:
-                        dico_sea[(til_x - 16, til_y - 16)].append(
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        )
-                    else:
-                        dico_sea[(til_x - 16, til_y - 16)] = [
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        ]
-                elif b == 3:
-                    if (til_x - 16, til_y + 16) in dico_sea:
-                        dico_sea[(til_x - 16, til_y + 16)].append(
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        )
-                    else:
-                        dico_sea[(til_x - 16, til_y + 16)] = [
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        ]
+                add_to_dico(til_x - 16, til_y)
+                if b == 0: add_to_dico(til_x - 16, til_y - 16)
+                elif b == 3: add_to_dico(til_x - 16, til_y + 16)
             elif a == 3:
-                if (til_x + 16, til_y) in dico_sea:
-                    dico_sea[(til_x + 16, til_y)].append(
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    )
-                else:
-                    dico_sea[(til_x + 16, til_y)] = [
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    ]
-                if b == 0:
-                    if (til_x + 16, til_y - 16) in dico_sea:
-                        dico_sea[(til_x + 16, til_y - 16)].append(
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        )
-                    else:
-                        dico_sea[(til_x + 16, til_y - 16)] = [
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        ]
-                elif b == 3:
-                    if (til_x + 16, til_y + 16) in dico_sea:
-                        dico_sea[(til_x + 16, til_y + 16)].append(
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        )
-                    else:
-                        dico_sea[(til_x + 16, til_y + 16)] = [
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        ]
+                add_to_dico(til_x + 16, til_y)
+                if b == 0: add_to_dico(til_x + 16, til_y - 16)
+                elif b == 3: add_to_dico(til_x + 16, til_y + 16)
             if b == 0:
-                if (til_x, til_y - 16) in dico_sea:
-                    dico_sea[(til_x, til_y - 16)].append(
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    )
-                else:
-                    dico_sea[(til_x, til_y - 16)] = [
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    ]
+                add_to_dico(til_x, til_y - 16)
             elif b == 3:
-                if (til_x, til_y + 16) in dico_sea:
-                    dico_sea[(til_x, til_y + 16)].append(
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    )
-                else:
-                    dico_sea[(til_x, til_y + 16)] = [
-                        (lat1, lon1, lat2, lon2, lat3, lon3)
-                    ]
-        f_mesh.close()
-        if not tile.use_masks_for_inland:
-            UI.vprint(2, "   Taking care of inland water near shoreline")
-            f_mesh = open(mesh_file_name, "r")
-            for i in range(0, 4):
-                f_mesh.readline()
-            nbr_pt_in = int(f_mesh.readline())
-            for i in range(0, 2 * nbr_pt_in + 5):
-                f_mesh.readline()
-            nbr_tri_in = int(f_mesh.readline())  # read nbr of tris
-            step_stones = nbr_tri_in // 100
-            percent = -1
-            for i in range(0, nbr_tri_in):
-                if i % step_stones == 0:
-                    percent += 1
-                    UI.progress_bar(1, int(percent * 5 / 10))
-                    if UI.red_flag:
-                        UI.exit_message_and_bottom_line()
-                        return 0
-                (n1, n2, n3, tri_type) = [
-                    int(x) - 1 for x in f_mesh.readline().split()[:4]
-                ]
-                tri_type += 1
-                if not (tri_type & has_water) == 1:
-                    continue
-                (lon1, lat1) = pt_in[5 * n1 : 5 * n1 + 2]
-                (lon2, lat2) = pt_in[5 * n2 : 5 * n2 + 2]
-                (lon3, lat3) = pt_in[5 * n3 : 5 * n3 + 2]
-                bary_lat = (lat1 + lat2 + lat3) / 3
-                bary_lon = (lon1 + lon2 + lon3) / 3
-                (til_x, til_y) = GEO.wgs84_to_orthogrid(
-                    bary_lat, bary_lon, tile.mask_zl
-                )
-                if (
-                    til_x < til_x_min - 16
-                    or til_x > til_x_max + 16
-                    or til_y < til_y_min - 16
-                    or til_y > til_y_max + 16
-                ):
-                    continue
-                (til_x2, til_y2) = GEO.wgs84_to_orthogrid(
-                    bary_lat, bary_lon, tile.mask_zl + 2
-                )
-                a = (til_x2 // 16) % 4
-                b = (til_y2 // 16) % 4
-                # Here an inland water tri is added ONLY if sea water tri were 
-                # already added for this mask extent
-                if (til_x, til_y) in dico_sea:
-                    if (til_x, til_y) in dico_inland:
-                        dico_inland[(til_x, til_y)].append(
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        )
-                    else:
-                        dico_inland[(til_x, til_y)] = [
-                            (lat1, lon1, lat2, lon2, lat3, lon3)
-                        ]
-            f_mesh.close()
+                add_to_dico(til_x, til_y + 16)
     
     return (dico_sea, dico_inland)
 ################################################################################
