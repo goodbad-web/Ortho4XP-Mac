@@ -13,29 +13,36 @@ import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
 from O4_Parallel_Utils import parallel_launch, parallel_join
 
-max_convert_slots = 4
+max_convert_slots = 8
+max_download_slots = 8
 skip_downloads = False
 skip_converts = False
 
 ################################################################################
 def download_textures(tile, download_queue, convert_queue):
-    UI.vprint(1, "-> Opening download queue.")
-    done = 0
-    while True:
-        texture_attributes = download_queue.get()
-        if isinstance(texture_attributes, str) and texture_attributes == "quit":
-            UI.progress_bar(2, 100)
-            break
+    UI.vprint(1, "-> Opening download queue with", max_download_slots, "workers.")
+
+    def download_task(*texture_attributes):
         if IMG.build_jpeg_ortho(tile, *texture_attributes):
-            done += 1
-            UI.progress_bar(
-                2, int(100 * done / (done + download_queue.qsize()))
-            )
             convert_queue.put((tile, *texture_attributes))
-        if UI.red_flag:
-            UI.vprint(1, "Download process interrupted.")
-            return 0
-    if done:
+            return 1
+        return 0
+
+    dico_dl_progress = {"done": 0, "bar": 2}
+    dl_workers = parallel_launch(
+        download_task,
+        download_queue,
+        max_download_slots,
+        progress=dico_dl_progress,
+    )
+
+    parallel_join(dl_workers)
+
+    if UI.red_flag:
+        UI.vprint(1, "Download process interrupted.")
+        return 0
+
+    if dico_dl_progress["done"]:
         UI.vprint(1, " *Download of textures completed.")
     return 1
 
@@ -141,7 +148,8 @@ def build_tile(tile):
             convert_launched = True
     build_dsf_thread.join()
     if download_launched:
-        download_queue.put("quit")
+        for _ in range(max_download_slots):
+            download_queue.put("quit")
         download_thread.join()
         if convert_launched:
             for _ in range(max_convert_slots):
