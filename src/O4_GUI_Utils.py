@@ -894,10 +894,13 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         self.photo = ImageTk.PhotoImage(self.image)
         self.map_x_res = self.photo.width()
         self.map_y_res = self.photo.height()
-        self.img_map = self.canvas.create_image(
-            0, 0, anchor=NW, image=self.photo
-        )
-        self.canvas.config(scrollregion=self.canvas.bbox(ALL))
+        try:
+            self.img_map = self.canvas.create_image(
+                0, 0, anchor=NW, image=self.photo
+            )
+            self.canvas.config(scrollregion=self.canvas.bbox(ALL))
+        except:
+            return
         if "dar" in sys.platform:
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
