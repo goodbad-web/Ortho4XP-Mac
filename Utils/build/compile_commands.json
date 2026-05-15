@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/hiroshi/Developer/Ortho4XP-Mac/Utils/build",
+  "command": "/usr/bin/cc   -O3 -mcpu=native -ffast-math -flto=thin -arch arm64 -o CMakeFiles/Triangle4XP.dir/src/Triangle4XP.c.o -c /Users/hiroshi/Developer/Ortho4XP-Mac/Utils/src/Triangle4XP.c",
+  "file": "/Users/hiroshi/Developer/Ortho4XP-Mac/Utils/src/Triangle4XP.c",
+  "output": "CMakeFiles/Triangle4XP.dir/src/Triangle4XP.c.o"
+}
+]

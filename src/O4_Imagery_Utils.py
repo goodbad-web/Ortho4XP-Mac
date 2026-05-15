@@ -9,6 +9,7 @@ import O4_UI_Utils as UI
 import time
 import os
 import sys
+import shutil
 import subprocess
 import io
 import requests
@@ -53,10 +54,18 @@ request_headers_generic = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+use_magick = False
 if "dar" in sys.platform:
-    dds_convert_cmd = os.path.join(
-        UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
-    )
+    # Try to find native 'magick' first for Apple Silicon optimization
+    magick_cmd = shutil.which("magick")
+    if magick_cmd:
+        dds_convert_cmd = magick_cmd
+        use_magick = True
+    else:
+        dds_convert_cmd = os.path.join(
+            UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
+        )
+        use_magick = False
     gdal_transl_cmd = "gdal_translate"
     gdalwarp_cmd = "gdalwarp"
     devnull_rdir = " >/dev/null 2>&1"
@@ -2429,28 +2438,40 @@ def convert_texture(
         erase_tmp_png = True
         big_image.save(file_to_convert)
     # finally if nothing needs to be done prior to the conversion
-    else:
-        file_to_convert = os.path.join(file_dir, jpeg_file_name)
     # eventually the dds conversion
     if type == "dds":
-        if not dxt5:
+        out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
+        if use_magick:
+            # Native Magick conversion (arm64)
+            # We don't use devnull_rdir here because subprocess.run/Popen with list doesn't support shell redirects
+            compression = "dxt5" if dxt5 else "dxt1"
             conv_cmd = [
                 dds_convert_cmd,
-                "-bc1",
-                "-fast",
+                "convert",
                 file_to_convert,
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                devnull_rdir,
+                "-define", f"dds:compression={compression}",
+                "-define", "dds:cluster-fit=true", # Better quality
+                out_file_path
             ]
         else:
-            conv_cmd = [
-                dds_convert_cmd,
-                "-bc3",
-                "-fast",
-                file_to_convert,
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                devnull_rdir,
-            ]
+            # Legacy nvcompress conversion (x86_64)
+            # Remove devnull_rdir from list as it causes errors in subprocess.Popen with list
+            if not dxt5:
+                conv_cmd = [
+                    dds_convert_cmd,
+                    "-bc1",
+                    "-fast",
+                    file_to_convert,
+                    out_file_path
+                ]
+            else:
+                conv_cmd = [
+                    dds_convert_cmd,
+                    "-bc3",
+                    "-fast",
+                    file_to_convert,
+                    out_file_path
+                ]
     else:
         (latmax, lonmin) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         (latmin, lonmax) = GEO.gtile_to_wgs84(

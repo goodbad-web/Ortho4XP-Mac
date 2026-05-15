@@ -1,4 +1,5 @@
 import os
+import sys
 from math import ceil
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -62,8 +63,8 @@ a particular server.",
     "max_convert_slots": {
         "module": "TILE",
         "type": int,
-        "default": 4,
-        "values": (1, 2, 3, 4, 5, 6, 7, 8),
+        "default": 8 if "dar" in sys.platform else 4,
+        "values": (1, 2, 3, 4, 5, 6, 7, 8, 12, 16),
         "hint": "Number of parallel threads for dds conversion. Should be mainly dictated by the number of cores in your CPU.",
     },
     "check_tms_response": {

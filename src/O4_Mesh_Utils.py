@@ -229,17 +229,18 @@ def build_curv_tol_weight_map(tile, weight_array):
 ################################################################################
 def post_process_nodes_altitudes(tile):
     dico_attributes = VECT.Vector_Map.dico_attributes
-    f_node = open(FNAMES.output_node_file(tile), "r")
-    init_line_f_node = f_node.readline()
-    nbr_pt = int(init_line_f_node.split()[0])
-    vertices = numpy.zeros(6 * nbr_pt)
     UI.vprint(1, "-> Loading of the mesh computed by Triangle4XP.")
-    for i in range(0, nbr_pt):
-        vertices[6 * i : 6 * i + 6] = [
-            float(x) for x in f_node.readline().split()[1:7]
-        ]
-    end_line_f_node = f_node.readline()
-    f_node.close()
+    
+    node_path = FNAMES.output_node_file(tile)
+    with open(node_path, "r") as f_node:
+        init_line_f_node = f_node.readline()
+        nbr_pt = int(init_line_f_node.split()[0])
+        # Fast loading using numpy
+        data = numpy.loadtxt(f_node, skiprows=0, usecols=range(1, 7))
+        vertices = data.flatten()
+        # Read the last line if it exists (usually just a newline or empty)
+        end_line_f_node = "" # Triangle usually doesn't have an 'end line' in .node, just nodes
+    
     UI.vprint(1, "-> Post processing of altitudes according to vector data")
     f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_tri = int(f_ele.readline().split()[0])
@@ -248,77 +249,70 @@ def post_process_nodes_altitudes(tile):
     interp_alt_tris = set()
     for i in range(nbr_tri):
         line = f_ele.readline()
+        if not line: break
         # triangle attributes are powers of 2, except for the dummy attributed
-        # which doesn't require post-treatment
         if line[-2] == "0":
             continue
-        (v1, v2, v3, attr) = [int(x) - 1 for x in line.split()[1:5]]
+        parts = line.split()
+        if len(parts) < 5: continue
+        (v1, v2, v3, attr) = [int(x) - 1 for x in parts[1:5]]
         attr += 1
-        if attr >= dico_attributes["INTERP_ALT"]:
+        if attr >= dico_attributes.get("INTERP_ALT", 1000000):
             interp_alt_tris.add((v1, v2, v3))
-        elif attr & dico_attributes["SEA"]:
+        elif attr & dico_attributes.get("SEA", 0):
             sea_tris.add((v1, v2, v3))
         elif (
-            attr & dico_attributes["WATER"]
-            or attr & dico_attributes["SEA_EQUIV"]
+            attr & dico_attributes.get("WATER", 0)
+            or attr & dico_attributes.get("SEA_EQUIV", 0)
         ):
             water_tris.add((v1, v2, v3))
+    f_ele.close()
+
     if tile.water_smoothing:
         UI.vprint(1, "   Smoothing inland water.")
-        for j in range(tile.water_smoothing):
-            for v1, v2, v3 in water_tris:
-                zmean = (
-                    vertices[6 * v1 + 2]
-                    + vertices[6 * v2 + 2]
-                    + vertices[6 * v3 + 2]
-                ) / 3
+        v_indices = numpy.array(list(water_tris))
+        if v_indices.size > 0:
+            for j in range(tile.water_smoothing):
+                v1, v2, v3 = v_indices[:, 0], v_indices[:, 1], v_indices[:, 2]
+                zmean = (vertices[6 * v1 + 2] + vertices[6 * v2 + 2] + vertices[6 * v3 + 2]) / 3.0
                 vertices[6 * v1 + 2] = zmean
                 vertices[6 * v2 + 2] = zmean
                 vertices[6 * v3 + 2] = zmean
+
     UI.vprint(1, "   Smoothing of sea water.")
-    for v1, v2, v3 in sea_tris:
+    s_indices = numpy.array(list(sea_tris))
+    if s_indices.size > 0:
+        v1, v2, v3 = s_indices[:, 0], s_indices[:, 1], s_indices[:, 2]
         if tile.sea_smoothing_mode == "zero":
             vertices[6 * v1 + 2] = 0
             vertices[6 * v2 + 2] = 0
             vertices[6 * v3 + 2] = 0
         elif tile.sea_smoothing_mode == "mean":
-            zmean = (
-                vertices[6 * v1 + 2]
-                + vertices[6 * v2 + 2]
-                + vertices[6 * v3 + 2]
-            ) / 3
+            zmean = (vertices[6 * v1 + 2] + vertices[6 * v2 + 2] + vertices[6 * v3 + 2]) / 3.0
             vertices[6 * v1 + 2] = zmean
             vertices[6 * v2 + 2] = zmean
             vertices[6 * v3 + 2] = zmean
         else:
-            vertices[6 * v1 + 2] = max(vertices[6 * v1 + 2], 0)
-            vertices[6 * v2 + 2] = max(vertices[6 * v2 + 2], 0)
-            vertices[6 * v3 + 2] = max(vertices[6 * v3 + 2], 0)
+            vertices[6 * v1 + 2] = numpy.maximum(vertices[6 * v1 + 2], 0)
+            vertices[6 * v2 + 2] = numpy.maximum(vertices[6 * v2 + 2], 0)
+            vertices[6 * v3 + 2] = numpy.maximum(vertices[6 * v3 + 2], 0)
+    
     UI.vprint(1, "   Treatment of airports, roads and patches.")
-    for v1, v2, v3 in interp_alt_tris:
-        vertices[6 * v1 + 2] = vertices[6 * v1 + 5]
-        vertices[6 * v2 + 2] = vertices[6 * v2 + 5]
-        vertices[6 * v3 + 2] = vertices[6 * v3 + 5]
-        vertices[6 * v1 + 3] = 0
-        vertices[6 * v2 + 3] = 0
-        vertices[6 * v3 + 3] = 0
-        vertices[6 * v1 + 4] = 0
-        vertices[6 * v2 + 4] = 0
-        vertices[6 * v3 + 4] = 0
+    i_indices = numpy.array(list(interp_alt_tris))
+    if i_indices.size > 0:
+        v1, v2, v3 = i_indices[:, 0], i_indices[:, 1], i_indices[:, 2]
+        for v in [v1, v2, v3]:
+            vertices[6 * v + 2] = vertices[6 * v + 5]
+            vertices[6 * v + 3] = 0
+            vertices[6 * v + 4] = 0
+            
     UI.vprint(1, "-> Writing output nodes file.")
-    f_node = open(FNAMES.output_node_file(tile), "w")
-    f_node.write(init_line_f_node)
-    for i in range(0, nbr_pt):
-        f_node.write(
-            str(i + 1)
-            + " "
-            + " ".join(
-                ("{:.15f}".format(x) for x in vertices[6 * i : 6 * i + 6])
-            )
-            + "\n"
-        )
-    f_node.write(end_line_f_node)
-    f_node.close()
+    with open(FNAMES.output_node_file(tile), "w") as f_node:
+        f_node.write(init_line_f_node)
+        v_matrix = vertices.reshape((-1, 6))
+        indices = numpy.arange(1, len(v_matrix) + 1).reshape((-1, 1))
+        out_data = numpy.hstack([indices, v_matrix])
+        numpy.savetxt(f_node, out_data, fmt='%d %.15f %.15f %.15f %.15f %.15f %.15f')
     return vertices
 
 
