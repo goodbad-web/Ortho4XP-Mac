@@ -151,6 +151,16 @@ class DEM:
                             break
                     if file_name != source:
                         break
+                if file_name == source:
+                    UI.vprint(1, "   INFO: No matching DEM found in", source, ", falling back to default.")
+                    if os.path.exists(FNAMES.generic_tif(self.lat, self.lon)):
+                        file_name = FNAMES.generic_tif(self.lat, self.lon)
+                    else:
+                        short_source = available_sources[0]
+                        if ensure_elevation(short_source, self.lat, self.lon):
+                            file_name = FNAMES.elevation_data(short_source, self.lat, self.lon)
+                        else:
+                            file_name = source # keep original so it still errors gracefully if even fallback fails
             else:
                 file_name = source
             (
@@ -742,6 +752,7 @@ def ensure_elevation(source, lat, lon, verbose=True):
                     with open(out_filename, "wb") as out:
                         UI.vprint(2, "      Extracting", out_filename)
                         out.write(zip_ref.open(f, "r").read())
+        return 1 if os.path.exists(FNAMES.viewfinderpanorama(lat, lon)) else 0
     elif source in ("SRTM", "ALOS"):
         if os.path.exists(FNAMES.elevation_data(source, lat, lon)):
             UI.vprint(
@@ -879,7 +890,7 @@ def fill_nodata_values_with_nearest_neighbor(alt_dem, nodata):
     step = 0
     while (alt_dem == nodata).any():
         if not step:
-            if numpy.sum(alt_dem == nodata) >= 10000:
+            if numpy.sum(alt_dem == nodata) >= 100000:
                 return 0
             UI.vprint(
                 2,

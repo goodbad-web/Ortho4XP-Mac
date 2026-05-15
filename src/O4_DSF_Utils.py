@@ -31,6 +31,26 @@ def float2qquad(x):
     return numpy.binary_repr(int(16777216 * x)).zfill(24)  # 2**24 == 16777216
 
 
+def numpy_wgs84_to_orthogrid(lat, lon, zoomlevel):
+    ratio_x = lon / 180
+    ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
+    mult = 2 ** (zoomlevel - 5)
+    til_x = (numpy.floor((ratio_x + 1) * mult).astype(numpy.int32) * 16)
+    til_y = (numpy.floor((1 - ratio_y) * mult).astype(numpy.int32) * 16)
+    return til_x, til_y
+
+
+def numpy_st_coord(lat, lon, tex_x, tex_y, zoomlevel):
+    ratio_x = lon / 180
+    ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
+    mult = 2 ** (zoomlevel - 5)
+    s = (ratio_x + 1) * mult - (tex_x // 16)
+    t = 1 - ((1 - ratio_y) * mult - tex_y // 16)
+    s = numpy.clip(s, 0, 1)
+    t = numpy.clip(t, 0, 1)
+    return s, t
+
+
 ################################################################################
 
 ################################################################################
@@ -491,6 +511,23 @@ def build_dsf(tile, download_queue):
     
     UI.vprint(1, "-> Computing point pools and texture requirements")
     
+    # 5.1 Vectorized triangle attributes
+    lons = node_coords[0::5]
+    lats = node_coords[1::5]
+    tri_idx_reshaped = tri_idx[:3*nbr_tris].reshape((nbr_tris, 3))
+    tri_lons = numpy.mean(lons[tri_idx_reshaped], axis=1)
+    tri_lats = numpy.mean(lats[tri_idx_reshaped], axis=1)
+    til_xs, til_ys = numpy_wgs84_to_orthogrid(tri_lats, tri_lons, tile.mesh_zl)
+    
+    # Boundary clipping for safety
+    til_x_min, til_y_min = numpy_wgs84_to_orthogrid(tile.lat + 1, tile.lon, tile.mesh_zl)
+    til_x_max, til_y_max = numpy_wgs84_to_orthogrid(tile.lat, tile.lon + 1, tile.mesh_zl)
+    til_xs = numpy.clip(til_xs, til_x_min, til_x_max)
+    til_ys = numpy.clip(til_ys, til_y_min, til_y_max)
+    
+    tri_orthogrid = list(zip(til_xs, til_ys))
+    tri_tex_attr = [dico_customzl[key] for key in tri_orthogrid]
+    
     # 5 Compute quadtree
     if (tile.use_masks_for_inland):
         quad_capacity = quad_capacity_low
@@ -649,19 +686,7 @@ def build_dsf(tile, download_queue):
                 UI.vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
-        bary_lon = (
-            node_coords[5 * n1 + 0]
-            + node_coords[5 * n2 + 0]
-            + node_coords[5 * n3 + 0]
-        ) / 3
-        bary_lat = (
-            node_coords[5 * n1 + 1]
-            + node_coords[5 * n2 + 1]
-            + node_coords[5 * n3 + 1]
-        ) / 3
-        texture_attributes = dico_customzl[
-            GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mesh_zl)
-        ]
+        texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
@@ -781,10 +806,10 @@ def build_dsf(tile, download_queue):
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    (s, t) = GEO.st_coord(
+                    (s, t) = numpy_st_coord(
                         node_coords[5 * n + 1],
                         node_coords[5 * n],
-                        *texture_attributes
+                        *texture_attributes[:3]
                     )
                     # BEWARE : normal coordinates are pointing (EAST,SOUTH)
                     # in X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
@@ -884,17 +909,7 @@ def build_dsf(tile, download_queue):
                 UI.vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
-        bary_lon = (
-            node_coords[5 * n1] + node_coords[5 * n2] + node_coords[5 * n3]
-        ) / 3
-        bary_lat = (
-            node_coords[5 * n1 + 1]
-            + node_coords[5 * n2 + 1]
-            + node_coords[5 * n3 + 1]
-        ) / 3
-        texture_attributes = dico_customzl[
-            GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mesh_zl)
-        ]
+        texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
@@ -952,10 +967,10 @@ def build_dsf(tile, download_queue):
             if node_hash in textured_nodes:
                 (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
             else:
-                (s, t) = GEO.st_coord(
+                (s, t) = numpy_st_coord(
                     node_coords[5 * n + 1],
                     node_coords[5 * n],
-                    *texture_attributes
+                    *texture_attributes[:3]
                 )
                 # BEWARE : normal coordinates are pointing (EAST,SOUTH) in 
                 # X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
@@ -1149,11 +1164,8 @@ def build_dsf(tile, download_queue):
         f.write(struct.pack("<I", dsf_pool_length[k]))
         f.write(struct.pack("<B", dsf_pool_plane[k]))
         for l in range(dsf_pool_plane[k]):
-            f.write(struct.pack("<B", 0))
-            for m in range(dsf_pool_length[k]):
-                f.write(
-                    struct.pack("<H", dsf_pools[k][dsf_pool_plane[k] * m + l])
-                )
+            f.write(b"\x00")
+            f.write(dsf_pools[k][l :: dsf_pool_plane[k]].tobytes())
     for k in range(dsf_pool_nbr):
         if dsf_pool_length[k] == 0:
             continue
