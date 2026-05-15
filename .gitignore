@@ -15,4 +15,4 @@ Tiles/
 **/*.bak
 **/*.swp
 .last_gui_params.txt
-.DS_Store
+**/.DS_Store

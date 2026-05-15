@@ -4,4 +4,4 @@ grid_type=webmercator
 url_template=http://cyberjapandata.gsi.go.jp/xyz/ort/{zoom}/{x}/{y}.jpg
 max_threads=8
 imagery_dir=grouped
-in_GUI=False
+in_GUI=True
