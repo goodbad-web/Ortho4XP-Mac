@@ -798,7 +798,7 @@ def sort_mesh(tile):
         
         # Nodes
         # Nodes
-        nbr_nodes = int(lines[ptr].split()[0])
+        nbr_nodes = int(float(lines[ptr].split()[0]))
         ptr += 1
         nodes_data = [l.strip() for l in lines[ptr : ptr + nbr_nodes]]
         ptr += nbr_nodes
@@ -807,7 +807,7 @@ def sort_mesh(tile):
         while ptr < len(lines) and "Normals" not in lines[ptr]:
             ptr += 1
         ptr += 1
-        nbr_norms = int(lines[ptr].split()[0])
+        nbr_norms = int(float(lines[ptr].split()[0]))
         ptr += 1
         norms_data = [l.strip() for l in lines[ptr : ptr + nbr_norms]]
         ptr += nbr_norms
@@ -816,11 +816,11 @@ def sort_mesh(tile):
         while ptr < len(lines) and "Triangles" not in lines[ptr]:
             ptr += 1
         ptr += 1
-        nbr_tris = int(lines[ptr].split()[0])
+        nbr_tris = int(float(lines[ptr].split()[0]))
         ptr += 1
         # tris_data: v1, v2, v3, attr (4 columns)
         tris_list = [l.split()[:4] for l in lines[ptr : ptr + nbr_tris]]
-        tris_data = numpy.array(tris_list, dtype=int)
+        tris_data = numpy.array(tris_list, dtype=float).astype(int)
 
         # Sort triangles by attribute (column index 3)
         sorted_indices = numpy.argsort(tris_data[:, 3])
@@ -894,7 +894,7 @@ def read_mesh_file(mesh_file):
     for i in range(3):
         f.readline()
     
-    nbr_nodes = int(f.readline())
+    nbr_nodes = int(float(f.readline()))
     node_coords = numpy.zeros(5 * nbr_nodes)
     
     # read positions
@@ -918,15 +918,15 @@ def read_mesh_file(mesh_file):
     # skip 2 lines
     for i in range(0, 2): 
         f.readline()
-
+ 
     # read nbr of tris
-    nbr_tris = int(f.readline())      
+    nbr_tris = int(float(f.readline()))      
 
     tri_idx  = numpy.zeros(3 * nbr_tris, dtype = numpy.uint32)
     tri_types = numpy.zeros(nbr_tris, dtype = numpy.uint32)
     for i in range(nbr_tris):
         (n1, n2, n3, t) = [
-            int(x) - 1 for x in f.readline().split()[:4]
+            int(float(x)) - 1 for x in f.readline().split()[:4]
         ]
         tri_idx[3 * i: 3 * i + 3] = (n1, n2, n3)
         tri_types[i] = t + 1

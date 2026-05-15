@@ -441,7 +441,7 @@ def record_water_tris(tile):
             while ptr < len(lines) and "Vertices" not in lines[ptr]:
                 ptr += 1
             ptr += 1
-            nbr_pt_in = int(lines[ptr].split()[0])
+            nbr_pt_in = int(float(lines[ptr].split()[0]))
             ptr += 1
             # Skip ID column (index 0) if it exists, or handle coordinates
             # MeshVersionFormatted 2 doesn't have IDs in vertices, just x y z 0
@@ -452,9 +452,9 @@ def record_water_tris(tile):
             while ptr < len(lines) and "Triangles" not in lines[ptr]:
                 ptr += 1
             ptr += 1
-            nbr_tri_in = int(lines[ptr].split()[0])
+            nbr_tri_in = int(float(lines[ptr].split()[0]))
             ptr += 1
-            tri_data = numpy.array([l.split()[:4] for l in lines[ptr:ptr+nbr_tri_in]], dtype=int)
+            tri_data = numpy.array([l.split()[:4] for l in lines[ptr:ptr+nbr_tri_in]], dtype=float).astype(int)
             # tri_data: v1 v2 v3 attr
             
             # Vectorized water triangle detection

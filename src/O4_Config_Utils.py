@@ -441,12 +441,16 @@ list_global_cfg = (
 ################################################################################
 # Initialization to default values
 for var in cfg_vars:
-    target = (
-        cfg_vars[var]["module"] + "." + var
-        if "module" in cfg_vars[var]
-        else var
-    )
-    exec(target + "=cfg_vars['" + var + "']['default']")
+    val = cfg_vars[var]["default"]
+    if "module" in cfg_vars[var]:
+        module_name = cfg_vars[var]["module"]
+        if module_name == "UI": setattr(UI, var, val)
+        elif module_name == "OSM": setattr(OSM, var, val)
+        elif module_name == "IMG": setattr(IMG, var, val)
+        elif module_name == "TILE": setattr(TILE, var, val)
+        elif module_name == "OVL": setattr(OVL, var, val)
+    else:
+        globals()[var] = val
 ################################################################################
 # Update from Global Ortho4XP.cfg
 try:
@@ -459,23 +463,39 @@ try:
             continue
         try:
             (var, value) = line.split("=")
+            var = var.strip()
+            value = value.strip()
             # compatibility with config files from version <= 1.20
             if value and value[0] in ('"', "'"):
                 value = value[1:]
             if value and value[-1] in ('"', "'"):
                 value = value[:-1]
-            target = (
-                cfg_vars[var]["module"] + "." + var
-                if "module" in cfg_vars[var]
-                else var
-            )
-            if cfg_vars[var]["type"] in (bool, list):
-                cmd = target + "=" + value
+            if var not in cfg_vars:
+                continue
+            if cfg_vars[var]["type"] == bool:
+                val = (value.lower() == "true")
+            elif cfg_vars[var]["type"] == list:
+                try:
+                    val = eval(value)
+                except:
+                    continue
             else:
-                cmd = target + "=cfg_vars['" + var + "']['type'](value)"
-            exec(cmd)
+                try:
+                    val = cfg_vars[var]["type"](value)
+                except:
+                    continue
+            
+            if "module" in cfg_vars[var]:
+                module_name = cfg_vars[var]["module"]
+                if module_name == "UI": setattr(UI, var, val)
+                elif module_name == "OSM": setattr(OSM, var, val)
+                elif module_name == "IMG": setattr(IMG, var, val)
+                elif module_name == "TILE": setattr(TILE, var, val)
+                elif module_name == "OVL": setattr(OVL, var, val)
+            else:
+                globals()[var] = val
+            UI.vprint(2, "   Config variable", var, "set to", val)
         except:
-            UI.lvprint(1, "Global config file contains an invalid line:", line)
             pass
     f.close()
 except:
@@ -497,7 +517,17 @@ class Tile:
         self.build_dir = FNAMES.build_dir(lat, lon, custom_build_dir)
         self.dem = None
         for var in list_tile_vars:
-            exec("self." + var + "=" + var)
+            if "module" in cfg_vars[var]:
+                module_name = cfg_vars[var]["module"]
+                if module_name == "UI": val = getattr(UI, var)
+                elif module_name == "OSM": val = getattr(OSM, var)
+                elif module_name == "IMG": val = getattr(IMG, var)
+                elif module_name == "TILE": val = getattr(TILE, var)
+                elif module_name == "OVL": val = getattr(OVL, var)
+                else: val = globals().get(var, cfg_vars[var]["default"])
+            else:
+                val = globals().get(var, cfg_vars[var]["default"])
+            setattr(self, var, val)
 
     def make_dirs(self):
         if os.path.isdir(self.build_dir):
