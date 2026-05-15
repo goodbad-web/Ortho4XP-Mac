@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 import sys
 import os
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, hard), hard))
+except:
+    pass
 Ortho4XP_dir='..' if getattr(sys,'frozen',False) else '.'
 sys.path.append(os.path.join(Ortho4XP_dir,'src'))
 
