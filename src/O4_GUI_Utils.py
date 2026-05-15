@@ -242,6 +242,13 @@ class Ortho4XP_GUI(tk.Tk):
         ttk.Button(
             self.frame_tile,
             takefocus=False,
+            text="Verify",
+            command=self.check_dependencies,
+            style="Flat.TButton",
+        ).grid(row=0, column=8, rowspan=2, padx=5, pady=0)
+        ttk.Button(
+            self.frame_tile,
+            takefocus=False,
             image=self.config_icon,
             command=self.open_config_window,
             style="Flat.TButton",
@@ -581,6 +588,36 @@ class Ortho4XP_GUI(tk.Tk):
 
     def set_red_flag(self):
         UI.red_flag = True
+
+    def check_dependencies(self):
+        UI.vprint(0, "\nChecking dependencies...")
+        all_found = True
+        
+        # Tools to check
+        tools = {
+            "gdal_translate": "GDAL (for geotagging/conversion)",
+            "gdalwarp": "GDAL (for reprojecting)",
+        }
+        
+        if OsX:
+            tools["magick"] = "ImageMagick (for Apple Silicon DDS conversion)"
+        else:
+            tools["nvcompress"] = "NVIDIA Texture Tools (for DDS conversion)"
+
+        for tool, desc in tools.items():
+            path = shutil.which(tool)
+            if path:
+                UI.vprint(0, f"  [OK] {tool} found: {path}")
+            else:
+                UI.vprint(0, f"  [!!] {tool} NOT FOUND ({desc})")
+                all_found = False
+        
+        if all_found:
+            UI.vprint(0, "All essential dependencies are satisfied!\n")
+        else:
+            UI.vprint(0, "Some dependencies are missing. Please install them via Homebrew.\n")
+            if OsX:
+                UI.vprint(0, "Try: brew install gdal imagemagick\n")
 
     def exit_prg(self):
         try:

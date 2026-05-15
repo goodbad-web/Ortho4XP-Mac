@@ -11,7 +11,7 @@ import O4_Mesh_Utils as MESH
 import O4_Mask_Utils as MASK
 import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
-from O4_Parallel_Utils import parallel_launch, parallel_join
+from O4_Parallel_Utils import parallel_launch, parallel_join, multiprocessing_pool
 
 max_convert_slots = 8
 max_download_slots = 8
@@ -132,19 +132,7 @@ def build_tile(tile):
         download_thread.start()
         download_launched = True
         if not skip_converts:
-            UI.vprint(
-                1,
-                "-> Opening convert queue and",
-                max_convert_slots,
-                "conversion workers.",
-            )
             dico_conv_progress = {"done": 0, "bar": 3}
-            convert_workers = parallel_launch(
-                IMG.convert_texture,
-                convert_queue,
-                max_convert_slots,
-                progress=dico_conv_progress,
-            )
             convert_launched = True
     build_dsf_thread.join()
     if download_launched:
@@ -152,9 +140,41 @@ def build_tile(tile):
             download_queue.put("quit")
         download_thread.join()
         if convert_launched:
-            for _ in range(max_convert_slots):
-                convert_queue.put("quit")
-            parallel_join(convert_workers)
+            UI.vprint(
+                1,
+                "-> Starting multiprocessing pool with",
+                max_convert_slots,
+                "workers for DDS conversion.",
+            )
+            config_data = {
+                'use_magick': IMG.use_magick,
+                'dds_convert_cmd': IMG.dds_convert_cmd,
+                'gdal_transl_cmd': IMG.gdal_transl_cmd,
+                'gdalwarp_cmd': IMG.gdalwarp_cmd,
+                'providers_dict': IMG.providers_dict,
+                'local_combined_providers_dict': IMG.local_combined_providers_dict,
+                'color_filters_dict': IMG.color_filters_dict,
+                'extents_dict': IMG.extents_dict,
+                'Ortho4XP_dir': UI.Ortho4XP_dir,
+                'verbosity': UI.verbosity,
+                'cleaning_level': UI.cleaning_level
+            }
+            # Collect conversion arguments from queue
+            convert_list = []
+            while not convert_queue.empty():
+                item = convert_queue.get()
+                if item != "quit":
+                    convert_list.append(item)
+            
+            multiprocessing_pool(
+                IMG.convert_texture,
+                convert_list,
+                max_convert_slots,
+                progress=dico_conv_progress,
+                init_func=IMG.init_worker,
+                init_args=config_data
+            )
+
             if UI.red_flag:
                 UI.vprint(1, "DDS conversion process interrupted.")
             elif dico_conv_progress["done"] >= 1:

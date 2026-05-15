@@ -2297,6 +2297,24 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
 ################################################################################
 
 ################################################################################
+# Support for multiprocessing initialization
+def init_worker(config_data):
+    global use_magick, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd
+    global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
+    
+    # Restore globals from passed config
+    use_magick = config_data['use_magick']
+    dds_convert_cmd = config_data['dds_convert_cmd']
+    gdal_transl_cmd = config_data['gdal_transl_cmd']
+    gdalwarp_cmd = config_data['gdalwarp_cmd']
+    providers_dict = config_data['providers_dict']
+    local_combined_providers_dict = config_data['local_combined_providers_dict']
+    color_filters_dict = config_data['color_filters_dict']
+    extents_dict = config_data['extents_dict']
+    UI.Ortho4XP_dir = config_data['Ortho4XP_dir']
+    UI.verbosity = config_data['verbosity']
+    UI.cleaning_level = config_data['cleaning_level']
+
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
 ):
@@ -2575,7 +2593,7 @@ def convert_texture(
             pass
     if erase_tmp_tif:
         try:
-            os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
+            os.remove(tmp_tif_file_name)
         except:
             pass
     return
