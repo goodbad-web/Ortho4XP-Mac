@@ -2374,6 +2374,7 @@ def convert_texture(
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
+        file_to_convert = os.path.join(file_dir, jpeg_file_name)
     if (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not os.path.exists(os.path.join(file_dir, jpeg_file_name))
