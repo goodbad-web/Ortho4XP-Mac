@@ -8,5 +8,5 @@ certifi>=2024.7.4
 chardet>=5.2.0
 idna>=3.7
 urllib3>=2.2.2
-GDAL==3.13.0
+GDAL>=3.9.0
 scikit-fmm

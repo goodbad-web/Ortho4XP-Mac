@@ -1,3 +1,7 @@
+# macOS
+.DS_Store
+.AppleDouble
+
 Binary/
 Elevation_data/
 Geotiffs/
@@ -9,6 +13,10 @@ Previews/
 Extents/Auto
 tmp/
 Tiles/
+
+# Python
+**/venv/
+**/.venv/
 **/Ortho4XP.log
 **/__pycache__
 **/Thumbs.db

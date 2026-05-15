@@ -69,7 +69,9 @@ if __name__ == '__main__':
             MASK.build_masks(tile)
             TILE.build_tile(tile)
             print("Bon vol!")
-        except:
-            print("Crash!")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Crash! Error: {e}")
  
         
