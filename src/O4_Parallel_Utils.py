@@ -50,6 +50,20 @@ def parallel_join(workers):
         worker.join()
 
 ################################################################################
+def parallel_execute(task, execute_queue, nbr_workers, progress=None):
+    success = [1]
+    for _ in range(nbr_workers):
+        execute_queue.put("quit")
+    workers = []
+    for _ in range(nbr_workers):
+        worker = parallel_worker(task, execute_queue, progress, success)
+        worker.start()
+        workers.append(worker)
+    for worker in workers:
+        worker.join()
+    return success[0]
+
+################################################################################
 # Multiprocessing support
 ################################################################################
 def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=None, init_args=None):
