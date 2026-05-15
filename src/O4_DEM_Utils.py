@@ -140,7 +140,19 @@ class DEM:
                         numpy.zeros((3601, 3601), dtype=numpy.float32),
                     )
         else:
-            file_name = source
+            if os.path.isdir(source):
+                file_name = source
+                target_hgt = (FNAMES.hem_latlon(self.lat, self.lon) + ".hgt").lower()
+                target_tif = (FNAMES.hem_latlon(self.lat, self.lon) + ".tif").lower()
+                for root, dirs, files in os.walk(source):
+                    for f in files:
+                        if f.lower() == target_hgt or f.lower() == target_tif:
+                            file_name = os.path.join(root, f)
+                            break
+                    if file_name != source:
+                        break
+            else:
+                file_name = source
             (
                 self.epsg,
                 self.x0,
