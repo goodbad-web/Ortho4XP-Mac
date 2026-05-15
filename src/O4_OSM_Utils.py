@@ -10,13 +10,14 @@ import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 
 overpass_servers = {
-    "DE": "http://overpass-api.de/api/interpreter",
-    "FR": "http://api.openstreetmap.fr/oapi/interpreter",
+    "DE": "https://overpass-api.de/api/interpreter",
+    "LZ": "https://lz4.overpass-api.de/api/interpreter",
+    "FR": "https://api.openstreetmap.fr/oapi/interpreter",
     "KU": "https://overpass.kumi.systems/api/interpreter",
-    "RU": "http://overpass.osm.rambler.ru/cgi/interpreter",
+    "CH": "https://overpass.osm.ch/api/interpreter"
 }
-overpass_server_choice = "DE"
-max_osm_tentatives = 8
+overpass_server_choice = "random"
+max_osm_tentatives = 10
 
 ################################################################################
 class OSM_layer:
