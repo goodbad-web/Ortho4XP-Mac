@@ -686,8 +686,7 @@ def initialize_local_combined_providers_dict(tile):
                     continue
                 UI.vprint(1, "    Building layer mask for ", name)
                 # need to build the extent mask over that tile
-                if not os.path.isdir(os.path.join(FNAMES.Extent_dir, "Auto")):
-                    os.makedirs(os.path.join(FNAMES.Extent_dir, "Auto"))
+                os.makedirs(os.path.join(FNAMES.Extent_dir, "Auto"), exist_ok=True)
                 cached_file_name = os.path.join(
                     FNAMES.Extent_dir, "LowRes", name + ".osm.bz2"
                 )
@@ -1589,8 +1588,7 @@ def download_jpeg_ortho(
             "could not be obtained ",
             "(even at lower ZL), it was filled with white there.",
         )
-    if not os.path.exists(file_dir):
-        os.makedirs(file_dir)
+    os.makedirs(file_dir, exist_ok=True)
     try:
         if super_resol_factor == 1:
             big_image.save(os.path.join(file_dir, file_name))
@@ -1723,8 +1721,7 @@ def build_jpeg_ortho(
             big_img = combine_textures(
                 tile, til_x_left, til_y_top, zoomlevel, provider_code
             )
-            if not os.path.exists(file_dir):
-                os.makedirs(file_dir)
+            os.makedirs(file_dir, exist_ok=True)
             try:
                 big_img.convert("RGB").save(os.path.join(file_dir, file_name))
             except Exception as e:
@@ -2000,8 +1997,7 @@ def build_provider_texture(dest_dir, provider_code, zoomlevel):
 ################################################################################
 def create_tile_preview(lat, lon, zoomlevel, provider_code):
     UI.red_flag = False
-    if not os.path.exists(FNAMES.Preview_dir):
-        os.makedirs(FNAMES.Preview_dir)
+    os.makedirs(FNAMES.Preview_dir, exist_ok=True)
     filepreview = FNAMES.preview(lat, lon, zoomlevel, provider_code)
     if not os.path.isfile(filepreview):
         provider = providers_dict[provider_code]
