@@ -150,6 +150,7 @@ class DEM:
                             file_name = os.path.join(root, f)
                             break
                     if file_name != source:
+                        UI.vprint(1, "   INFO: Found matching custom DEM in directory:", file_name)
                         break
                 if file_name == source:
                     UI.vprint(1, "   INFO: No matching DEM found in", source, ", falling back to default.")
