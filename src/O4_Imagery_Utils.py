@@ -2498,8 +2498,8 @@ def convert_texture(
     # eventually the dds conversion
     if type == "dds":
         out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
-        dds_converter = getattr(IMG, 'dds_converter', 'nvcompress')
-        dds_format = getattr(IMG, 'dds_format', 'BC3')
+        dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
+        dds_format = getattr(UI, 'dds_format', 'BC3')
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # Native Apple Silicon conversion via ASHelper
