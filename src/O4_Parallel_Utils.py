@@ -78,17 +78,20 @@ def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=N
     with ctx.Pool(processes=nbr_workers, initializer=init_func, initargs=(init_args,) if init_args else ()) as pool:
         done = 0
         total = len(arg_list)
+        log_step = max(1, total // 10)
         try:
             for _ in pool.imap_unordered(task_wrapper, [(task, args) for args in arg_list]):
                 done += 1
                 if progress:
                     progress["done"] += 1
                     UI.progress_bar(progress["bar"], int(100 * done / total))
+                if done % log_step == 0 or done == total:
+                    UI.vprint(1, f"   ... {done}/{total} ({int(100 * done / total)}%)")
                 if UI.red_flag:
                     pool.terminate()
                     break
         except Exception as e:
-            print(f"Pool execution error: {e}")
+            UI.vprint(1, f"Pool execution error: {e}")
             pool.terminate()
 
 def task_wrapper(args):
