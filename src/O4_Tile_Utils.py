@@ -120,6 +120,7 @@ def build_tile(tile):
     
     download_launched = False
     convert_launched = False
+    conversion_success = True
 
     build_dsf_thread = threading.Thread(
         target=DSF.build_dsf, args=[tile, download_queue]
@@ -169,7 +170,7 @@ def build_tile(tile):
                 if item != "quit":
                     convert_list.append(item)
             
-            multiprocessing_pool(
+            success_count = multiprocessing_pool(
                 IMG.convert_texture,
                 convert_list,
                 max_convert_slots,
@@ -177,6 +178,11 @@ def build_tile(tile):
                 init_func=IMG.init_worker,
                 init_args=config_data
             )
+
+            conversion_success = (success_count == len(convert_list))
+            if not conversion_success:
+                UI.lvprint(0, f"WARNING: {len(convert_list) - success_count} textures failed to convert.")
+                UI.lvprint(0, "Skipping cleanup to protect existing data.")
 
             if UI.red_flag:
                 UI.vprint(1, "DDS conversion process interrupted.")
@@ -217,7 +223,7 @@ def build_tile(tile):
             os.remove(FNAMES.apt_file(tile))
         except:
             pass
-    if UI.cleaning_level > 1 and not tile.grouped:
+    if UI.cleaning_level > 1 and not tile.grouped and conversion_success:
         remove_unwanted_textures(tile)
     UI.timings_and_bottom_line(timer)
     UI.logprint(
@@ -321,10 +327,9 @@ def remove_unwanted_textures(tile):
     for f in os.listdir(os.path.join(tile.build_dir, "terrain")):
         if f[-4:] != ".ter":
             continue
-        if f[-5] != "y":  # overlay
-            texture_list.append(f.replace(".ter", ".dds"))
-        else:
-            texture_list.append("_".join(f[:-4].split("_")[:-2]) + ".dds")
+        # Extract base texture name by removing suffixes
+        base_name = f[:-4].replace("_water", "").replace("_sea", "").replace("_overlay", "")
+        texture_list.append(base_name + ".dds")
     for f in os.listdir(os.path.join(tile.build_dir, "textures")):
         if f[-4:] != ".dds":
             continue

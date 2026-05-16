@@ -28,6 +28,17 @@ cleaning_level = 1
 gui = None
 log = True
 
+# System resource limits adjustment
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # macOS default is often 256, which is too low for Ortho4XP's parallel processing
+    if soft < 4096:
+        new_soft = min(hard, 65536)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+except:
+    pass
+
 ################################################################################
 def progress_bar(nbr, percentage, message=None):
     if gui:

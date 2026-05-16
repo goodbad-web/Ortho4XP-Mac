@@ -70,18 +70,21 @@ def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=N
     # This is a synchronous call but it uses a Pool to run in parallel.
     # It updates the progress bar.
     if not arg_list:
-        return
+        return 0
     
     # Use spawn context explicitly for macOS stability
     ctx = multiprocessing.get_context("spawn")
     
     with ctx.Pool(processes=nbr_workers, initializer=init_func, initargs=(init_args,) if init_args else ()) as pool:
         done = 0
+        success = 0
         total = len(arg_list)
         log_step = max(1, total // 10)
         try:
-            for _ in pool.imap_unordered(task_wrapper, [(task, args) for args in arg_list]):
+            for res in pool.imap_unordered(task_wrapper, [(task, args) for args in arg_list]):
                 done += 1
+                if res:
+                    success += 1
                 if progress:
                     progress["done"] += 1
                     UI.progress_bar(progress["bar"], int(100 * done / total))
@@ -93,6 +96,7 @@ def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=N
         except Exception as e:
             UI.vprint(1, f"Pool execution error: {e}")
             pool.terminate()
+        return success
 
 def task_wrapper(args):
     task, task_args = args
