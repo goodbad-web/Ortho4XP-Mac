@@ -2480,17 +2480,12 @@ def convert_texture(
 
     # Optional AI Upscale using Neural Engine
     if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
-        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
+        # Add pid to avoid conflicts during multiprocessing
+        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + f"_upscaled_{os.getpid()}.png")
         UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
         if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
             file_to_convert = upscaled_tmp
-            erase_tmp_png = True # Make sure to erase the upscaled one too if it's in tmp
-            # We need to track the upscaled file to delete it
             upscaled_file_to_delete = upscaled_tmp
-        else:
-            upscaled_file_to_delete = None
-    else:
-        upscaled_file_to_delete = None
 
     # finally if nothing needs to be done prior to the conversion
     # eventually the dds conversion
