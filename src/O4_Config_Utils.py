@@ -63,8 +63,8 @@ a particular server.",
     "max_convert_slots": {
         "module": "TILE",
         "type": int,
-        "default": 8 if "dar" in sys.platform else 4,
-        "values": (1, 2, 3, 4, 5, 6, 7, 8, 12, 16),
+        "default": os.cpu_count() if os.cpu_count() else (8 if "dar" in sys.platform else 4),
+        "values": (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32),
         "hint": "Number of parallel threads for dds conversion. Should be mainly dictated by the number of cores in your CPU.",
     },
     "max_download_slots": {
