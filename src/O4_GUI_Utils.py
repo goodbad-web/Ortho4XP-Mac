@@ -941,6 +941,9 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         except:
             return
         if OsX:
+            self.canvas.bind("<ButtonPress-1>", self.scroll_start)
+            self.canvas.bind("<B1-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-1>", self.scroll_stop)
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
             self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
@@ -956,7 +959,7 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.canvas.bind("<Control-ButtonPress-3>", self.delPol)
         self.canvas.bind(
             "<ButtonPress-1>", lambda event: self.canvas.focus_set()
-        )
+        ) if not OsX else None
         self.canvas.bind("<Shift-ButtonPress-1>", self.newPoint)
         mod_shift_key = "<Shift-Command-ButtonPress-1>" if OsX else "<Control-Shift-ButtonPress-1>"
         self.canvas.bind(mod_shift_key, self.newPointGrid)
@@ -998,6 +1001,7 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
 
     def scroll_start(self, event):
         self.canvas.config(cursor="closedhand")
+        self.canvas.focus_set()
         self.canvas.scan_mark(event.x, event.y)
         return
 
@@ -1448,7 +1452,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         self.canvas.yview_moveto(y0 / self.resolution)
         self.nx0 = int((8 * x0) // self.resolution)
         self.ny0 = int((8 * y0) // self.resolution)
+        self._redraw_id = None
         if OsX:
+            self.canvas.bind("<ButtonPress-1>", self.scroll_start)
+            self.canvas.bind("<B1-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-1>", self.scroll_stop)
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
             self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
@@ -1930,27 +1938,33 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
 
     def scroll_start(self, event):
         self.canvas.config(cursor="closedhand")
+        self.canvas.focus_set()
         self.canvas.scan_mark(event.x, event.y)
         return
 
     def scroll_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
-        self.redraw_canvas()
+        self.queue_redraw()
         return
 
     def scroll_stop(self, event):
         self.canvas.config(cursor="")
         return
 
+    def queue_redraw(self):
+        if self._redraw_id:
+            self.after_cancel(self._redraw_id)
+        self._redraw_id = self.after(100, self.redraw_canvas)
+
     def _on_mousewheel(self, event):
         delta = -1 * event.delta
         self.canvas.yview_scroll(int(delta), "units")
-        self.redraw_canvas()
+        self.queue_redraw()
 
     def _on_shift_mousewheel(self, event):
         delta = -1 * event.delta
         self.canvas.xview_scroll(int(delta), "units")
-        self.redraw_canvas()
+        self.queue_redraw()
 
     def redraw_canvas(self):
         x0 = self.canvas.canvasx(0)
