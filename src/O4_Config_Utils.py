@@ -816,8 +816,10 @@ class Ortho4XP_Config(tk.Toplevel):
         )
         dem_button.grid(row=0, column=2, padx=2, pady=0, sticky=W)
         dem_button.bind("<Shift-ButtonPress-1>", self.add_dem)
-        dem_button.bind("<Control-ButtonPress-1>", self.choose_dem_dir)
-        dem_button.bind("<Shift-Control-ButtonPress-1>", self.add_dem_dir)
+        mod_key = "<Command-ButtonPress-1>" if "dar" in sys.platform else "<Control-ButtonPress-1>"
+        shift_mod_key = "<Shift-Command-ButtonPress-1>" if "dar" in sys.platform else "<Shift-Control-ButtonPress-1>"
+        dem_button.bind(mod_key, self.choose_dem_dir)
+        dem_button.bind(shift_mod_key, self.add_dem_dir)
         item = "fill_nodata"
         ttk.Button(
             self.frame_cfg,

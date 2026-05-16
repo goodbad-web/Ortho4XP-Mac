@@ -298,7 +298,8 @@ class Ortho4XP_GUI(tk.Tk):
         )
         build_mesh_button.bind("<ButtonPress-1>", self.build_mesh)
         build_mesh_button.bind("<Shift-ButtonPress-1>", self.sort_mesh)
-        build_mesh_button.bind("<Control-ButtonPress-1>", self.community_mesh)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        build_mesh_button.bind(mod_key, self.community_mesh)
         build_masks_button = ttk.Button(
             self.frame_steps, text=" Draw Water Masks  "
         )  # ,command=self.build_masks)
@@ -852,10 +853,11 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.frame_left, text="Extract Mesh ", command=self.extract_mesh_ifc
         ).grid(row=row, column=0, padx=5, pady=3, sticky=N + S + E + W)
         row += 1
+        shortcut_text = "Cmd+B1 : add texture\nShift+B1: add zone point\nCmd+B2 : delete zone" if OsX else \
+                       "Ctrl+B1 : add texture\nShift+B1: add zone point\nCtrl+B2 : delete zone"
         tk.Label(
             self.frame_left,
-            text="Ctrl+B1 : add texture\nShift+B1: add zone point\n" + \
-                 "Ctrl+B2 : delete zone",
+            text=shortcut_text,
             bg="light green",
             justify=LEFT,
         ).grid(row=row, column=0, padx=5, pady=20, sticky=N + S + E + W)
@@ -938,20 +940,28 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.canvas.config(scrollregion=self.canvas.bbox(ALL))
         except:
             return
-        if "dar" in sys.platform:
+        if OsX:
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
-            self.canvas.bind("<Control-ButtonPress-2>", self.delPol)
+            self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
+            self.canvas.bind("<Command-ButtonPress-2>", self.delPol)
+            # Mac Trackpad panning & zooming
+            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+            self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
+            self.canvas.bind("<Command-MouseWheel>", self._on_zoom_wheel)
         else:
             self.canvas.bind("<ButtonPress-3>", self.scroll_start)
             self.canvas.bind("<B3-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-3>", self.scroll_stop)
             self.canvas.bind("<Control-ButtonPress-3>", self.delPol)
         self.canvas.bind(
             "<ButtonPress-1>", lambda event: self.canvas.focus_set()
         )
         self.canvas.bind("<Shift-ButtonPress-1>", self.newPoint)
-        self.canvas.bind("<Control-Shift-ButtonPress-1>", self.newPointGrid)
-        self.canvas.bind("<Control-ButtonPress-1>", self.newPol)
+        mod_shift_key = "<Shift-Command-ButtonPress-1>" if OsX else "<Control-Shift-ButtonPress-1>"
+        self.canvas.bind(mod_shift_key, self.newPointGrid)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        self.canvas.bind(mod_key, self.newPol)
         self.canvas.focus_set()
         self.canvas.bind("p", self.newPoint)
         self.canvas.bind("d", self.delete_zone_cmd)
@@ -987,12 +997,40 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         return
 
     def scroll_start(self, event):
+        self.canvas.config(cursor="closedhand")
         self.canvas.scan_mark(event.x, event.y)
         return
 
     def scroll_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
         return
+
+    def scroll_stop(self, event):
+        self.canvas.config(cursor="")
+        return
+
+    def _on_mousewheel(self, event):
+        delta = -1 * event.delta
+        # Mac scroll delta is small, needs a multiplier for natural speed
+        self.canvas.yview_scroll(int(delta), "units")
+
+    def _on_shift_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.xview_scroll(int(delta), "units")
+
+    def _on_zoom_wheel(self, event):
+        current_zl = int(self.zl_choice.get())
+        if event.delta > 0:
+            new_zl = min(current_zl + 1, 13)
+        else:
+            new_zl = max(current_zl - 1, 10)
+        if new_zl != current_zl:
+            # Calculate current view center to maintain position after zoom
+            x_center = self.canvas.canvasx(self.canvas.winfo_width() / 2)
+            y_center = self.canvas.canvasy(self.canvas.winfo_height() / 2)
+            lat_c, lon_c = GEO.pix_to_wgs84(x_center, y_center, current_zl)
+            self.zl_choice.set(str(new_zl))
+            self.preview_tile(lat_c, lon_c)
 
     def redraw_poly(self):
         try:
@@ -1379,11 +1417,15 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.frame_left, text="      Exit      ", command=self.exit
         ).grid(row=row, column=0, padx=5, pady=5, sticky=N + S + E + W)
         row += 1
+        shortcut_text = "Shortcuts :\n-----------------\nScroll/B2-hold=move map\n" + \
+                        "B1-double-click=select active\n" + \
+                        "Shift+B1=add to batch build\nCmd+B1=link in Custom Scenery" if OsX else \
+                        "Shortcuts :\n-----------------\nB2-press+hold=move map\n" + \
+                        "B1-double-click=select active\n" + \
+                        "Shift+B1=add to batch build\nCtrl+B1=link in Custom Scenery"
         tk.Label(
             self.frame_left,
-            text="Shortcuts :\n-----------------\nB2-press+hold=move map\n" + \
-                 "B1-double-click=select active\n" + \
-                 "Shift+B1=add to batch build\nCtrl+B1=link in Custom Scenery",
+            text=shortcut_text,
             bg="light green",
         ).grid(row=row, column=0, padx=0, pady=5, sticky=N + S + E + W)
         row += 1
@@ -1406,15 +1448,21 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         self.canvas.yview_moveto(y0 / self.resolution)
         self.nx0 = int((8 * x0) // self.resolution)
         self.ny0 = int((8 * y0) // self.resolution)
-        if "dar" in sys.platform:
+        if OsX:
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
+            # Mac Trackpad panning
+            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+            self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
         else:
             self.canvas.bind("<ButtonPress-3>", self.scroll_start)
             self.canvas.bind("<B3-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-3>", self.scroll_stop)
         self.canvas.bind("<Double-Button-1>", self.select_tile)
         self.canvas.bind("<Shift-ButtonPress-1>", self.add_tile)
-        self.canvas.bind("<Control-ButtonPress-1>", self.toggle_to_custom)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        self.canvas.bind(mod_key, self.toggle_to_custom)
         self.canvas.focus_set()
         self.draw_canvas(self.nx0, self.ny0)
         self.active_lat = lat
@@ -1881,6 +1929,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         return
 
     def scroll_start(self, event):
+        self.canvas.config(cursor="closedhand")
         self.canvas.scan_mark(event.x, event.y)
         return
 
@@ -1888,6 +1937,20 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
         self.redraw_canvas()
         return
+
+    def scroll_stop(self, event):
+        self.canvas.config(cursor="")
+        return
+
+    def _on_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.yview_scroll(int(delta), "units")
+        self.redraw_canvas()
+
+    def _on_shift_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.xview_scroll(int(delta), "units")
+        self.redraw_canvas()
 
     def redraw_canvas(self):
         x0 = self.canvas.canvasx(0)
