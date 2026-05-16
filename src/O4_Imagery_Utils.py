@@ -2512,6 +2512,8 @@ def convert_texture(
                 out_file_path,
                 dds_format
             ]
+            if getattr(UI, 'use_gpu_acceleration', True):
+                conv_cmd.append("--gpu")
         elif dds_converter == "magick":
             # ImageMagick fallback
             fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
