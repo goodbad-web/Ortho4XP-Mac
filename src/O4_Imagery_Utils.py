@@ -2480,7 +2480,7 @@ def convert_texture(
 
     # Optional AI Upscale using Neural Engine
     if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
-        upscaled_tmp = file_to_convert.replace(".png", "_upscaled.png")
+        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
         UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
         if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
             file_to_convert = upscaled_tmp
