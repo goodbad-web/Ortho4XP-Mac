@@ -679,16 +679,16 @@ class Ortho4XP_Config(tk.Toplevel):
 
         # Frames
         self.main_frame = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_cfg = tk.Frame(
-            self.main_frame, border=0, padx=5, pady=self.pady, bg="light green"
+            self.main_frame, border=0, padx=5, pady=self.pady, bg=UI.BG_COLOR
         )
         self.frame_dem = tk.Frame(
-            self.frame_cfg, border=0, padx=0, pady=self.pady, bg="light green"
+            self.frame_cfg, border=0, padx=0, pady=self.pady, bg=UI.BG_COLOR
         )
         self.frame_lastbtn = tk.Frame(
-            self.main_frame, border=0, padx=5, pady=self.pady, bg="light green"
+            self.main_frame, border=0, padx=5, pady=self.pady, bg=UI.BG_COLOR
         )
         # Frames properties
         for j in range(8):
@@ -723,7 +723,8 @@ class Ortho4XP_Config(tk.Toplevel):
             tk.Label(
                 self.frame_cfg,
                 text=title,
-                bg="light green",
+                bg=UI.BG_COLOR,
+                fg=UI.FG_COLOR,
                 anchor=W,
                 font="TKFixedFont 14",
             ).grid(
@@ -849,7 +850,8 @@ class Ortho4XP_Config(tk.Toplevel):
         tk.Label(
             self.frame_cfg,
             text="Application ",
-            bg="light green",
+            bg=UI.BG_COLOR,
+            fg=UI.FG_COLOR,
             anchor=W,
             font="TKFixedFont 14",
         ).grid(row=row, column=0, columnspan=4, pady=10, sticky=N + S + E + W)

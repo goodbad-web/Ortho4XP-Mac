@@ -1,6 +1,24 @@
 import os
 import sys
 import time
+import subprocess
+
+def is_dark_mode():
+    if sys.platform != "darwin": return False
+    try:
+        result = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True, timeout=1)
+        return "Dark" in result.stdout
+    except:
+        return False
+
+is_dark = is_dark_mode()
+BG_COLOR = "#2c2c2c" if is_dark else "light green"
+FG_COLOR = "#e0e0e0" if is_dark else "black"
+ENTRY_BG = "#3d3d3d" if is_dark else "white"
+ENTRY_FG = "#4ea8de" if is_dark else "blue"
+ACCENT_BG = "#1a1a1a" if is_dark else "dark green"
+BTN_BG = "#3a3a3a" if is_dark else "light green"
+
 
 Ortho4XP_dir = ".." if getattr(sys, "frozen", False) else "."
 verbosity = 1
