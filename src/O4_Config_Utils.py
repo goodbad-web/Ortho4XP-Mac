@@ -371,7 +371,6 @@ list_app_vars = [
     "overpass_server_choice",
     "skip_downloads",
     "skip_converts",
-    "use_neural_upscale",
     "max_convert_slots",
     "max_download_slots",
     "check_tms_response",
@@ -424,6 +423,7 @@ list_dsf_vars = [
     "cover_airports_with_highres",
     "cover_extent",
     "cover_zl",
+    "use_neural_upscale",
     "water_tech",
     "ratio_bathy",
     "ratio_water",
@@ -596,23 +596,26 @@ class Tile:
                         value = value[1:]
                     if value and value[-1] in ('"', "'"):
                         value = value[:-1]
-                    if cfg_vars[var]["type"] in (bool, list):
-                        cmd = "self." + var + "=" + value
+                    if cfg_vars[var]["type"] == bool:
+                        val = (value.lower() == "true")
+                    elif cfg_vars[var]["type"] == list:
+                        try:
+                            val = eval(value)
+                        except:
+                            continue
                     else:
-                        cmd = (
-                            "self."
-                            + var
-                            + "=cfg_vars['"
-                            + var
-                            + "']['type'](value)"
-                        )
-                    exec(cmd)
+                        try:
+                            val = cfg_vars[var]["type"](value)
+                        except:
+                            continue
+                    setattr(self, var, val)
                 except Exception as e:
                     # compatibility with zone_list config files from 
                     # version <= 1.20
                     if "zone_list.append" in line:
                         try:
-                            exec("self." + line)
+                            item = eval(line.split(".append(")[1][:-1])
+                            self.zone_list.append(item)
                         except:
                             pass
                     else:
@@ -1159,38 +1162,35 @@ class Ortho4XP_Config(tk.Toplevel):
         errors = []
         for var in list_tile_vars + list_app_vars:
             try:
-                target = (
-                    cfg_vars[var]["module"] + "." + var
-                    if "module" in cfg_vars[var]
-                    else "globals()['" + var + "']"
-                )
-                if cfg_vars[var]["type"] in (bool, list):
-                    cmd = target + "=" + self.v_[var].get()
+                value_str = self.v_[var].get()
+                if cfg_vars[var]["type"] == bool:
+                    val = (value_str.lower() == "true")
+                elif cfg_vars[var]["type"] == list:
+                    val = eval(value_str)
                 else:
-                    cmd = (
-                        target
-                        + "=cfg_vars['"
-                        + var
-                        + "']['type'](self.v_['"
-                        + var
-                        + "'].get())"
-                    )
-                exec(cmd)
+                    val = cfg_vars[var]["type"](value_str)
+                
+                if "module" in cfg_vars[var]:
+                    module_name = cfg_vars[var]["module"]
+                    if module_name == "UI": setattr(UI, var, val)
+                    elif module_name == "OSM": setattr(OSM, var, val)
+                    elif module_name == "IMG": setattr(IMG, var, val)
+                    elif module_name == "TILE": setattr(TILE, var, val)
+                    elif module_name == "OVL": setattr(OVL, var, val)
+                else:
+                    globals()[var] = val
             except:
-                target = (
-                    cfg_vars[var]["module"] + "." + var
-                    if "module" in cfg_vars[var]
-                    else "globals()['" + var + "']"
-                )
-                self.v_[var].set(str(cfg_vars[var]["default"]))
-                exec(
-                    target
-                    + "=cfg_vars['"
-                    + var
-                    + "']['type'](cfg_vars['"
-                    + var
-                    + "']['default'])"
-                )
+                default_val = cfg_vars[var]["default"]
+                if "module" in cfg_vars[var]:
+                    module_name = cfg_vars[var]["module"]
+                    if module_name == "UI": setattr(UI, var, default_val)
+                    elif module_name == "OSM": setattr(OSM, var, default_val)
+                    elif module_name == "IMG": setattr(IMG, var, default_val)
+                    elif module_name == "TILE": setattr(TILE, var, default_val)
+                    elif module_name == "OVL": setattr(OVL, var, default_val)
+                else:
+                    globals()[var] = default_val
+                self.v_[var].set(str(default_val))
                 errors.append(var)
         if errors:
             error_text = (
