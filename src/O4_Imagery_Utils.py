@@ -2503,21 +2503,14 @@ def convert_texture(
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # Native Apple Silicon conversion via ASHelper
-            dds_tool = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
-            if not os.path.exists(dds_tool): dds_tool = dds_convert_cmd
-            conv_cmd = [
-                dds_tool,
-                "--convert",
-                file_to_convert,
-                out_file_path,
-                dds_format
-            ]
+            executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+            target_fmt = dds_format if not dxt5 else "BC3"
+            conv_cmd = [executable, "--convert", file_to_convert, out_file_path, target_fmt]
             if getattr(UI, 'use_gpu_acceleration', True):
                 conv_cmd.append("--gpu")
         elif dds_converter == "magick":
             # ImageMagick fallback
             fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
-            if dxt5: fmt = "dxt5"
             conv_cmd = [
                 "magick",
                 file_to_convert,
@@ -2530,7 +2523,7 @@ def convert_texture(
             dds_tool = dds_convert_cmd
             if dds_format == "BC7":
                 fmt = "-bc7"
-            elif dds_format == "BC3" or dxt5:
+            elif dds_format == "BC3":
                 fmt = "-bc3"
             else:
                 fmt = "-bc1"
@@ -2538,9 +2531,11 @@ def convert_texture(
 
         # Execute conversion
         try:
-            subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            if retcode != 0:
+                UI.vprint(1, f"      Error: DDS conversion failed with return code {retcode} ({dds_converter})")
         except Exception as e:
-            UI.vprint(1, f"      Error during DDS conversion with {dds_converter}: {str(e)}")
+            UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
     else:
         (latmax, lonmin) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         (latmin, lonmax) = GEO.gtile_to_wgs84(
