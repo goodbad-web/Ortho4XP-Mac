@@ -2498,59 +2498,48 @@ def convert_texture(
     # eventually the dds conversion
     if type == "dds":
         out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
-        if use_texture_converter:
-            # Metal optimized conversion
-            compression = "BC3" if dxt5 else "BC1"
+        dds_converter = getattr(IMG, 'dds_converter', 'nvcompress')
+        dds_format = getattr(IMG, 'dds_format', 'BC3')
+
+        if dds_converter == "TextureConverter":
+            # Native Apple Silicon conversion via ASHelper
+            dds_tool = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
             conv_cmd = [
-                dds_convert_cmd,
-                "--compression_format=" + compression,
-                "--compression_quality=Normal",
-                "--output=" + out_file_path,
-                file_to_convert
-            ]
-        # Use nvcompress as primary for maximum XP12 compatibility (clean headers)
-        nvcompress_mac = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "nvcompress")
-        if os.path.exists(nvcompress_mac):
-            dds_convert_cmd = nvcompress_mac
-            compression = "-bc3" if dxt5 else "-bc1"
-            conv_cmd = [
-                dds_convert_cmd,
-                compression,
+                dds_tool,
+                "--convert",
                 file_to_convert,
-                out_file_path
+                out_file_path,
+                dds_format
             ]
-        elif use_magick:
-            # Native Magick conversion (fallback)
-            compression = "dxt5" if dxt5 else "dxt1"
+        elif dds_converter == "magick":
+            # ImageMagick fallback
+            fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" # Magick might not do BC7 well
+            if dxt5: fmt = "dxt5"
             conv_cmd = [
-                dds_convert_cmd,
+                "magick",
                 file_to_convert,
-                "-strip",
-                "-alpha", "on" if dxt5 else "off",
-                "-define", f"dds:compression={compression}",
+                "-define", f"dds:compression={fmt}",
                 "-define", "dds:cluster-fit=true",
                 "-define", "dds:mipmaps=13",
                 out_file_path
             ]
-        else:
-            # Legacy nvcompress conversion (x86_64)
-            # Remove devnull_rdir from list as it causes errors in subprocess.Popen with list
-            if not dxt5:
-                conv_cmd = [
-                    dds_convert_cmd,
-                    "-bc1",
-                    "-fast",
-                    file_to_convert,
-                    out_file_path
-                ]
+        else: # Default: nvcompress
+            dds_tool = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "nvcompress")
+            if dds_format == "BC7":
+                fmt = "-bc7"
+            elif dds_format == "BC3" or dxt5:
+                fmt = "-bc3"
             else:
-                conv_cmd = [
-                    dds_convert_cmd,
-                    "-bc3",
-                    "-fast",
-                    file_to_convert,
-                    out_file_path
-                ]
+                fmt = "-bc1"
+            
+            # Use -fast for nvcompress on Mac/Rosetta to improve stability/speed
+            conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
+
+        # Execute conversion
+        try:
+            subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        except Exception as e:
+            UI.vprint(1, f"      Error during DDS conversion with {dds_converter}: {str(e)}")
     else:
         (latmax, lonmin) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         (latmin, lonmax) = GEO.gtile_to_wgs84(
