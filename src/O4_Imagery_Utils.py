@@ -2501,9 +2501,10 @@ def convert_texture(
         dds_converter = getattr(IMG, 'dds_converter', 'nvcompress')
         dds_format = getattr(IMG, 'dds_format', 'BC3')
 
-        if dds_converter == "TextureConverter":
+        if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # Native Apple Silicon conversion via ASHelper
             dds_tool = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+            if not os.path.exists(dds_tool): dds_tool = dds_convert_cmd
             conv_cmd = [
                 dds_tool,
                 "--convert",
@@ -2513,7 +2514,7 @@ def convert_texture(
             ]
         elif dds_converter == "magick":
             # ImageMagick fallback
-            fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" # Magick might not do BC7 well
+            fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
             if dxt5: fmt = "dxt5"
             conv_cmd = [
                 "magick",
@@ -2523,16 +2524,14 @@ def convert_texture(
                 "-define", "dds:mipmaps=13",
                 out_file_path
             ]
-        else: # Default: nvcompress
-            dds_tool = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "nvcompress")
+        else: # Default: nvcompress (uses globally defined dds_convert_cmd)
+            dds_tool = dds_convert_cmd
             if dds_format == "BC7":
                 fmt = "-bc7"
             elif dds_format == "BC3" or dxt5:
                 fmt = "-bc3"
             else:
                 fmt = "-bc1"
-            
-            # Use -fast for nvcompress on Mac/Rosetta to improve stability/speed
             conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
 
         # Execute conversion
