@@ -13,10 +13,11 @@ using namespace metal;
 
 kernel void compressDXT(texture2d<float, access::read> input [[texture(0)]],
                         device uchar *output [[buffer(0)]],
-                        constant bool &isDXT5 [[buffer(1)]],
+                        constant uchar &isDXT5Value [[buffer(1)]],
                         uint2 gid [[thread_position_in_grid]]) {
     uint2 pos = gid * 4;
     if (pos.x >= input.get_width() || pos.y >= input.get_height()) return;
+    bool isDXT5 = (isDXT5Value != 0);
 
     float3 minC = float3(1.0);
     float3 maxC = float3(0.0);
@@ -135,7 +136,8 @@ func compressGPU(cgImage: CGImage, isDXT5: Bool) -> Data? {
     tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: raw, bytesPerRow: w * 4)
     let bW = (w + 3) / 4; let bH = (h + 3) / 4; let sz = bW * bH * (isDXT5 ? 16 : 8)
     guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared), let cmb = q.makeCommandBuffer(), let enc = cmb.makeComputeCommandEncoder() else { return nil }
-    var dxt5 = isDXT5; enc.setComputePipelineState(pipe); enc.setTexture(tex, index: 0); enc.setBuffer(buf, offset: 0, index: 0); enc.setBytes(&dxt5, length: 1, index: 1)
+    var dxt5Value: UInt8 = isDXT5 ? 1 : 0
+    enc.setComputePipelineState(pipe); enc.setTexture(tex, index: 0); enc.setBuffer(buf, offset: 0, index: 0); enc.setBytes(&dxt5Value, length: 1, index: 1)
     enc.dispatchThreadgroups(MTLSize(width: (bW + 15) / 16, height: (bH + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     enc.endEncoding(); cmb.commit(); cmb.waitUntilCompleted(); return Data(bytes: buf.contents(), count: sz)
 }
