@@ -36,8 +36,6 @@ def mask_name_for_texture(tile, til_x_left, til_y_top, zl, *args):
 
 ################################################################################
 def needs_mask(tile, til_x_left, til_y_top, zl, *args):
-    if int(zl) >= 18:
-        return None
     if int(zl) < tile.mask_zl:
         return False
     factor = 2 ** (zl - tile.mask_zl)

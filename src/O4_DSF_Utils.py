@@ -337,7 +337,7 @@ def create_terrain_file(
 
         f.write("BASE_TEX_NOWRAP ../textures/" + texture_file_name + "\n")
 
-        if int(zoomlevel) >= 18:
+        if int(zoomlevel) >= 18 and tri_type == 0:
             f.write("NO_ALPHA\n")
             return ter_file_name
 
@@ -696,8 +696,7 @@ def build_dsf(tile, download_queue):
     # First potentially masked water tris
     for tri in range(nbr_tris):
         tri_type = tri_types[tri]
-        texture_attributes = tri_tex_attr[tri]
-        if (tri_type != 2) or (int(texture_attributes[2]) >= 18):
+        if (tri_type != 2):
             continue
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         if done % step == 0:
