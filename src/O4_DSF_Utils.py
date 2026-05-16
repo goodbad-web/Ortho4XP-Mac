@@ -224,18 +224,30 @@ def zone_list_to_ortho_dico(tile):
         ]
         masks_draw.polygon(pol, fill=i)
         i += 1
-    for til_x in range(til_x_min, til_x_max + 1, 16):
-        for til_y in range(til_y_min, til_y_max + 1, 16):
+    # Resolution of the mesh_zl grid in terms of the 4096x4096nd airport_array
+    step_x = 4096 / (til_x_max - til_x_min + 1)
+    step_y = 4096 / (til_y_max - til_y_min + 1)
+
+    for til_x in range(til_x_min, til_x_max + 1):
+        for til_y in range(til_y_min, til_y_max + 1):
             (latp, lonp) = GEO.gtile_to_wgs84(
-                til_x + 8, til_y + 8, tile.mesh_zl
+                til_x + 0.5, til_y + 0.5, tile.mesh_zl
             )
             lonp = max(min(lonp, tile.lon + 1), tile.lon)
             latp = max(min(latp, tile.lat + 1), tile.lat)
             x = round((lonp - tile.lon) * 4095)
             y = round((tile.lat + 1 - latp) * 4095)
             (zoomlevel, provider_code) = dico_tmp[masks_im.getpixel((x, y))]
-            if airport_array[y, x]:
+            
+            # Check a block in airport_array instead of a single pixel
+            x0 = int(max(0, x - step_x / 2))
+            x1 = int(min(4095, x + step_x / 2))
+            y0 = int(max(0, y - step_y / 2))
+            y1 = int(min(4095, y + step_y / 2))
+            
+            if airport_array[y0 : y1 + 1, x0 : x1 + 1].any():
                 zoomlevel = max(zoomlevel, tile.cover_zl)
+                
             til_x_text = 16 * (
                 int(til_x / 2 ** (tile.mesh_zl - zoomlevel)) // 16
             )
@@ -288,6 +300,9 @@ def create_terrain_file(
     tri_type,
     is_overlay,
 ):
+    # Force land for high-res airport tiles to avoid misidentification as water
+    if int(zoomlevel) >= 18:
+        tri_type = 0
 
     if not os.path.exists(os.path.join(tile.build_dir, "terrain")):
         os.makedirs(os.path.join(tile.build_dir, "terrain"))
@@ -321,6 +336,10 @@ def create_terrain_file(
         )
 
         f.write("BASE_TEX_NOWRAP ../textures/" + texture_file_name + "\n")
+
+        if int(zoomlevel) >= 18:
+            f.write("NO_ALPHA\n")
+            return ter_file_name
 
         if tri_type in (1, 2) and (not is_overlay):  # XP12 water
             #pass
@@ -677,7 +696,8 @@ def build_dsf(tile, download_queue):
     # First potentially masked water tris
     for tri in range(nbr_tris):
         tri_type = tri_types[tri]
-        if (tri_type != 2):
+        texture_attributes = tri_tex_attr[tri]
+        if (tri_type != 2) or (int(texture_attributes[2]) >= 18):
             continue
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         if done % step == 0:
@@ -688,6 +708,8 @@ def build_dsf(tile, download_queue):
         done += 1
         texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
+        if int(texture_attributes[2]) >= 18:
+            tri_type = 0
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
         
@@ -836,6 +858,9 @@ def build_dsf(tile, download_queue):
                         ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
                                                             node_bathy, tile)
                         ratio_fetch = 1
+                        if int(texture_attributes[2]) >= 18:
+                            ratio_bathy = 0
+                            ratio_fetch = 0
                         dsf_pools[idx_dsfpool].extend(
                             (int(65535 * ratio_fetch), int(65535 * ratio_bathy), 
                              int(round(s * 65535)), int(round(t * 65535)))
@@ -911,6 +936,8 @@ def build_dsf(tile, download_queue):
         done += 1
         texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
+        if int(texture_attributes[2]) >= 18:
+            tri_type = 0
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
 
@@ -935,6 +962,9 @@ def build_dsf(tile, download_queue):
                             )
                 rebuild = False
                 if (not os.path.isfile(target_tex)):
+                    rebuild = True
+                # Force rebuild for high-res tiles to apply recent logic changes
+                if int(texture_attributes[2]) >= 18:
                     rebuild = True
                 if (rebuild):
                     download_queue.put(texture_attributes)

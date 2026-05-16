@@ -2408,6 +2408,11 @@ def convert_texture(
                 if small_array.max() > 30:
                     masked_texture = True
 
+    # Universal override for high-res airport tiles (always land, no mask)
+    if int(zoomlevel) >= 18:
+        masked_texture = False
+        dxt5 = False
+
     if provider_code in providers_dict:
         jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2451,7 +2456,7 @@ def convert_texture(
     # color correction is required.
     elif (
         providers_dict[provider_code]["color_filters"] != "none"
-    ) or masked_texture:
+    ) or masked_texture or (int(zoomlevel) >= 18):
         big_image = Image.open(
             os.path.join(file_dir, jpeg_file_name), "r"
         ).convert("RGB")
@@ -2503,16 +2508,28 @@ def convert_texture(
                 "--output=" + out_file_path,
                 file_to_convert
             ]
+        # Use nvcompress as primary for maximum XP12 compatibility (clean headers)
+        nvcompress_mac = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "nvcompress")
+        if os.path.exists(nvcompress_mac):
+            dds_convert_cmd = nvcompress_mac
+            compression = "-bc3" if dxt5 else "-bc1"
+            conv_cmd = [
+                dds_convert_cmd,
+                compression,
+                file_to_convert,
+                out_file_path
+            ]
         elif use_magick:
-            # Native Magick conversion (arm64)
-            # We include mipmaps as they are required for performance and stability in X-Plane 12
+            # Native Magick conversion (fallback)
             compression = "dxt5" if dxt5 else "dxt1"
             conv_cmd = [
                 dds_convert_cmd,
                 file_to_convert,
+                "-strip",
+                "-alpha", "on" if dxt5 else "off",
                 "-define", f"dds:compression={compression}",
-                "-define", "dds:cluster-fit=true", # Better quality
-                "-define", "dds:mipmaps=11",       # 11 mipmaps for 4096x4096px
+                "-define", "dds:cluster-fit=true",
+                "-define", "dds:mipmaps=13",
                 out_file_path
             ]
         else:
