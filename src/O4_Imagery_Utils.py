@@ -59,24 +59,26 @@ use_texture_converter = False
 as_helper_cmd = None
 
 if "dar" in sys.platform:
-    # 1. Try TextureConverter (Metal/GPU optimized)
-    try:
-        texture_converter = subprocess.check_output(["xcrun", "-f", "textureconverter"], text=True).strip()
-    except:
-        texture_converter = None
-        
-    if texture_converter:
-        dds_convert_cmd = texture_converter
-        use_texture_converter = True
-        use_magick = False
-    else:
+    # 1. Try native 'magick' (Apple Silicon optimization)
+    # We prioritize magick over textureconverter because the latter produces 
+    # DX10 headers that are incompatible with X-Plane 12's terrain engine.
+    magick_cmd = shutil.which("magick")
+    if magick_cmd:
+        dds_convert_cmd = magick_cmd
+        use_magick = True
         use_texture_converter = False
-        # 2. Try native 'magick' (Apple Silicon optimization)
-        magick_cmd = shutil.which("magick")
-        if magick_cmd:
-            dds_convert_cmd = magick_cmd
-            use_magick = True
+    else:
+        use_magick = False
+        # 2. Try TextureConverter (Metal/GPU optimized)
+        try:
+            texture_converter = subprocess.check_output(["xcrun", "-f", "textureconverter"], text=True).strip()
+        except:
+            texture_converter = None
+        if texture_converter:
+            dds_convert_cmd = texture_converter
+            use_texture_converter = True
         else:
+            use_texture_converter = False
             dds_convert_cmd = os.path.join(
                 UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
             )
@@ -2503,14 +2505,14 @@ def convert_texture(
             ]
         elif use_magick:
             # Native Magick conversion (arm64)
-            # We don't use devnull_rdir here because subprocess.run/Popen with list doesn't support shell redirects
+            # We include mipmaps as they are required for performance and stability in X-Plane 12
             compression = "dxt5" if dxt5 else "dxt1"
             conv_cmd = [
                 dds_convert_cmd,
-                "convert",
                 file_to_convert,
                 "-define", f"dds:compression={compression}",
                 "-define", "dds:cluster-fit=true", # Better quality
+                "-define", "dds:mipmaps=11",       # 11 mipmaps for 4096x4096px
                 out_file_path
             ]
         else:
@@ -2642,7 +2644,7 @@ def convert_texture(
             os.remove(upscaled_file_to_delete)
         except:
             pass
-    return
+    return 1
 
 
 ################################################################################
