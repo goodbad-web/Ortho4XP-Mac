@@ -160,22 +160,47 @@ class DEM:
                         if ensure_elevation(short_source, self.lat, self.lon):
                             file_name = FNAMES.elevation_data(short_source, self.lat, self.lon)
                         else:
-                            file_name = source # keep original so it still errors gracefully if even fallback fails
+                            # If even fallback fails, don't pass the directory to read_elevation_from_file
+                            # instead, set to empty so it gets zero altitude in read_elevation_from_file or here
+                            file_name = "" 
             else:
                 file_name = source
-            (
-                self.epsg,
-                self.x0,
-                self.y0,
-                self.x1,
-                self.y1,
-                self.nodata,
-                self.nxdem,
-                self.nydem,
-                self.alt_dem,
-            ) = read_elevation_from_file(
-                file_name, self.lat, self.lon, info_only
-            )
+            if not file_name:
+                (
+                    self.epsg,
+                    self.x0,
+                    self.y0,
+                    self.x1,
+                    self.y1,
+                    self.nodata,
+                    self.nxdem,
+                    self.nydem,
+                    self.alt_dem,
+                ) = (
+                    4326,
+                    0,
+                    0,
+                    1,
+                    1,
+                    -32768,
+                    3601,
+                    3601,
+                    numpy.zeros((3601, 3601), dtype=numpy.float32),
+                )
+            else:
+                (
+                    self.epsg,
+                    self.x0,
+                    self.y0,
+                    self.x1,
+                    self.y1,
+                    self.nodata,
+                    self.nxdem,
+                    self.nydem,
+                    self.alt_dem,
+                ) = read_elevation_from_file(
+                    file_name, self.lat, self.lon, info_only
+                )
         if not local_sources:
             return
         self.subdems = tuple()
@@ -470,6 +495,8 @@ def read_elevation_from_file(
         epsg = 4326
         nodata = -32768
         try:
+            if not os.path.isfile(file_name):
+                raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
             if not info_only:
                 alt_dem = (
@@ -498,6 +525,8 @@ def read_elevation_from_file(
 
     elif file_name[-4:].lower() == ".raw":
         try:
+            if not os.path.isfile(file_name):
+                raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
             f = open(file_name, "rb")
             alt = array.array("h")
