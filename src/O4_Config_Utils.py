@@ -789,10 +789,18 @@ class Ortho4XP_Config(tk.Toplevel):
         ).grid(row=0, column=0, padx=2, pady=2, sticky=E + W)
         # self.entry_[item]=tk.Entry(self.frame_dem,textvariable=self.v_[item],
         # bg='white',fg='blue',width=80)
-        values = DEM.available_sources[1::2]
+        # Collect subdirectories in Elevation_data for the pull-down
+        dem_values = list(DEM.available_sources[1::2])
+        try:
+            for entry in sorted(os.listdir(FNAMES.Elevation_dir)):
+                full_path = os.path.join(FNAMES.Elevation_dir, entry)
+                if os.path.isdir(full_path) and not entry.startswith("+"):
+                    dem_values.append(full_path)
+        except:
+            pass
         self.entry_[item] = ttk.Combobox(
             self.frame_dem,
-            values=values,
+            values=dem_values,
             textvariable=self.v_[item],
             width=80,
             style="O4.TCombobox",
