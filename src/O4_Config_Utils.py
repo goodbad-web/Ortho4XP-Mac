@@ -98,6 +98,12 @@ a particular server.",
         "default": 5,
         "hint": "How much times do we try again after an internal server error for an imagery request. Only used if check_tms_response is set to True.",
     },
+    "use_neural_upscale": {
+        "module": "IMG",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon Neural Engine (Vision/CoreML) for texture upscaling. Requires macOS 12.0+.",
+    },
     "ovl_exclude_pol": {
         "module": "OVL",
         "type": list,
@@ -365,6 +371,7 @@ list_app_vars = [
     "overpass_server_choice",
     "skip_downloads",
     "skip_converts",
+    "use_neural_upscale",
     "max_convert_slots",
     "max_download_slots",
     "check_tms_response",
@@ -801,6 +808,8 @@ class Ortho4XP_Config(tk.Toplevel):
         )
         dem_button.grid(row=0, column=2, padx=2, pady=0, sticky=W)
         dem_button.bind("<Shift-ButtonPress-1>", self.add_dem)
+        dem_button.bind("<Control-ButtonPress-1>", self.choose_dem_dir)
+        dem_button.bind("<Shift-Control-ButtonPress-1>", self.add_dem_dir)
         item = "fill_nodata"
         ttk.Button(
             self.frame_cfg,
@@ -994,6 +1003,21 @@ class Ortho4XP_Config(tk.Toplevel):
                 ("all files", ".*"),
             ],
         )
+        if tmp:
+            if not self.v_["custom_dem"].get():
+                self.v_["custom_dem"].set(str(tmp))
+            else:
+                self.v_["custom_dem"].set(
+                    self.v_["custom_dem"].get() + ";" + str(tmp)
+                )
+
+    def choose_dem_dir(self, event):
+        tmp = filedialog.askdirectory(parent=self, title="Choose DEM folder")
+        if tmp:
+            self.v_["custom_dem"].set(str(tmp))
+
+    def add_dem_dir(self, event):
+        tmp = filedialog.askdirectory(parent=self, title="Choose DEM folder")
         if tmp:
             if not self.v_["custom_dem"].get():
                 self.v_["custom_dem"].set(str(tmp))

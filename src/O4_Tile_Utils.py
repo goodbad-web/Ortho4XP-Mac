@@ -148,16 +148,19 @@ def build_tile(tile):
             )
             config_data = {
                 'use_magick': IMG.use_magick,
+                'use_texture_converter': getattr(IMG, 'use_texture_converter', False),
                 'dds_convert_cmd': IMG.dds_convert_cmd,
                 'gdal_transl_cmd': IMG.gdal_transl_cmd,
                 'gdalwarp_cmd': IMG.gdalwarp_cmd,
+                'as_helper_cmd': getattr(IMG, 'as_helper_cmd', None),
                 'providers_dict': IMG.providers_dict,
                 'local_combined_providers_dict': IMG.local_combined_providers_dict,
                 'color_filters_dict': IMG.color_filters_dict,
                 'extents_dict': IMG.extents_dict,
                 'Ortho4XP_dir': UI.Ortho4XP_dir,
                 'verbosity': UI.verbosity,
-                'cleaning_level': UI.cleaning_level
+                'cleaning_level': UI.cleaning_level,
+                'use_neural_upscale': getattr(tile, 'use_neural_upscale', False)
             }
             # Collect conversion arguments from queue
             convert_list = []

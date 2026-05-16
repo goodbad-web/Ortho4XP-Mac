@@ -14,6 +14,18 @@ log = True
 def progress_bar(nbr, percentage, message=None):
     if gui:
         gui.pgrb_queue.put((nbr, percentage))
+    else:
+        # Command line progress bar
+        bar_length = 30
+        filled_length = int(bar_length * percentage // 100)
+        bar = '#' * filled_length + '-' * (bar_length - filled_length)
+        prefix = "Progress"
+        if nbr == 2: prefix = "Downloads"
+        elif nbr == 3: prefix = "DDS Conv "
+        sys.stdout.write(f"\r{prefix}: [{bar}] {percentage:3d}%")
+        sys.stdout.flush()
+        if percentage >= 100:
+            sys.stdout.write('\n')
 
 
 ################################################################################

@@ -16,13 +16,13 @@ custom_overlay_src = ""
 
 if "dar" in sys.platform:
     unzip_cmd = "7z "
-    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "mac", "DSFTool ")
+    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "mac", "DSFTool")
 elif "win" in sys.platform:
     unzip_cmd = os.path.join(FNAMES.Utils_dir, "win", "7z.exe ")
-    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "win", "DSFTool.exe ")
+    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "win", "DSFTool.exe")
 else:
     unzip_cmd = "7z "
-    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "lin", "DSFTool ")
+    dsftool_cmd = os.path.join(FNAMES.Utils_dir, "lin", "DSFTool")
 
 ################################################################################
 def build_overlay(lat, lon):

@@ -55,17 +55,38 @@ request_headers_generic = {
 }
 
 use_magick = False
+use_texture_converter = False
+as_helper_cmd = None
+
 if "dar" in sys.platform:
-    # Try to find native 'magick' first for Apple Silicon optimization
-    magick_cmd = shutil.which("magick")
-    if magick_cmd:
-        dds_convert_cmd = magick_cmd
-        use_magick = True
-    else:
-        dds_convert_cmd = os.path.join(
-            UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
-        )
+    # 1. Try TextureConverter (Metal/GPU optimized)
+    try:
+        texture_converter = subprocess.check_output(["xcrun", "-f", "textureconverter"], text=True).strip()
+    except:
+        texture_converter = None
+        
+    if texture_converter:
+        dds_convert_cmd = texture_converter
+        use_texture_converter = True
         use_magick = False
+    else:
+        use_texture_converter = False
+        # 2. Try native 'magick' (Apple Silicon optimization)
+        magick_cmd = shutil.which("magick")
+        if magick_cmd:
+            dds_convert_cmd = magick_cmd
+            use_magick = True
+        else:
+            dds_convert_cmd = os.path.join(
+                UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
+            )
+            use_magick = False
+    
+    # Apple Silicon Helper for Neural Engine / Media Engine
+    as_helper_cmd = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+    if not os.path.exists(as_helper_cmd):
+        as_helper_cmd = None
+
     gdal_transl_cmd = "gdal_translate"
     gdalwarp_cmd = "gdalwarp"
     devnull_rdir = " >/dev/null 2>&1"
@@ -2295,14 +2316,16 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
 ################################################################################
 # Support for multiprocessing initialization
 def init_worker(config_data):
-    global use_magick, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd
+    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd
     global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
     
     # Restore globals from passed config
     use_magick = config_data['use_magick']
+    use_texture_converter = config_data.get('use_texture_converter', False)
     dds_convert_cmd = config_data['dds_convert_cmd']
     gdal_transl_cmd = config_data['gdal_transl_cmd']
     gdalwarp_cmd = config_data['gdalwarp_cmd']
+    as_helper_cmd = config_data.get('as_helper_cmd')
     providers_dict = config_data['providers_dict']
     local_combined_providers_dict = config_data['local_combined_providers_dict']
     color_filters_dict = config_data['color_filters_dict']
@@ -2310,10 +2333,12 @@ def init_worker(config_data):
     UI.Ortho4XP_dir = config_data['Ortho4XP_dir']
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
+    UI.use_neural_upscale = config_data.get('use_neural_upscale', False)
 
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
 ):
+    upscaled_file_to_delete = None
     if type == "dds":
         out_file_name = FNAMES.dds_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2333,7 +2358,7 @@ def convert_texture(
             UI.Ortho4XP_dir, "tmp", out_file_name.replace("4326", "3857")
         )
     UI.vprint(
-        1, "   Converting orthophoto(s) to build texture " + out_file_name + "."
+        2, "   Converting orthophoto(s) to build texture " + out_file_name + "."
     )
     erase_tmp_png = False
     erase_tmp_tif = False
@@ -2452,11 +2477,36 @@ def convert_texture(
         file_to_convert = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
         erase_tmp_png = True
         big_image.save(file_to_convert)
+
+    # Optional AI Upscale using Neural Engine
+    if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
+        upscaled_tmp = file_to_convert.replace(".png", "_upscaled.png")
+        UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
+        if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
+            file_to_convert = upscaled_tmp
+            erase_tmp_png = True # Make sure to erase the upscaled one too if it's in tmp
+            # We need to track the upscaled file to delete it
+            upscaled_file_to_delete = upscaled_tmp
+        else:
+            upscaled_file_to_delete = None
+    else:
+        upscaled_file_to_delete = None
+
     # finally if nothing needs to be done prior to the conversion
     # eventually the dds conversion
     if type == "dds":
         out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
-        if use_magick:
+        if use_texture_converter:
+            # Metal optimized conversion
+            compression = "BC3" if dxt5 else "BC1"
+            conv_cmd = [
+                dds_convert_cmd,
+                "--compression_format=" + compression,
+                "--compression_quality=Normal",
+                "--output=" + out_file_path,
+                file_to_convert
+            ]
+        elif use_magick:
             # Native Magick conversion (arm64)
             # We don't use devnull_rdir here because subprocess.run/Popen with list doesn't support shell redirects
             compression = "dxt5" if dxt5 else "dxt1"
@@ -2590,6 +2640,11 @@ def convert_texture(
     if erase_tmp_tif:
         try:
             os.remove(tmp_tif_file_name)
+        except:
+            pass
+    if upscaled_file_to_delete:
+        try:
+            os.remove(upscaled_file_to_delete)
         except:
             pass
     return
