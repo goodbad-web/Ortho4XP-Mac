@@ -2736,12 +2736,24 @@ def convert_texture(
                 "(10 tries)",
             )
             break
-        UI.lvprint(
-            1,
-            "WARNING: Could not convert texture",
-            os.path.join(tile.build_dir, "textures", out_file_name),
-        )
-        time.sleep(1)
+        
+        # CPU Fallback: If GPU-accelerated ASHelper failed, try without --gpu next
+        if "--gpu" in conv_cmd:
+            conv_cmd = [x for x in conv_cmd if x != "--gpu"]
+            UI.lvprint(
+                1,
+                "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
+                os.path.join(tile.build_dir, "textures", out_file_name),
+            )
+        else:
+            UI.lvprint(
+                1,
+                "WARNING: Could not convert texture",
+                os.path.join(tile.build_dir, "textures", out_file_name),
+            )
+        
+        # Add random jitter to avoid lockstep retry collisions among multiprocessing workers
+        time.sleep(1 + random.uniform(-0.5, 0.5))
     if erase_tmp_png:
         try:
             os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
