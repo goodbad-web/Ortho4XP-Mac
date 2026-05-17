@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import Vision
 import CoreImage
 import Metal
+import MetalKit
 
 struct DDSHeader {
     var magic: UInt32 = 0x20534444; var size: UInt32 = 124; var flags: UInt32 = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000 
@@ -91,13 +92,16 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
 
 func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     guard let dev = MTLCreateSystemDefaultDevice(), let lib = try? dev.makeLibrary(source: metalSource, options: nil), let fn = lib.makeFunction(name: "compressTexture"), let pipe = try? dev.makeComputePipelineState(function: fn), let q = dev.makeCommandQueue() else { return nil }
-    let w = cgImage.width; let h = cgImage.height
-    let texD = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: true); texD.usage = [.shaderRead, .shaderWrite, .pixelFormatView]
-    guard let tex = dev.makeTexture(descriptor: texD) else { return nil }
-    let raw = getRawRGBA(cgImage: cgImage)
-    raw.withUnsafeBytes { tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: w * 4) }
-    guard let cmbM = q.makeCommandBuffer(), let bE = cmbM.makeBlitCommandEncoder() else { return nil }
-    bE.generateMipmaps(for: tex); bE.endEncoding(); cmbM.commit(); cmbM.waitUntilCompleted()
+    
+    let loader = MTKTextureLoader(device: dev)
+    let options: [MTKTextureLoader.Option: Any] = [
+        .SRGB: false,
+        .generateMipmaps: true,
+        .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue | MTLTextureUsage.pixelFormatView.rawValue)
+    ]
+    
+    guard let tex = try? loader.newTexture(cgImage: cgImage, options: options) else { return nil }
+    let w = tex.width; let h = tex.height
     
     guard let cmb = q.makeCommandBuffer() else { return nil }
     var buffers: [MTLBuffer] = []
@@ -142,7 +146,6 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
         // Fallback for CPU (no mipmaps for now to keep it simple, or implement scaling)
         hdr.mipmapCount = 1; out = hdr.toData(); if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
         let raw = getRawRGBA(cgImage: img); var dds = Data(); let bW = (w+3)/4; let bH = (h+3)/4
-        for by in 0..<bH { for bx in 0..<bW {
         for by in 0..<bH { for bx in 0..<bW {
             if formatCode >= 1 {
                 var minA: UInt8 = 255; var maxA: UInt8 = 0
@@ -195,7 +198,7 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
                 idx |= (index << (i * 2))
             }
             blk[4]=UInt8(idx&0xFF); blk[5]=UInt8((idx>>8)&0xFF); blk[6]=UInt8((idx>>16)&0xFF); blk[7]=UInt8((idx>>24)&0xFF); dds.append(contentsOf: blk)
-        }}; out.append(dds)
+        }}
     }
     try? out.write(to: URL(fileURLWithPath: outputPath))
 }
