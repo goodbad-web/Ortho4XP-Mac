@@ -34,9 +34,9 @@ def float2qquad(x):
 def numpy_wgs84_to_orthogrid(lat, lon, zoomlevel):
     ratio_x = lon / 180
     ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
-    mult = 2 ** (zoomlevel - 5)
-    til_x = (numpy.floor((ratio_x + 1) * mult).astype(numpy.int32) * 16)
-    til_y = (numpy.floor((1 - ratio_y) * mult).astype(numpy.int32) * 16)
+    mult = 2 ** (zoomlevel - 1)
+    til_x = numpy.floor((ratio_x + 1) * mult).astype(numpy.int32)
+    til_y = numpy.floor((1 - ratio_y) * mult).astype(numpy.int32)
     return til_x, til_y
 
 
@@ -286,6 +286,7 @@ def zone_list_to_ortho_dico(tile):
                             zoomlevel,
                             provider_code,
                         )
+
     return dico_customzl
 ################################################################################
 
@@ -539,8 +540,8 @@ def build_dsf(tile, download_queue):
     til_xs, til_ys = numpy_wgs84_to_orthogrid(tri_lats, tri_lons, tile.mesh_zl)
     
     # Boundary clipping for safety
-    til_x_min, til_y_min = numpy_wgs84_to_orthogrid(tile.lat + 1, tile.lon, tile.mesh_zl)
-    til_x_max, til_y_max = numpy_wgs84_to_orthogrid(tile.lat, tile.lon + 1, tile.mesh_zl)
+    til_x_min, til_y_min = GEO.wgs84_to_orthogrid(tile.lat + 1, tile.lon, tile.mesh_zl)
+    til_x_max, til_y_max = GEO.wgs84_to_orthogrid(tile.lat, tile.lon + 1, tile.mesh_zl)
     til_xs = numpy.clip(til_xs, til_x_min, til_x_max)
     til_ys = numpy.clip(til_ys, til_y_min, til_y_max)
     
