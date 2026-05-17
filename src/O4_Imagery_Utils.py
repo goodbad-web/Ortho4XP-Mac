@@ -2408,10 +2408,7 @@ def convert_texture(
                 if small_array.max() > 30:
                     masked_texture = True
 
-    # Universal override for high-res airport tiles (always land, no mask)
-    if int(zoomlevel) >= 18:
-        masked_texture = False
-        dxt5 = False
+
 
     if provider_code in providers_dict:
         jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(

@@ -302,8 +302,7 @@ def create_terrain_file(
     is_overlay,
 ):
     # Force land for high-res airport tiles to avoid misidentification as water
-    if int(zoomlevel) >= 18:
-        tri_type = 0
+
 
     if not os.path.exists(os.path.join(tile.build_dir, "terrain")):
         os.makedirs(os.path.join(tile.build_dir, "terrain"))
