@@ -63,7 +63,14 @@ def needs_mask(tile, til_x_left, til_y_top, zl, *args):
 
 ################################################################################
 def build_masks(tile, for_imagery=False):
-    
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_masks(tile, for_imagery)
+    finally:
+        UI.flush_build_log(tile.build_dir)
+
+def _build_masks(tile, for_imagery=False):
     if UI.is_working:
         return 0
     UI.is_working = 1

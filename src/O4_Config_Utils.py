@@ -389,6 +389,12 @@ too low to grab these details.",
         "default": True,
         "hint": "When set, the no_data values in the raster will be filled by a nearest neighbour algorithm. If unset, they are turned into zero (can be useful for rasters with no_data over the whole oceanic part or partial LIDAR data).",
     },
+    "write_build_log": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "When set, a detailed build log (Ortho4XP_build.log) will be written directly inside the tile's build directory upon completion or failure of the build steps.",
+    },
 }
 
 list_app_vars = [
@@ -464,6 +470,7 @@ list_dsf_vars = [
     "normal_map_strength",
     "terrain_casts_shadows",
     "use_decal_on_terrain",
+    "write_build_log",
 ]
 list_other_vars = ["custom_dem", "fill_nodata"]
 list_tile_vars = (

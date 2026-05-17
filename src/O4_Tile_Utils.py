@@ -48,6 +48,14 @@ def download_textures(tile, download_queue, convert_queue):
 
 ################################################################################
 def build_tile(tile):
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_tile(tile)
+    finally:
+        UI.flush_build_log(tile.build_dir)
+
+def _build_tile(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
@@ -234,6 +242,15 @@ def build_tile(tile):
 
 ################################################################################
 def build_all(tile):
+    UI.is_building_all = True
+    UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_all(tile)
+    finally:
+        UI.is_building_all = False
+        UI.flush_build_log(tile.build_dir)
+
+def _build_all(tile):
     VMAP.build_poly_file(tile)
     if UI.red_flag:
         UI.exit_message_and_bottom_line("")

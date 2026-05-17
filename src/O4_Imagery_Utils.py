@@ -1635,7 +1635,7 @@ def download_jpeg_ortho(
     file_path = os.path.join(file_dir, file_name)
     if zoomlevel > 16:
         try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) < 512000:
+            if os.path.exists(file_path) and os.path.getsize(file_path) < 150000:
                 UI.vprint(1, f"   [Quality Check] {file_name} is too small ({os.path.getsize(file_path)} bytes). Attempting high-quality crop from ZL16.")
                 parent_zl = 16
                 diff = zoomlevel - parent_zl

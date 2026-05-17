@@ -532,6 +532,14 @@ def extract_mesh_to_obj(
 
 ################################################################################
 def build_mesh(tile):
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_mesh(tile)
+    finally:
+        UI.flush_build_log(tile.build_dir)
+
+def _build_mesh(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1

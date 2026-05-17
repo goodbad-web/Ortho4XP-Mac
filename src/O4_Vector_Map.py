@@ -17,6 +17,14 @@ good_imagery_list = ()
 
 ################################################################################
 def build_poly_file(tile):
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_poly_file(tile)
+    finally:
+        UI.flush_build_log(tile.build_dir)
+
+def _build_poly_file(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
