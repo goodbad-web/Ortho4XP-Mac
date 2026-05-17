@@ -98,20 +98,19 @@ def build_poly_file(tile):
     UI.vprint(0, "-> Inserting edges related to the orthophotos grid")
     xgrid = set()  # x coordinates of vertical grid lines
     ygrid = set()  # y coordinates of horizontal grid lines
+    grid_zl = max([tile.mesh_zl, tile.cover_zl] + [zone[1] for zone in tile.zone_list])
     (til_xul, til_yul) = GEO.wgs84_to_orthogrid(
-        tile.lat + 1, tile.lon, tile.mesh_zl
+        tile.lat + 1, tile.lon, grid_zl
     )
     (til_xlr, til_ylr) = GEO.wgs84_to_orthogrid(
-        tile.lat, tile.lon + 1, tile.mesh_zl
+        tile.lat, tile.lon + 1, grid_zl
     )
     for til_x in range(til_xul + 16, til_xlr + 1, 16):
-        pos_x = til_x / (2 ** (tile.mesh_zl - 1)) - 1
+        pos_x = til_x / (2 ** (grid_zl - 1)) - 1
         xgrid.add(pos_x * 180 - tile.lon)
-        #print("x", pos_x * 180 - tile.lon)
     for til_y in range(til_yul + 16, til_ylr + 1, 16):
-        pos_y = 1 - (til_y) / (2 ** (tile.mesh_zl - 1))
+        pos_y = 1 - (til_y) / (2 ** (grid_zl - 1))
         ygrid.add(360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat)
-        #print("y", (360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat))
 
     xgrid.add(0)
     xgrid.add(1)
