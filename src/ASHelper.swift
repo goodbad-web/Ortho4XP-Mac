@@ -28,14 +28,33 @@ kernel void compressTexture(texture2d<float, access::read> input [[texture(0)]],
     uint2 pos = gid * 4; if (pos.x >= input.get_width() || pos.y >= input.get_height()) return;
     float3 minC = float3(1.0); float3 maxC = float3(0.0); float minA = 1.0; float maxA = 0.0;
     for (uint y = 0; y < 4; y++) { for (uint x = 0; x < 4; x++) {
-        float4 color = input.read(pos + uint2(x, y)); minC = min(minC, color.rgb); maxC = max(maxC, color.rgb); minA = min(minA, color.a); maxA = max(maxA, color.a);
+        uint2 readPos = min(pos + uint2(x, y), uint2(input.get_width() - 1, input.get_height() - 1));
+        float4 color = input.read(readPos);
+        minC = min(minC, color.rgb); maxC = max(maxC, color.rgb); minA = min(minA, color.a); maxA = max(maxA, color.a);
     }}
     uint blocksPerRow = (input.get_width() + 3) / 4;
     uint offset = (gid.y * blocksPerRow + gid.x) * (formatMode == 0 ? 8 : 16);
     if (formatMode >= 1) {
         output[offset] = (uchar)(maxA * 255.0); output[offset + 1] = (uchar)(minA * 255.0);
-        uint64_t aIndices = 0; float midA = (maxA + minA) / 2.0;
-        for (int i = 0; i < 16; i++) { if (input.read(pos + uint2(i % 4, i / 4)).a < midA) aIndices |= (1ULL << (i * 3)); }
+        uint64_t aIndices = 0;
+        float a0 = maxA;
+        float a1 = minA;
+        float step = (a0 - a1) / 7.0;
+        for (int i = 0; i < 16; i++) {
+            uint2 readPos = min(pos + uint2(i % 4, i / 4), uint2(input.get_width() - 1, input.get_height() - 1));
+            float a = input.read(readPos).a;
+            uint index = 0;
+            if (a0 > a1) {
+                float minDist = abs(a - a0);
+                for (uint j = 1; j <= 6; j++) {
+                    float val = a0 - float(j) * step;
+                    float dist = abs(a - val);
+                    if (dist < minDist) { minDist = dist; index = j + 1; }
+                }
+                if (abs(a - a1) < minDist) { index = 1; }
+            }
+            aIndices |= ((uint64_t)index << (i * 3));
+        }
         for (int i = 0; i < 6; i++) output[offset + 2 + i] = (uchar)((aIndices >> (i * 8)) & 0xFF);
         offset += 8;
     }
@@ -43,7 +62,22 @@ kernel void compressTexture(texture2d<float, access::read> input [[texture(0)]],
     ushort c1 = ((ushort)(minC.r * 31.0) << 11) | ((ushort)(minC.g * 63.0) << 5) | (ushort)(minC.b * 31.0);
     output[offset] = c0 & 0xFF; output[offset + 1] = c0 >> 8; output[offset + 2] = c1 & 0xFF; output[offset + 3] = c1 >> 8;
     uint32_t indices = 0;
-    for (int i = 0; i < 16; i++) { if (distance(input.read(pos + uint2(i % 4, i / 4)).rgb, minC) < distance(input.read(pos + uint2(i % 4, i / 4)).rgb, maxC)) indices |= (1 << (i * 2)); }
+    float3 c2 = (2.0 * maxC + minC) / 3.0;
+    float3 c3 = (maxC + 2.0 * minC) / 3.0;
+    for (int i = 0; i < 16; i++) {
+        uint2 readPos = min(pos + uint2(i % 4, i / 4), uint2(input.get_width() - 1, input.get_height() - 1));
+        float3 pixel = input.read(readPos).rgb;
+        float3 diff0 = pixel - maxC; float d0 = dot(diff0, diff0);
+        float3 diff1 = pixel - minC; float d1 = dot(diff1, diff1);
+        float3 diff2 = pixel - c2;   float d2 = dot(diff2, diff2);
+        float3 diff3 = pixel - c3;   float d3 = dot(diff3, diff3);
+        uint index = 0;
+        float minDist = d0;
+        if (d1 < minDist) { minDist = d1; index = 1; }
+        if (d2 < minDist) { minDist = d2; index = 2; }
+        if (d3 < minDist) { minDist = d3; index = 3; }
+        indices |= (index << (i * 2));
+    }
     output[offset + 4] = indices & 0xFF; output[offset + 5] = (indices >> 8) & 0xFF; output[offset + 6] = (indices >> 16) & 0xFF; output[offset + 7] = (indices >> 24) & 0xFF;
 }
 """
@@ -97,15 +131,52 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
                 var minA: UInt8 = 255; var maxA: UInt8 = 0
                 for i in 0..<16 { let a = raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3]; minA=min(minA,a); maxA=max(maxA,a) }
                 var ab=[UInt8](repeating:0,count:8); ab[0]=maxA; ab[1]=minA; var ai:UInt64=0
-                if maxA>minA { for i in 0..<16 { if raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3] < (UInt32(maxA)+UInt32(minA))/2 { ai|=(1<<(i*3)) } } }
+                let a0 = Double(maxA)
+                let a1 = Double(minA)
+                let step = (a0 - a1) / 7.0
+                for i in 0..<16 {
+                    let a = Double(raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3])
+                    var index: UInt64 = 0
+                    if a0 > a1 {
+                        var minDist = abs(a - a0)
+                        for j in 1...6 {
+                            let val = a0 - Double(j) * step
+                            let dist = abs(a - val)
+                            if dist < minDist { minDist = dist; index = UInt64(j + 1) }
+                        }
+                        if abs(a - a1) < minDist { index = 1 }
+                    }
+                    ai |= (index << (i * 3))
+                }
                 for i in 0..<6 { ab[i+2] = UInt8((ai >> (i * 8)) & 0xFF) }; dds.append(contentsOf: ab)
             }
             var minC=(r:255,g:255,b:255); var maxC=(r:0,g:0,b:0)
             for i in 0..<16 { let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4; let r=Int(raw[o]),g=Int(raw[o+1]),b=Int(raw[o+2]); if (r+g+b)<(minC.r+minC.g+minC.b){minC=(r,g,b)}; if (r+g+b)>(maxC.r+maxC.g+maxC.b){maxC=(r,g,b)} }
             let c0=UInt16(((UInt32(maxC.r)>>3)<<11)|((UInt32(maxC.g)>>2)<<5)|(UInt32(maxC.b)>>3))
             let c1=UInt16(((UInt32(minC.r)>>3)<<11)|((UInt32(minC.g)>>2)<<5)|(UInt32(minC.b)>>3))
+            
+            let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
+            let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
+            let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
+            let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
+            
             var blk=[UInt8](repeating:0,count:8); blk[0]=UInt8(c0&0xFF); blk[1]=UInt8(c0>>8); blk[2]=UInt8(c1&0xFF); blk[3]=UInt8(c1>>8); var idx:UInt32=0
-            for i in 0..<16 { let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4; let r=Int(raw[o]),g=Int(raw[o+1]),b=Int(raw[o+2]); if (abs(r-minC.r)+abs(g-minC.g)+abs(b-minC.b)) < (abs(r-maxC.r)+abs(g-maxC.g)+abs(b-maxC.b)) { idx|=(1<<(i*2)) } }
+            for i in 0..<16 {
+                let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4
+                let r=Double(raw[o]), g=Double(raw[o+1]), b=Double(raw[o+2])
+                
+                let d0 = (r-r0)*(r-r0) + (g-g0)*(g-g0) + (b-b0)*(b-b0)
+                let d1 = (r-r1)*(r-r1) + (g-g1)*(g-g1) + (b-b1)*(b-b1)
+                let d2 = (r-r2)*(r-r2) + (g-g2)*(g-g2) + (b-b2)*(b-b2)
+                let d3 = (r-r3)*(r-r3) + (g-g3)*(g-g3) + (b-b3)*(b-b3)
+                
+                var index: UInt32 = 0
+                var minDist = d0
+                if d1 < minDist { minDist = d1; index = 1 }
+                if d2 < minDist { minDist = d2; index = 2 }
+                if d3 < minDist { minDist = d3; index = 3 }
+                idx |= (index << (i * 2))
+            }
             blk[4]=UInt8(idx&0xFF); blk[5]=UInt8((idx>>8)&0xFF); blk[6]=UInt8((idx>>16)&0xFF); blk[7]=UInt8((idx>>24)&0xFF); dds.append(contentsOf: blk)
         }}; out.append(dds)
     }
