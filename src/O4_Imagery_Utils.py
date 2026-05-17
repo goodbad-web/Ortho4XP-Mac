@@ -2552,10 +2552,11 @@ def convert_texture(
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # Native Apple Silicon conversion via ASHelper
             executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
-            target_fmt = dds_format if not dxt5 else "BC3"
+            target_fmt = dds_format if (not dxt5 or dds_format == "BC7") else "BC3"
             conv_cmd = [executable, "--convert", file_to_convert, out_file_path, target_fmt]
             if getattr(UI, 'use_gpu_acceleration', True):
                 conv_cmd.append("--gpu")
+            UI.vprint(2, f"      ASHelper: Converting texture to DDS ({target_fmt})")
         elif dds_converter == "magick":
             # ImageMagick fallback
             fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
@@ -2567,6 +2568,7 @@ def convert_texture(
                 "-define", "dds:mipmaps=13",
                 out_file_path
             ]
+            UI.vprint(2, f"      ImageMagick: Converting texture to DDS ({fmt.upper()})")
         else: # Default: nvcompress (uses globally defined dds_convert_cmd)
             dds_tool = dds_convert_cmd
             if dds_format == "BC7":
@@ -2576,6 +2578,7 @@ def convert_texture(
             else:
                 fmt = "-bc1"
             conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
+            UI.vprint(2, f"      nvcompress: Converting texture to DDS ({fmt[1:].upper()})")
 
         # Execute conversion
         try:
