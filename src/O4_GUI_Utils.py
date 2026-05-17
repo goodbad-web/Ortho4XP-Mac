@@ -406,11 +406,13 @@ class Ortho4XP_GUI(tk.Tk):
         try:
             while 1:
                 line = self.console_queue.get_nowait()
+                at_bottom = self.console.yview()[1] >= 0.99
                 if line is None:
                     self.console.delete(1.0, END)
                 else:
                     self.console.insert(END, str(line))
-                self.console.see(END)
+                if at_bottom:
+                    self.console.see(END)
                 self.console.update_idletasks()
         except queue.Empty:
             pass
