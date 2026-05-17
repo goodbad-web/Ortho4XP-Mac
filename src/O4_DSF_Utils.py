@@ -707,8 +707,6 @@ def build_dsf(tile, download_queue):
         done += 1
         texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
-        if int(texture_attributes[2]) >= 18:
-            tri_type = 0
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
         
@@ -935,8 +933,6 @@ def build_dsf(tile, download_queue):
         done += 1
         texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
-        if int(texture_attributes[2]) >= 18:
-            tri_type = 0
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
 

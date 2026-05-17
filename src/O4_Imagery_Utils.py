@@ -2367,25 +2367,37 @@ def convert_texture(
     dxt5 = False
     masked_texture = False
     if tile.imprint_masks_to_dds and type == "dds":
-        masked_texture = os.path.exists(
-            os.path.join(
-                tile.build_dir,
-                "textures",
-                FNAMES.mask_file(
-                    til_x_left, til_y_top, zoomlevel, provider_code
-                ),
-            )
+        mask_path = os.path.join(
+            tile.build_dir,
+            "textures",
+            FNAMES.mask_file(
+                til_x_left, til_y_top, zoomlevel, provider_code
+            ),
         )
-        if masked_texture:
-            mask_im = Image.open(
-                os.path.join(
-                    tile.build_dir,
-                    "textures",
-                    FNAMES.mask_file(
-                        til_x_left, til_y_top, zoomlevel, provider_code
-                    ),
+        if os.path.exists(mask_path):
+            masked_texture = True
+            mask_im = Image.open(mask_path).convert("L")
+        elif int(zoomlevel) >= tile.mask_zl:
+            # Fallback to lower-resolution mask file (e.g. for high-res airport ZL18 tiles)
+            factor = 2 ** (zoomlevel - tile.mask_zl)
+            m_til_x = (int(til_x_left / factor) // 16) * 16
+            m_til_y = (int(til_y_top / factor) // 16) * 16
+            rx = int((til_x_left - factor * m_til_x) / 16)
+            ry = int((til_y_top - factor * m_til_y) / 16)
+            mask_file = os.path.join(
+                FNAMES.mask_dir(tile.lat, tile.lon),
+                FNAMES.legacy_mask(m_til_x, m_til_y),
+            )
+            if os.path.isfile(mask_file):
+                big_img = Image.open(mask_file)
+                x0 = int(rx * 4096 / factor)
+                y0 = int(ry * 4096 / factor)
+                mask_im = big_img.crop(
+                    (x0, y0, x0 + 4096 // factor, y0 + 4096 // factor)
                 )
-            ).convert("L")
+                small_array = numpy.array(mask_im, dtype=numpy.uint8)
+                if small_array.max() > 30:
+                    masked_texture = True
     elif tile.imprint_masks_to_dds:  # type = 'tif'
         if int(zoomlevel) >= tile.mask_zl:
             factor = 2 ** (zoomlevel - tile.mask_zl)
