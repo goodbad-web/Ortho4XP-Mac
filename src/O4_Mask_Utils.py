@@ -4,6 +4,7 @@ import time
 import queue
 from math import atan, ceil, floor
 import numpy
+import cv2
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import skfmm
 import O4_DEM_Utils as DEM
@@ -17,7 +18,7 @@ import O4_Mesh_Utils as MESH
 from O4_Parallel_Utils import parallel_execute
 
 mask_altitude_above = 0.5
-masks_build_slots = 4
+masks_build_slots = max(1, (os.cpu_count() or 4) - 2)
 
 ################################################################################
 def mask_name_for_texture(tile, til_x_left, til_y_top, zl, *args):
@@ -172,7 +173,7 @@ def build_masks(tile, for_imagery=False):
         )[1024 : 4096 + 1024, 1024 : 4096 + 1024]
         
         if tile.masks_custom_extent:
-            blured_mask = numpy.maximum(blured_mask, custom_mask)
+            blured_mask = numpy.maximum(blured_mask, custom_array)
 
         if not (blured_mask.max() == 0 or blured_mask.min() == 255):
             mask_im = Image.fromarray(blured_mask)
@@ -263,9 +264,8 @@ def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
     (px0, py0) = GEO.wgs84_to_pix(latm0, lonm0, tile.mask_zl)
     px0 -= 1024
     py0 -= 1024
-    # 1) We start with a black mask
-    mask_im = Image.new("L", (4096 + 2 * 1024, 4096 + 2 * 1024), "black")
-    mask_draw = ImageDraw.Draw(mask_im)
+    # 1) Start with a black mask (numpy array directly)
+    img_array = numpy.zeros((6144, 6144), dtype=numpy.uint8)
     # 2) We fill it with white over the extent of each tile around for 
     # which we had a mesh available
     for mesh_file_name in mesh_list:
@@ -278,54 +278,49 @@ def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
             lathere + 1, lonhere + 1, tile.mask_zl
         )
         (px4, py4) = GEO.wgs84_to_pix(lathere + 1, lonhere, tile.mask_zl)
-        px1 -= px0
-        px2 -= px0
-        px3 -= px0
-        px4 -= px0
-        py1 -= py0
-        py2 -= py0
-        py3 -= py0
-        py4 -= py0
-        mask_draw.polygon(
-            [(px1, py1), (px2, py2), (px3, py3), (px4, py4)], fill="white"
-        )
+        pts = numpy.array([[
+            [px1 - px0, py1 - py0],
+            [px2 - px0, py2 - py0],
+            [px3 - px0, py3 - py0],
+            [px4 - px0, py4 - py0]
+        ]], dtype=numpy.int32)
+        cv2.fillPoly(img_array, pts, 255)
     # 3a)  We overwrite the white part of the mask with grey (ratio_water 
     # dependent) where inland water was detected in the first part above
     if (til_x, til_y) in dico_inland:
+        polygons = []
         for (lat1, lon1, lat2, lon2, lat3, lon3) in dico_inland[
             (til_x, til_y)
         ]:
             (px1, py1) = GEO.wgs84_to_pix(lat1, lon1, tile.mask_zl)
             (px2, py2) = GEO.wgs84_to_pix(lat2, lon2, tile.mask_zl)
             (px3, py3) = GEO.wgs84_to_pix(lat3, lon3, tile.mask_zl)
-            px1 -= px0
-            px2 -= px0
-            px3 -= px0
-            py1 -= py0
-            py2 -= py0
-            py3 -= py0
-            mask_draw.polygon(
-                [(px1, py1), (px2, py2), (px3, py3)], fill=sea_level
-            )  # int(255*(1-tile.ratio_water)))
+            polygons.append([
+                [px1 - px0, py1 - py0],
+                [px2 - px0, py2 - py0],
+                [px3 - px0, py3 - py0]
+            ])
+        if polygons:
+            pts = numpy.array(polygons, dtype=numpy.int32)
+            cv2.fillPoly(img_array, pts, int(sea_level))
     # 3b) We overwrite the white + grey part of the mask with black where 
     # sea water was detected in the first part above
-    for (lat1, lon1, lat2, lon2, lat3, lon3) in dico_sea[(til_x, til_y)]:
-        (px1, py1) = GEO.wgs84_to_pix(lat1, lon1, tile.mask_zl)
-        (px2, py2) = GEO.wgs84_to_pix(lat2, lon2, tile.mask_zl)
-        (px3, py3) = GEO.wgs84_to_pix(lat3, lon3, tile.mask_zl)
-        px1 -= px0
-        px2 -= px0
-        px3 -= px0
-        py1 -= py0
-        py2 -= py0
-        py3 -= py0
-        mask_draw.polygon(
-            [(px1, py1), (px2, py2), (px3, py3)], fill="black"
-        )
-    del mask_draw
-    # mask_im=mask_im.convert("L")
-    img_array = numpy.array(mask_im, dtype=numpy.uint8)
+    if (til_x, til_y) in dico_sea:
+        polygons = []
+        for (lat1, lon1, lat2, lon2, lat3, lon3) in dico_sea[(til_x, til_y)]:
+            (px1, py1) = GEO.wgs84_to_pix(lat1, lon1, tile.mask_zl)
+            (px2, py2) = GEO.wgs84_to_pix(lat2, lon2, tile.mask_zl)
+            (px3, py3) = GEO.wgs84_to_pix(lat3, lon3, tile.mask_zl)
+            polygons.append([
+                [px1 - px0, py1 - py0],
+                [px2 - px0, py2 - py0],
+                [px3 - px0, py3 - py0]
+            ])
+        if polygons:
+            pts = numpy.array(polygons, dtype=numpy.int32)
+            cv2.fillPoly(img_array, pts, 0)
     return img_array
+
 ################################################################################
 
 ################################################################################
@@ -532,39 +527,22 @@ def blur_mask(img_array, tile, sea_level):
         blur_width = [L / pxscal for L in tile.masks_width]
     # Sand mode
     if tile.masking_mode == "sand" and blur_width:
-        # convolution with a hat function
-        b_img_array = numpy.array(img_array)
-        kernel = numpy.array(range(1, 2 * blur_width))
-        kernel[blur_width:] = range(blur_width - 1, 0, -1)
-        kernel = kernel / blur_width ** 2
-        for i in range(0, len(b_img_array)):
-            b_img_array[i] = numpy.convolve(b_img_array[i], kernel, "same")
-        b_img_array = b_img_array.transpose()
-        for i in range(0, len(b_img_array)):
-            b_img_array[i] = numpy.convolve(b_img_array[i], kernel, "same")
-        b_img_array = b_img_array.transpose()
+        # convolution with a hat function (using cv2.sepFilter2D for extreme speedup)
+        kernel = numpy.array(list(range(1, blur_width)) + [blur_width] + list(range(blur_width - 1, 0, -1)), dtype=numpy.float32)
+        kernel = kernel / (blur_width ** 2)
+        b_img_array = cv2.sepFilter2D(img_array, -1, kernel, kernel)
         b_img_array = 2 * numpy.minimum(b_img_array, 127)
-        b_img_array = numpy.array(b_img_array, dtype=numpy.uint8)
+        b_img_array = b_img_array.astype(numpy.uint8)
     # Rocks mode
     elif tile.masking_mode == "rocks" and blur_width:
         # slight increase of the mask, then gaussian blur, nonlinear map and
         # a tiny bit of smoothing again on a short scale along the shore
-        b_img_array = (
-            numpy.array(
-                Image.fromarray(img_array)
-                .convert("L")
-                .filter(ImageFilter.GaussianBlur(blur_width / 1.7)),
-                dtype=numpy.uint8,
-            )
-            > 0
-        ).astype(numpy.uint8) * 255
+        sigma1 = blur_width / 1.7
+        blurred1 = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
+        b_img_array = (blurred1 > 0).astype(numpy.uint8) * 255
         # blur it
-        b_img_array = numpy.array(
-            Image.fromarray(b_img_array)
-            .convert("L")
-            .filter(ImageFilter.GaussianBlur(blur_width)),
-            dtype=numpy.uint8,
-        )
+        sigma2 = blur_width
+        b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
         # nonlinear transform to make the transition quicker at the shore 
         # (gaussian is too flat)
         gamma = 2.5
@@ -585,15 +563,9 @@ def blur_mask(img_array, tile, sea_level):
             / (255 ** (gamma - 1))
         ).astype(numpy.uint8)
         # still some slight smoothing at the shore
-        b_img_array = numpy.maximum(
-            b_img_array,
-            numpy.array(
-                Image.fromarray(img_array)
-                .convert("L")
-                .filter(ImageFilter.GaussianBlur(2 ** (tile.mask_zl - 14))),
-                dtype=numpy.uint8,
-            ),
-        )
+        sigma3 = 2 ** (tile.mask_zl - 14)
+        smoothed_shore = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
+        b_img_array = numpy.maximum(b_img_array, smoothed_shore)
     # 3 steps
     elif tile.masking_mode == "3steps":
         # why trying something so complicated...
@@ -609,42 +581,20 @@ def blur_mask(img_array, tile, sea_level):
             value = shore_level + transition_profile(
                 (i + 1) / stepsin, "parabolic"
             ) * (sea_level - shore_level)
-            b_mask_array = (
-                numpy.array(
-                    Image.fromarray(b_mask_array)
-                    .convert("L")
-                    .filter(ImageFilter.GaussianBlur(1)),
-                    dtype=numpy.uint8,
-                )
-                > 0
-            ).astype(numpy.uint8) * 255
+            blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
+            b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
             UI.vprint(2, value)
         # Next the intermediate zone at constant transparency
         sea_b_radius = midzone / 3
         sea_b_radius_buffered = (midzone + transout) / 3
-        b_mask_array = (
-            numpy.array(
-                Image.fromarray(b_mask_array)
-                .convert("L")
-                .filter(ImageFilter.GaussianBlur(sea_b_radius_buffered)),
-                dtype=numpy.uint8,
-            )
-            > 0
-        ).astype(numpy.uint8) * 255
-        b_mask_array = (
-            numpy.array(
-                Image.fromarray(b_mask_array)
-                .convert("L")
-                .filter(
-                    ImageFilter.GaussianBlur(
-                        sea_b_radius_buffered - sea_b_radius
-                    )
-                ),
-                dtype=numpy.uint8,
-            )
-            == 255
-        ).astype(numpy.uint8) * 255
+        if sea_b_radius_buffered > 0:
+            b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
+            b_mask_array = (b_mask_array > 0).astype(numpy.uint8) * 255
+        diff_radius = sea_b_radius_buffered - sea_b_radius
+        if diff_radius > 0:
+            b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
+            b_mask_array = (b_mask_array == 255).astype(numpy.uint8) * 255
         b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = sea_level
         # Finally the transition to the X-Plane sea
         # We go from sea_level to 0 in transout meters
@@ -653,25 +603,13 @@ def blur_mask(img_array, tile, sea_level):
             value = sea_level * (
                 1 - transition_profile((i + 1) / stepsout, "linear")
             )
-            b_mask_array = (
-                numpy.array(
-                    Image.fromarray(b_mask_array)
-                    .convert("L")
-                    .filter(ImageFilter.GaussianBlur(1)),
-                    dtype=numpy.uint8,
-                )
-                > 0
-            ).astype(numpy.uint8) * 255
+            blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
+            b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
             UI.vprint(2, value)
         # To smoothen the thresolding introduced above we do a global short 
         # extent gaussian blur
-        b_img_array = numpy.array(
-            Image.fromarray(b_img_array)
-            .convert("L")
-            .filter(ImageFilter.GaussianBlur(2)),
-            dtype=numpy.uint8,
-        )
+        b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=2, sigmaY=2)
     else:
         # Just a (futile) copy
         b_img_array = numpy.array(img_array)
