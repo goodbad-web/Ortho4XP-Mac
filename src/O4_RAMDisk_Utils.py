@@ -1,0 +1,106 @@
+import os
+import sys
+import subprocess
+import shutil
+import O4_File_Names as FNAMES
+import O4_UI_Utils as UI
+
+def mount_ram_disk(size_gb=4):
+    if sys.platform != 'darwin':
+        UI.vprint(1, "[RAMDisk] RAM disk is only supported on macOS.")
+        return False
+        
+    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    tmp_path = os.path.abspath(FNAMES.Tmp_dir)
+    
+    # 1. Check if RAM disk is already mounted
+    if os.path.exists(ram_disk_path):
+        UI.vprint(1, f"[RAMDisk] RAM disk is already mounted at {ram_disk_path}")
+    else:
+        UI.vprint(1, f"[RAMDisk] Creating {size_gb}GB RAM disk on macOS...")
+        # 1 GB = 2097152 sectors
+        sectors = size_gb * 2097152
+        try:
+            # Attach RAM disk
+            result = subprocess.run(
+                ["hdiutil", "attach", "-nomount", f"ram://{sectors}"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            device_node = result.stdout.strip()
+            UI.vprint(2, f"[RAMDisk] Attached RAM device: {device_node}")
+            
+            # Format and mount
+            subprocess.run(
+                ["diskutil", "erasevolume", "HFS+", "Ortho4XP_RAM_Disk", device_node],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            UI.vprint(1, f"[RAMDisk] Formatted and mounted RAM disk at {ram_disk_path}")
+        except Exception as e:
+            UI.vprint(0, f"[RAMDisk] Error creating RAM disk: {e}")
+            return False
+            
+    # 2. Setup the symlink for tmp folder
+    try:
+        if os.path.islink(tmp_path):
+            current_target = os.readlink(tmp_path)
+            if current_target == ram_disk_path:
+                UI.vprint(2, f"[RAMDisk] symlink already points to {ram_disk_path}")
+                return True
+            os.unlink(tmp_path)
+        elif os.path.isdir(tmp_path):
+            if not os.listdir(tmp_path):
+                os.rmdir(tmp_path)
+            else:
+                backup_path = tmp_path + "_backup"
+                if os.path.exists(backup_path):
+                    shutil.rmtree(backup_path, ignore_errors=True)
+                os.rename(tmp_path, backup_path)
+                UI.vprint(1, f"[RAMDisk] Non-empty 'tmp' folder backed up to '{backup_path}'.")
+        elif os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
+        os.symlink(ram_disk_path, tmp_path)
+        UI.vprint(1, f"[RAMDisk] Linked {tmp_path} -> {ram_disk_path}")
+        return True
+    except Exception as e:
+        UI.vprint(0, f"[RAMDisk] Error setting up symbolic link: {e}")
+        return False
+
+def unmount_ram_disk():
+    if sys.platform != 'darwin':
+        return False
+        
+    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    tmp_path = os.path.abspath(FNAMES.Tmp_dir)
+    
+    # 1. Remove symlink and restore empty tmp directory
+    try:
+        if os.path.islink(tmp_path):
+            os.unlink(tmp_path)
+            os.makedirs(tmp_path, exist_ok=True)
+            UI.vprint(1, "[RAMDisk] Restored empty 'tmp' directory.")
+        elif os.path.isdir(tmp_path):
+            pass # normal directory, no symlink to clean
+    except Exception as e:
+        UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
+        
+    # 2. Unmount RAM disk
+    if os.path.exists(ram_disk_path):
+        UI.vprint(1, f"[RAMDisk] Detaching RAM disk from {ram_disk_path}...")
+        try:
+            subprocess.run(
+                ["hdiutil", "detach", ram_disk_path],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            UI.vprint(1, "[RAMDisk] RAM disk detached successfully.")
+            return True
+        except Exception as e:
+            UI.vprint(0, f"[RAMDisk] Error detaching RAM disk: {e}")
+            return False
+    return True

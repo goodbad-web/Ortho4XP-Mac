@@ -395,6 +395,19 @@ too low to grab these details.",
         "default": False,
         "hint": "When set, a detailed build log (Ortho4XP_build.log) will be written directly inside the tile's build directory upon completion or failure of the build steps.",
     },
+    "use_ram_disk": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Create a macOS RAM disk in memory for the tmp directory to speed up I/O and reduce SSD wear.",
+    },
+    "ram_disk_size_gb": {
+        "module": "UI",
+        "type": int,
+        "default": 4,
+        "values": (4, 8, 12, 16, 24, 32),
+        "hint": "Size of the RAM disk in Gigabytes (GB).",
+    },
 }
 
 list_app_vars = [
@@ -409,6 +422,8 @@ list_app_vars = [
     "http_timeout",
     "max_connect_retries",
     "max_baddata_retries",
+    "use_ram_disk",
+    "ram_disk_size_gb",
     "ovl_exclude_pol",
     "ovl_exclude_net",
     "custom_scenery_dir",
