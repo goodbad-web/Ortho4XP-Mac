@@ -12,11 +12,20 @@ def run_test():
     print("=== Ortho4XP RAM Disk Test ===")
     
     tmp_abs_path = os.path.abspath(FNAMES.Tmp_dir)
+    ortho_abs_path = os.path.abspath(FNAMES.Imagery_dir)
     print(f"Target tmp path: {tmp_abs_path}")
+    print(f"Target Orthophotos path: {ortho_abs_path}")
     
-    # 1. Mount RAM Disk (using 2GB for test)
-    print("\n--- 1. Testing Mount ---")
-    mounted = O4_RAMDisk_Utils.mount_ram_disk(size_gb=2)
+    # 0. Setup dummy orthophoto file to simulate existing cache
+    os.makedirs(ortho_abs_path, exist_ok=True)
+    dummy_cache_file = os.path.join(ortho_abs_path, "dummy_cache_test.txt")
+    with open(dummy_cache_file, "w") as f:
+        f.write("Important Cached Aerial Imagery!")
+    print(f"Created dummy orthophoto cache file at: {dummy_cache_file}")
+    
+    # 1. Mount RAM Disk with Orthophotos enabled
+    print("\n--- 1. Testing Mount with Orthophotos ---")
+    mounted = O4_RAMDisk_Utils.mount_ram_disk(size_gb=2, use_orthophotos=True)
     if not mounted:
         print("ERROR: Mount failed!")
         return False
@@ -28,47 +37,56 @@ def run_test():
         print(f"ERROR: {ram_disk_path} does not exist!")
         return False
         
+    # Check tmp symlink
     if not os.path.islink(tmp_abs_path):
         print(f"ERROR: {tmp_abs_path} is not a symlink!")
         return False
+    print("Tmp symlink verified.")
         
-    target = os.readlink(tmp_abs_path)
-    if target != ram_disk_path:
-        print(f"ERROR: symlink points to {target} instead of {ram_disk_path}!")
+    # Check Orthophotos symlink
+    if not os.path.islink(ortho_abs_path):
+        print(f"ERROR: {ortho_abs_path} is not a symlink!")
         return False
+    target = os.readlink(ortho_abs_path)
+    expected_target = os.path.join(ram_disk_path, "Orthophotos")
+    if target != expected_target:
+        print(f"ERROR: Orthophotos symlink points to {target} instead of {expected_target}!")
+        return False
+    print("Orthophotos symlink verified.")
         
-    print("Mount verification passed.")
+    # Check Orthophotos backup existence and contents
+    ortho_backup_path = ortho_abs_path + "_backup"
+    backup_file = os.path.join(ortho_backup_path, "dummy_cache_test.txt")
+    if not os.path.exists(backup_file):
+        print(f"ERROR: Backup file {backup_file} does not exist!")
+        return False
+    with open(backup_file, "r") as f:
+        content = f.read()
+    if content != "Important Cached Aerial Imagery!":
+        print(f"ERROR: Backup file content mismatch: {content}")
+        return False
+    print("Orthophotos backup content verified successfully.")
     
-    # 2. Test writing a file
-    print("\n--- 2. Testing Write ---")
-    test_file_path = os.path.join(tmp_abs_path, "test_ramdisk_write.txt")
+    # 2. Test writing a temporary download file
+    print("\n--- 2. Testing Write to RAM-mounted Orthophotos ---")
+    temp_download_file = os.path.join(ortho_abs_path, "temp_download_test.txt")
     try:
-        with open(test_file_path, "w") as f:
-            f.write("Hello from Ortho4XP RAM Disk!")
-        
-        # Verify file exists and reads correctly
-        with open(test_file_path, "r") as f:
+        with open(temp_download_file, "w") as f:
+            f.write("Temporary download chunk.")
+        with open(temp_download_file, "r") as f:
             content = f.read()
-        print(f"File write/read content: '{content}'")
-        if content != "Hello from Ortho4XP RAM Disk!":
-            print("ERROR: File content mismatch!")
+        print(f"Written temp file content: '{content}'")
+        if content != "Temporary download chunk.":
+            print("ERROR: Temp file content mismatch!")
             return False
-        print("Write verification passed.")
+        print("RAM-mounted Orthophotos write verification passed.")
     except Exception as e:
-        print(f"ERROR: File writing failed: {e}")
+        print(f"ERROR: Orthophotos write failed: {e}")
         return False
         
-    # 3. Test double mounting (should not fail, should report already mounted)
-    print("\n--- 3. Testing Double Mount ---")
-    double_mounted = O4_RAMDisk_Utils.mount_ram_disk(size_gb=2)
-    if not double_mounted:
-        print("ERROR: Double mount failed!")
-        return False
-    print("Double mount verification passed.")
-    
-    # 4. Test Unmounting
-    print("\n--- 4. Testing Unmount ---")
-    unmounted = O4_RAMDisk_Utils.unmount_ram_disk()
+    # 3. Test Unmounting
+    print("\n--- 3. Testing Unmount and Restore ---")
+    unmounted = O4_RAMDisk_Utils.unmount_ram_disk(use_orthophotos=True)
     if not unmounted:
         print("ERROR: Unmount failed!")
         return False
@@ -83,11 +101,41 @@ def run_test():
         print(f"ERROR: {tmp_abs_path} is still a symlink after unmount!")
         return False
         
-    if not os.path.isdir(tmp_abs_path):
-        print(f"ERROR: {tmp_abs_path} is not a directory after unmount!")
+    if os.path.islink(ortho_abs_path):
+        print(f"ERROR: {ortho_abs_path} is still a symlink after unmount!")
         return False
         
-    print("Unmount verification passed.")
+    # Verify backup is restored
+    if os.path.exists(ortho_backup_path):
+        print(f"ERROR: Backup directory {ortho_backup_path} still exists after unmount!")
+        return False
+        
+    restored_cache_file = os.path.join(ortho_abs_path, "dummy_cache_test.txt")
+    if not os.path.exists(restored_cache_file):
+        print(f"ERROR: Restored cache file {restored_cache_file} does not exist!")
+        return False
+    with open(restored_cache_file, "r") as f:
+        content = f.read()
+    if content != "Important Cached Aerial Imagery!":
+        print(f"ERROR: Restored cache file content mismatch: {content}")
+        return False
+    print("Orthophotos restored content verified successfully.")
+    
+    # Verify RAM-written temp file has been successfully merged back to SSD!
+    restored_temp_file = os.path.join(ortho_abs_path, "temp_download_test.txt")
+    if not os.path.exists(restored_temp_file):
+        print("ERROR: Temporary download file was NOT merged back to SSD after restore!")
+        return False
+    with open(restored_temp_file, "r") as f:
+        content = f.read()
+    if content != "Temporary download chunk.":
+        print(f"ERROR: Merged temp file content mismatch: {content}")
+        return False
+    print("Temporary RAM-written file successfully merged to SSD cache verified.")
+    
+    # Clean up the dummy cache and merged files to keep workspace clean
+    os.remove(restored_cache_file)
+    os.remove(restored_temp_file)
     print("\n=== ALL TESTS PASSED SUCCESSFULLY! ===")
     return True
 

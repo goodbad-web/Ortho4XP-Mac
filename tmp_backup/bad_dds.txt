@@ -1,0 +1,90 @@
+Image:
+  Filename: /Users/hiroshi/Developer/Ortho4XP-Mac/Tiles/zOrtho4XP_+34+135/textures/208000_459328_BI19.dds
+  Permissions: rw-r--r--
+  Format: DDS (Microsoft DirectDraw Surface)
+  Class: DirectClass
+  Geometry: 4096x4096+0+0
+  Units: Undefined
+  Colorspace: sRGB
+  Type: TrueColor
+  Base type: Undefined
+  Endianness: LSB
+  Depth: 8-bit
+  Channels: 3.0
+  Channel depth:
+    Red: 8-bit
+    Green: 8-bit
+    Blue: 8-bit
+  Channel statistics:
+    Pixels: 16777216
+    Red:
+      min: 0  (0)
+      max: 255 (1)
+      mean: 103.629 (0.406387)
+      median: 99 (0.388235)
+      standard deviation: 52.0801 (0.204236)
+      kurtosis: -0.868749
+      skewness: 0.338672
+      entropy: 0.89475
+    Green:
+      min: 0  (0)
+      max: 255 (1)
+      mean: 103.024 (0.404018)
+      median: 97 (0.380392)
+      standard deviation: 48.9995 (0.192155)
+      kurtosis: -0.712682
+      skewness: 0.424105
+      entropy: 0.901122
+    Blue:
+      min: 0  (0)
+      max: 255 (1)
+      mean: 98.8638 (0.387701)
+      median: 90 (0.352941)
+      standard deviation: 45.6891 (0.179173)
+      kurtosis: -0.40335
+      skewness: 0.620743
+      entropy: 0.868084
+  Image statistics:
+    Overall:
+      min: 0  (0)
+      max: 255 (1)
+      mean: 101.839 (0.399369)
+      median: 95.3333 (0.373856)
+      standard deviation: 48.9229 (0.191855)
+      kurtosis: -0.661594
+      skewness: 0.461174
+      entropy: 0.887985
+  Rendering intent: Perceptual
+  Gamma: 0.454545
+  Chromaticity:
+    red primary: (0.64,0.33,0.03)
+    green primary: (0.3,0.6,0.1)
+    blue primary: (0.15,0.06,0.79)
+    white point: (0.3127,0.329,0.3583)
+  Matte color: grey74
+  Background color: white
+  Border color: srgb(223,223,223)
+  Transparent color: black
+  Interlace: None
+  Intensity: Undefined
+  Compose: Over
+  Page geometry: 4096x4096+0+0
+  Dispose: Undefined
+  Iterations: 0
+  Compression: DXT1
+  Orientation: Undefined
+  Properties:
+    date:create: 2026-05-16T11:09:56+00:00
+    date:modify: 2026-05-16T11:09:56+00:00
+    date:timestamp: 2026-05-16T11:31:07+00:00
+    signature: 41cbd79034cc9b6d7ac8376266e9c69a18daabeacda1cdd1e9c240eb6cc57909
+  Artifacts:
+    verbose: true
+  Tainted: False
+  Filesize: 10.6668MiB
+  Number pixels: 16.7772M
+  Pixel cache type: Memory
+  Pixels per second: 116.793MP
+  User time: 0.150u
+  Elapsed time: 0:01.143
+  Version: ImageMagick 7.1.2-22 Q16-HDRI aarch64 bbfc7cba0:20260511 https://imagemagick.org

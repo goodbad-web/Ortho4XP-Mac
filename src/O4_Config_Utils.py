@@ -130,6 +130,12 @@ a particular server.",
         "default": False,
         "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for drawing and blurring water masks. Dramatically speeds up the masking step on Apple Silicon Mac.",
     },
+    "use_gpu_for_color_filters": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for texture color transformation. Speed up the color correction step in Step 3.",
+    },
     "ovl_exclude_pol": {
         "module": "OVL",
         "type": list,
@@ -408,6 +414,12 @@ too low to grab these details.",
         "values": (4, 8, 12, 16, 24, 32),
         "hint": "Size of the RAM disk in Gigabytes (GB).",
     },
+    "use_ram_disk_for_orthophotos": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Optionally handle downloaded imagery (Orthophotos) in the macOS RAM disk. Automatically backs up existing photos and restores them on exit.",
+    },
 }
 
 list_app_vars = [
@@ -423,6 +435,7 @@ list_app_vars = [
     "max_connect_retries",
     "use_ram_disk",
     "ram_disk_size_gb",
+    "use_ram_disk_for_orthophotos",
     "max_baddata_retries",
     "ovl_exclude_pol",
     "ovl_exclude_net",
@@ -473,6 +486,7 @@ list_dsf_vars = [
     "cover_zl",
     "use_neural_upscale",
     "use_gpu_acceleration",
+    "use_gpu_for_color_filters",
     "dds_converter",
     "dds_format",
     "water_tech",

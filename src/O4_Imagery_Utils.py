@@ -2153,6 +2153,66 @@ def gdalwarp_alternative(s_bbox, s_epsg, s_im, t_bbox, t_epsg, t_size):
 ################################################################################
 def color_transform(im, color_code):
     try:
+        use_gpu = getattr(UI, "use_gpu_for_color_filters", False)
+        if use_gpu:
+            import cv2
+            img_array = numpy.array(im)
+            has_alpha = False
+            alpha_channel = None
+            if img_array.ndim == 3 and img_array.shape[2] == 4:
+                has_alpha = True
+                alpha_channel = img_array[:, :, 3]
+                img_array = img_array[:, :, :3]
+                
+            gpu_img = cv2.UMat(img_array)
+            for color_filter in color_filters_dict[color_code]:
+                if color_filter[0] == "brightness-contrast":
+                    (brightness, contrast) = color_filter[1:3]
+                    lut = numpy.arange(256, dtype=numpy.float32)
+                    if brightness >= 0:
+                        lut = 128 + tan(pi / 4 * (1 + contrast / 128)) * (brightness + (255 - brightness) / 255 * lut - 128)
+                    else:
+                        lut = 128 + tan(pi / 4 * (1 + contrast / 128)) * ((255 + brightness) / 255 * lut - 128)
+                    lut = numpy.clip(lut, 0, 255).astype(numpy.uint8)
+                    gpu_img = cv2.LUT(gpu_img, lut)
+                    
+                elif color_filter[0] == "saturation":
+                    saturation = color_filter[1]
+                    factor = 1 + saturation / 100
+                    gray = cv2.cvtColor(gpu_img, cv2.COLOR_RGB2GRAY)
+                    gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+                    gpu_img = cv2.addWeighted(gpu_img, factor, gray_rgb, 1 - factor, 0)
+                    
+                elif color_filter[0] == "sharpness":
+                    factor = color_filter[1]
+                    blurred = cv2.blur(gpu_img, (3, 3))
+                    gpu_img = cv2.addWeighted(gpu_img, factor, blurred, 1 - factor, 0)
+                    
+                elif color_filter[0] == "blur":
+                    radius = color_filter[1]
+                    gpu_img = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=radius, sigmaY=radius)
+                    
+                elif color_filter[0] == "levels":
+                    lut_channels = []
+                    for j in [0, 1, 2]:
+                        in_min, gamma, in_max, out_min, out_max = color_filter[5 * j + 1 : 5 * j + 6]
+                        lut = numpy.arange(256, dtype=numpy.float32)
+                        lut = numpy.clip(lut, in_min, in_max)
+                        lut = out_min + (out_max - out_min) * (((lut - in_min) / (in_max - in_min)) ** (1 / gamma))
+                        lut_channels.append(numpy.clip(lut, 0, 255).astype(numpy.uint8))
+                    lut_merged = numpy.stack(lut_channels, axis=-1)
+                    gpu_img = cv2.LUT(gpu_img, lut_merged)
+            
+            result_array = gpu_img.get()
+            if has_alpha:
+                result_array = numpy.dstack((result_array, alpha_channel))
+            return Image.fromarray(result_array, mode=im.mode)
+    except Exception as e:
+        UI.vprint(2, f"GPU color correction fallback due to error: {str(e)}")
+        pass
+
+    # CPU/PIL Fallback path
+    try:
         for color_filter in color_filters_dict[color_code]:
             # both range from -127 to 127,
             # http://gimp.sourcearchive.com/documentation/2.6.1/\
