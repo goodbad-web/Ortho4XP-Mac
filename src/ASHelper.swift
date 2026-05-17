@@ -91,24 +91,40 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
 
 func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     guard let dev = MTLCreateSystemDefaultDevice(), let lib = try? dev.makeLibrary(source: metalSource, options: nil), let fn = lib.makeFunction(name: "compressTexture"), let pipe = try? dev.makeComputePipelineState(function: fn), let q = dev.makeCommandQueue() else { return nil }
-    var w = cgImage.width; var h = cgImage.height
+    let w = cgImage.width; let h = cgImage.height
     let texD = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: true); texD.usage = [.shaderRead, .shaderWrite, .pixelFormatView]
     guard let tex = dev.makeTexture(descriptor: texD) else { return nil }
     let raw = getRawRGBA(cgImage: cgImage)
     raw.withUnsafeBytes { tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: w * 4) }
     guard let cmbM = q.makeCommandBuffer(), let bE = cmbM.makeBlitCommandEncoder() else { return nil }
     bE.generateMipmaps(for: tex); bE.endEncoding(); cmbM.commit(); cmbM.waitUntilCompleted()
-    var outData = Data()
+    
+    guard let cmb = q.makeCommandBuffer() else { return nil }
+    var buffers: [MTLBuffer] = []
+    
     for level in 0..<tex.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
-        let sz = bW * bH * (mode == 0 ? 8 : 16); guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared), let cmb = q.makeCommandBuffer(), let enc = cmb.makeComputeCommandEncoder() else { break }
-        var m = mode; enc.setComputePipelineState(pipe); enc.setTexture(tex, index: 0); enc.setBuffer(buf, offset: 0, index: 0); enc.setBytes(&m, length: 4, index: 1)
-        // Note: For simplicity, we use the level 0 texture but read with manual sampling or multiple textures. 
-        // For correct mipmap read in compute, we'd need a texture view per level.
+        let sz = bW * bH * (mode == 0 ? 8 : 16)
+        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { break }
+        buffers.append(buf)
+        
+        guard let enc = cmb.makeComputeCommandEncoder() else { break }
+        var m = mode
+        enc.setComputePipelineState(pipe)
         let view = tex.makeTextureView(pixelFormat: tex.pixelFormat, textureType: tex.textureType, levels: level..<level+1, slices: 0..<1)
         enc.setTexture(view, index: 0)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBytes(&m, length: 4, index: 1)
         enc.dispatchThreadgroups(MTLSize(width: (bW + 15) / 16, height: (bH + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
-        enc.endEncoding(); cmb.commit(); cmb.waitUntilCompleted(); outData.append(Data(bytes: buf.contents(), count: sz))
+        enc.endEncoding()
+    }
+    
+    cmb.commit()
+    cmb.waitUntilCompleted()
+    
+    var outData = Data()
+    for buf in buffers {
+        outData.append(Data(bytes: buf.contents(), count: buf.length))
     }
     return outData
 }
@@ -126,6 +142,7 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
         // Fallback for CPU (no mipmaps for now to keep it simple, or implement scaling)
         hdr.mipmapCount = 1; out = hdr.toData(); if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
         let raw = getRawRGBA(cgImage: img); var dds = Data(); let bW = (w+3)/4; let bH = (h+3)/4
+        for by in 0..<bH { for bx in 0..<bW {
         for by in 0..<bH { for bx in 0..<bW {
             if formatCode >= 1 {
                 var minA: UInt8 = 255; var maxA: UInt8 = 0
