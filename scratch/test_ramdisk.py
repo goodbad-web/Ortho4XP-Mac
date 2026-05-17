@@ -16,6 +16,10 @@ def run_test():
     print(f"Target tmp path: {tmp_abs_path}")
     print(f"Target Orthophotos path: {ortho_abs_path}")
     
+    # 0. Clean up any pre-existing RAM disk states to ensure fresh test boundaries
+    print("Cleaning up any pre-existing RAM disk states...")
+    O4_RAMDisk_Utils.unmount_ram_disk(use_orthophotos=True)
+    
     # 0. Setup dummy orthophoto file to simulate existing cache
     os.makedirs(ortho_abs_path, exist_ok=True)
     dummy_cache_file = os.path.join(ortho_abs_path, "dummy_cache_test.txt")

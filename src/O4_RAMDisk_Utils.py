@@ -119,8 +119,7 @@ def merge_directories(src_dir, dest_dir):
             src_file = os.path.join(root, file)
             dest_file = os.path.join(target_dir, file)
             try:
-                if not os.path.exists(dest_file):
-                    shutil.copy2(src_file, dest_file)
+                shutil.copy2(src_file, dest_file)
             except Exception as e:
                 UI.vprint(2, f"[RAMDisk] Warning: Failed to copy {file} during merge: {e}")
 
@@ -132,6 +131,7 @@ def unmount_ram_disk(use_orthophotos=False):
     tmp_path = os.path.abspath(FNAMES.Tmp_dir)
     ortho_path = os.path.abspath(FNAMES.Imagery_dir)
     ortho_backup = ortho_path + "_backup"
+    tmp_backup = tmp_path + "_backup"
     
     # 1. Clean up Orthophotos symlink and restore backup if requested
     if use_orthophotos:
@@ -154,14 +154,20 @@ def unmount_ram_disk(use_orthophotos=False):
         except Exception as e:
             UI.vprint(0, f"[RAMDisk] Error restoring Orthophotos directory: {e}")
             
-    # 2. Remove symlink and restore empty tmp directory
+    # 2. Remove symlink and restore empty or backed up tmp directory
     try:
         if os.path.islink(tmp_path):
             os.unlink(tmp_path)
-            os.makedirs(tmp_path, exist_ok=True)
-            UI.vprint(1, "[RAMDisk] Restored empty 'tmp' directory.")
+            if os.path.exists(tmp_backup):
+                os.rename(tmp_backup, tmp_path)
+                UI.vprint(1, f"[RAMDisk] Restored 'tmp' directory from '{tmp_backup}'.")
+            else:
+                os.makedirs(tmp_path, exist_ok=True)
+                UI.vprint(1, "[RAMDisk] Restored empty 'tmp' directory.")
         elif os.path.isdir(tmp_path):
             pass # normal directory, no symlink to clean
+    except Exception as e:
+        UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
     except Exception as e:
         UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
         
