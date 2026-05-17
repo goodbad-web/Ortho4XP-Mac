@@ -141,11 +141,12 @@ def build_tile(tile):
             download_queue.put("quit")
         download_thread.join()
         if convert_launched:
+            dds_format = getattr(UI, 'dds_format', 'BC3')
             UI.vprint(
                 1,
                 "-> Starting multiprocessing pool with",
                 max_convert_slots,
-                "workers for DDS conversion.",
+                f"workers for DDS conversion (Format: {dds_format}).",
             )
             config_data = {
                 'use_magick': IMG.use_magick,
