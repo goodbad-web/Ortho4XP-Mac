@@ -136,6 +136,12 @@ a particular server.",
         "default": False,
         "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for texture color transformation. Speed up the color correction step in Step 3.",
     },
+    "use_gpu_for_dem_smoothing": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for smoothing DEM raster elevation data. Dramatically speeds up Step 2 mesh prep.",
+    },
     "ovl_exclude_pol": {
         "module": "OVL",
         "type": list,
@@ -467,6 +473,7 @@ list_mesh_vars = [
     "min_angle",
     "sea_smoothing_mode",
     "water_smoothing",
+    "use_gpu_for_dem_smoothing",
     "iterate",
 ]
 list_mask_vars = [

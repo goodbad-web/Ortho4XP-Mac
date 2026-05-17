@@ -1018,16 +1018,32 @@ def smoothen(raster, pix_width, mask_im, preserve_boundary=True):
     kernel = kernel / (pix_width + 1) ** 2
     tmp = tmp * mask_array
     tmpw = numpy.array(mask_array)
-    for i in range(0, len(tmp)):
-        tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
-        tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
-    tmp = tmp.transpose()
-    tmpw = tmpw.transpose()
-    for i in range(0, len(tmp)):
-        tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
-        tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
-    tmp = tmp.transpose()
-    tmpw = tmpw.transpose()
+    use_gpu = getattr(UI, "use_gpu_for_dem_smoothing", False)
+    if use_gpu:
+        try:
+            import cv2
+            gpu_tmp = cv2.UMat(tmp)
+            gpu_tmpw = cv2.UMat(tmpw)
+            k_float = kernel.astype(numpy.float32)
+            gpu_tmp = cv2.sepFilter2D(gpu_tmp, -1, k_float, k_float, borderType=cv2.BORDER_CONSTANT)
+            gpu_tmpw = cv2.sepFilter2D(gpu_tmpw, -1, k_float, k_float, borderType=cv2.BORDER_CONSTANT)
+            tmp = gpu_tmp.get()
+            tmpw = gpu_tmpw.get()
+        except Exception as e:
+            UI.vprint(2, f"GPU DEM smoothing fallback due to error: {str(e)}")
+            use_gpu = False
+
+    if not use_gpu:
+        for i in range(0, len(tmp)):
+            tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
+            tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
+        tmp = tmp.transpose()
+        tmpw = tmpw.transpose()
+        for i in range(0, len(tmp)):
+            tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
+            tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
+        tmp = tmp.transpose()
+        tmpw = tmpw.transpose()
     tmp[mask_array != 0] = (
         mask_array[mask_array != 0]
         * tmp[mask_array != 0]
