@@ -222,6 +222,7 @@ class MockTile:
 
 def test_equivalence():
     tile = MockTile()
+    tile.use_gpu_for_masks = False # Initialize CPU mode
     til_x, til_y = 13328, 6496  # Mock values
     mesh_list = ["+34+135.mes"]
     
@@ -260,7 +261,7 @@ def test_equivalence():
     print(f"Pre-mask pixel match rate: {pixel_match:.4f}%")
     assert pixel_match > 99.0, "Pre-mask verification failed!"
 
-    print("\n--- 2. Testing blur_mask (Sand Mode) ---")
+    print("\n--- 2. Testing blur_mask (Sand Mode) CPU vs GPU ---")
     blur_width = 30
     tile.masking_mode = "sand"
     tile.masks_width = blur_width * GEO.webmercator_pixel_size(tile.lat + 0.5, tile.mask_zl)
@@ -269,17 +270,30 @@ def test_equivalence():
     blur_sand_orig = blur_mask_sand_original(arr_orig, tile, sea_level, blur_width)
     t_sand_orig = time.time() - t0
     
+    # Test CPU
+    tile.use_gpu_for_masks = False
     t0 = time.time()
-    blur_sand_opt = MASK.blur_mask(arr_orig, tile, sea_level)
-    t_sand_opt = time.time() - t0
+    blur_sand_cpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_sand_cpu = time.time() - t0
     
-    diff_sand = numpy.abs(blur_sand_orig.astype(int) - blur_sand_opt.astype(int))
+    # Test GPU
+    tile.use_gpu_for_masks = True
+    t0 = time.time()
+    blur_sand_gpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_sand_gpu = time.time() - t0
+    
+    # Compare CPU vs GPU equivalence
+    diff_gpu = numpy.abs(blur_sand_cpu.astype(int) - blur_sand_gpu.astype(int))
+    gpu_pixel_match = (diff_gpu == 0).sum() / diff_gpu.size * 100
+    print(f"Sand Mode - CPU: {t_sand_cpu:.4f}s | GPU: {t_sand_gpu:.4f}s | Speedup (vs Orig): {t_sand_orig / t_sand_gpu:.2f}x")
+    print(f"CPU vs GPU Match Rate: {gpu_pixel_match:.4f}%")
+    assert gpu_pixel_match == 100.0, "GPU Sand mode produced mathematically different output!"
+    
+    diff_sand = numpy.abs(blur_sand_orig.astype(int) - blur_sand_cpu.astype(int))
     sand_match = (diff_sand == 0).sum() / diff_sand.size * 100
-    print(f"Sand mode - Original: {t_sand_orig:.4f}s | Optimized: {t_sand_opt:.4f}s | Speedup: {t_sand_orig / t_sand_opt:.2f}x")
-    print(f"Sand mode pixel match rate: {sand_match:.4f}%")
     assert sand_match > 99.9, "Sand mode verification failed!"
 
-    print("\n--- 3. Testing blur_mask (Rocks Mode) ---")
+    print("\n--- 3. Testing blur_mask (Rocks Mode) CPU vs GPU ---")
     blur_width = 30
     tile.masking_mode = "rocks"
     tile.masks_width = blur_width * (2 * GEO.webmercator_pixel_size(tile.lat + 0.5, tile.mask_zl))
@@ -288,18 +302,30 @@ def test_equivalence():
     blur_rocks_orig = blur_mask_rocks_original(arr_orig, tile, sea_level, blur_width)
     t_rocks_orig = time.time() - t0
     
+    # Test CPU
+    tile.use_gpu_for_masks = False
     t0 = time.time()
-    blur_rocks_opt = MASK.blur_mask(arr_orig, tile, sea_level)
-    t_rocks_opt = time.time() - t0
+    blur_rocks_cpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_rocks_cpu = time.time() - t0
     
-    diff_rocks = numpy.abs(blur_rocks_orig.astype(int) - blur_rocks_opt.astype(int))
-    # Due to minor difference in OpenCV vs PIL GaussianBlur kernel rounding, we accept a tolerance of +/- 2.
+    # Test GPU
+    tile.use_gpu_for_masks = True
+    t0 = time.time()
+    blur_rocks_gpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_rocks_gpu = time.time() - t0
+    
+    # Compare CPU vs GPU equivalence
+    diff_gpu = numpy.abs(blur_rocks_cpu.astype(int) - blur_rocks_gpu.astype(int))
+    gpu_pixel_match = (diff_gpu == 0).sum() / diff_gpu.size * 100
+    print(f"Rocks Mode - CPU: {t_rocks_cpu:.4f}s | GPU: {t_rocks_gpu:.4f}s | Speedup (vs Orig): {t_rocks_orig / t_rocks_gpu:.2f}x")
+    print(f"CPU vs GPU Match Rate: {gpu_pixel_match:.4f}%")
+    assert gpu_pixel_match == 100.0, "GPU Rocks mode produced mathematically different output!"
+    
+    diff_rocks = numpy.abs(blur_rocks_orig.astype(int) - blur_rocks_cpu.astype(int))
     rocks_match = (diff_rocks <= 2).sum() / diff_rocks.size * 100
-    print(f"Rocks mode - Original: {t_rocks_orig:.4f}s | Optimized: {t_rocks_opt:.4f}s | Speedup: {t_rocks_orig / t_rocks_opt:.2f}x")
-    print(f"Rocks mode pixel match rate (within tolerance +/- 2): {rocks_match:.4f}%")
     assert rocks_match > 99.0, "Rocks mode verification failed!"
 
-    print("\n--- 4. Testing blur_mask (3-Steps Mode) ---")
+    print("\n--- 4. Testing blur_mask (3-Steps Mode) CPU vs GPU ---")
     # Using 3-step radius values
     blur_width_3s = [15, 30, 45]
     tile.masking_mode = "3steps"
@@ -309,15 +335,27 @@ def test_equivalence():
     blur_3s_orig = blur_mask_3steps_original(arr_orig, tile, sea_level, blur_width_3s)
     t_3s_orig = time.time() - t0
     
+    # Test CPU
+    tile.use_gpu_for_masks = False
     t0 = time.time()
-    blur_3s_opt = MASK.blur_mask(arr_orig, tile, sea_level)
-    t_3s_opt = time.time() - t0
+    blur_3s_cpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_3s_cpu = time.time() - t0
     
-    diff_3s = numpy.abs(blur_3s_orig.astype(int) - blur_3s_opt.astype(int))
-    # Gaussian standard deviation approximation tolerance of +/- 3.
+    # Test GPU
+    tile.use_gpu_for_masks = True
+    t0 = time.time()
+    blur_3s_gpu = MASK.blur_mask(arr_orig, tile, sea_level)
+    t_3s_gpu = time.time() - t0
+    
+    # Compare CPU vs GPU equivalence
+    diff_gpu = numpy.abs(blur_3s_cpu.astype(int) - blur_3s_gpu.astype(int))
+    gpu_pixel_match = (diff_gpu == 0).sum() / diff_gpu.size * 100
+    print(f"3-Steps Mode - CPU: {t_3s_cpu:.4f}s | GPU: {t_3s_gpu:.4f}s | Speedup (vs Orig): {t_3s_orig / t_3s_gpu:.2f}x")
+    print(f"CPU vs GPU Match Rate: {gpu_pixel_match:.4f}%")
+    assert gpu_pixel_match == 100.0, "GPU 3-Steps mode produced mathematically different output!"
+    
+    diff_3s = numpy.abs(blur_3s_orig.astype(int) - blur_3s_cpu.astype(int))
     match_3s = (diff_3s <= 3).sum() / diff_3s.size * 100
-    print(f"3-steps mode - Original: {t_3s_orig:.4f}s | Optimized: {t_3s_opt:.4f}s | Speedup: {t_3s_orig / t_3s_opt:.2f}x")
-    print(f"3-steps mode pixel match rate (within tolerance +/- 3): {match_3s:.4f}%")
     assert match_3s > 99.0, "3-steps mode verification failed!"
 
 if __name__ == "__main__":

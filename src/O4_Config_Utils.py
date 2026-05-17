@@ -124,6 +124,12 @@ a particular server.",
         "default": False,
         "hint": "Use Apple Silicon Neural Engine (Vision/CoreML) for texture upscaling. Requires macOS 12.0+.",
     },
+    "use_gpu_for_masks": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for drawing and blurring water masks. Dramatically speeds up the masking step on Apple Silicon Mac.",
+    },
     "ovl_exclude_pol": {
         "module": "OVL",
         "type": list,
@@ -438,6 +444,7 @@ list_mask_vars = [
     "distance_masks_too",
     "masks_use_DEM_too",
     "masks_custom_extent",
+    "use_gpu_for_masks",
 ]
 list_dsf_vars = [
     "cover_airports_with_highres",

@@ -530,7 +530,12 @@ def blur_mask(img_array, tile, sea_level):
         # convolution with a hat function (using cv2.sepFilter2D for extreme speedup)
         kernel = numpy.array(list(range(1, blur_width)) + [blur_width] + list(range(blur_width - 1, 0, -1)), dtype=numpy.float32)
         kernel = kernel / (blur_width ** 2)
-        b_img_array = cv2.sepFilter2D(img_array, -1, kernel, kernel)
+        if getattr(tile, "use_gpu_for_masks", False):
+            gpu_img = cv2.UMat(img_array)
+            gpu_blurred = cv2.sepFilter2D(gpu_img, -1, kernel, kernel)
+            b_img_array = gpu_blurred.get()
+        else:
+            b_img_array = cv2.sepFilter2D(img_array, -1, kernel, kernel)
         b_img_array = 2 * numpy.minimum(b_img_array, 127)
         b_img_array = b_img_array.astype(numpy.uint8)
     # Rocks mode
@@ -538,11 +543,22 @@ def blur_mask(img_array, tile, sea_level):
         # slight increase of the mask, then gaussian blur, nonlinear map and
         # a tiny bit of smoothing again on a short scale along the shore
         sigma1 = blur_width / 1.7
-        blurred1 = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
+        use_gpu = getattr(tile, "use_gpu_for_masks", False)
+        if use_gpu:
+            gpu_img = cv2.UMat(img_array)
+            gpu_blurred1 = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
+            blurred1 = gpu_blurred1.get()
+        else:
+            blurred1 = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
         b_img_array = (blurred1 > 0).astype(numpy.uint8) * 255
         # blur it
         sigma2 = blur_width
-        b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
+        if use_gpu:
+            gpu_b_img = cv2.UMat(b_img_array)
+            gpu_blurred2 = cv2.GaussianBlur(gpu_b_img, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
+            b_img_array = gpu_blurred2.get()
+        else:
+            b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
         # nonlinear transform to make the transition quicker at the shore 
         # (gaussian is too flat)
         gamma = 2.5
@@ -564,7 +580,12 @@ def blur_mask(img_array, tile, sea_level):
         ).astype(numpy.uint8)
         # still some slight smoothing at the shore
         sigma3 = 2 ** (tile.mask_zl - 14)
-        smoothed_shore = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
+        if use_gpu:
+            gpu_img = cv2.UMat(img_array)
+            gpu_smoothed_shore = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
+            smoothed_shore = gpu_smoothed_shore.get()
+        else:
+            smoothed_shore = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
         b_img_array = numpy.maximum(b_img_array, smoothed_shore)
     # 3 steps
     elif tile.masking_mode == "3steps":
@@ -574,6 +595,7 @@ def blur_mask(img_array, tile, sea_level):
         transout = blur_width[2]
         shore_level = 255
         b_img_array = b_mask_array = numpy.array(img_array)
+        use_gpu = getattr(tile, "use_gpu_for_masks", False)
         # First the transition at the shore
         # We go from shore_level to sea_level in transin meters
         stepsin = int(transin / 3)
@@ -581,7 +603,12 @@ def blur_mask(img_array, tile, sea_level):
             value = shore_level + transition_profile(
                 (i + 1) / stepsin, "parabolic"
             ) * (sea_level - shore_level)
-            blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
+            if use_gpu:
+                gpu_mask = cv2.UMat(b_mask_array)
+                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
+                blurred = gpu_blurred.get()
+            else:
+                blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
             b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
             UI.vprint(2, value)
@@ -589,11 +616,21 @@ def blur_mask(img_array, tile, sea_level):
         sea_b_radius = midzone / 3
         sea_b_radius_buffered = (midzone + transout) / 3
         if sea_b_radius_buffered > 0:
-            b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
+            if use_gpu:
+                gpu_mask = cv2.UMat(b_mask_array)
+                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
+                b_mask_array = gpu_blurred.get()
+            else:
+                b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
             b_mask_array = (b_mask_array > 0).astype(numpy.uint8) * 255
         diff_radius = sea_b_radius_buffered - sea_b_radius
         if diff_radius > 0:
-            b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
+            if use_gpu:
+                gpu_mask = cv2.UMat(b_mask_array)
+                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
+                b_mask_array = gpu_blurred.get()
+            else:
+                b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
             b_mask_array = (b_mask_array == 255).astype(numpy.uint8) * 255
         b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = sea_level
         # Finally the transition to the X-Plane sea
@@ -603,13 +640,23 @@ def blur_mask(img_array, tile, sea_level):
             value = sea_level * (
                 1 - transition_profile((i + 1) / stepsout, "linear")
             )
-            blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
+            if use_gpu:
+                gpu_mask = cv2.UMat(b_mask_array)
+                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
+                blurred = gpu_blurred.get()
+            else:
+                blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
             b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
             UI.vprint(2, value)
         # To smoothen the thresolding introduced above we do a global short 
         # extent gaussian blur
-        b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=2, sigmaY=2)
+        if use_gpu:
+            gpu_img = cv2.UMat(b_img_array)
+            gpu_blurred = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=2, sigmaY=2)
+            b_img_array = gpu_blurred.get()
+        else:
+            b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=2, sigmaY=2)
     else:
         # Just a (futile) copy
         b_img_array = numpy.array(img_array)
