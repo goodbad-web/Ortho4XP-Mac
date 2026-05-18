@@ -2521,6 +2521,7 @@ def convert_texture(
 
 
 
+    jpeg_path = None
     if provider_code in providers_dict:
         jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2528,7 +2529,20 @@ def convert_texture(
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
-        file_to_convert = os.path.join(file_dir, jpeg_file_name)
+        jpeg_path = os.path.join(file_dir, jpeg_file_name)
+    
+    is_combined = (provider_code in local_combined_providers_dict) and (
+        (provider_code not in providers_dict)
+        or not jpeg_path or not os.path.exists(jpeg_path)
+    )
+    use_upscale = getattr(UI, 'use_neural_upscale', False)
+    use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
+    
+    if use_gpu_batch and not is_combined and not use_upscale and type == "dds":
+        return 1
+        
+    if provider_code in providers_dict:
+        file_to_convert = jpeg_path
     if (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not os.path.exists(os.path.join(file_dir, jpeg_file_name))

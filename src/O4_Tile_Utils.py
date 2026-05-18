@@ -230,23 +230,52 @@ def _build_tile(tile):
                         conversion_success = False
                         break
                     
-                    # Detect alpha channel for correct format selection (fallback to BC3/DXT5 if alpha present)
-                    has_alpha = False
-                    try:
-                        with Image.open(input_path) as im:
-                            if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
-                                has_alpha = True
-                    except:
-                        pass
+                    mask_path = "none"
+                    if input_path == jpeg_path and tile.imprint_masks_to_dds:
+                        possible_mask_path = os.path.join(tile.build_dir, "textures", FNAMES.mask_file(til_x_left, til_y_top, zoomlevel, provider_code))
+                        if os.path.exists(possible_mask_path):
+                            mask_path = possible_mask_path
+                    
+                    r, g, b = 1.0, 1.0, 1.0
+                    contrast, brightness, saturation = 1.0, 0.0, 1.0
+                    
+                    if input_path == jpeg_path and provider_code in IMG.providers_dict:
+                        color_code = IMG.providers_dict[provider_code]["color_filters"]
+                        if color_code != "none" and color_code in IMG.color_filters_dict:
+                            for color_filter in IMG.color_filters_dict[color_code]:
+                                filter_name = color_filter[0]
+                                if filter_name == "brightness-contrast":
+                                    b_val, c_val = color_filter[1:3]
+                                    brightness = b_val / 255.0
+                                    contrast = 1.0 + (c_val / 128.0)
+                                elif filter_name == "saturation":
+                                    s_val = color_filter[1]
+                                    saturation = 1.0 + (s_val / 100.0)
+                    
+                    has_alpha = (mask_path != "none")
+                    if not has_alpha and input_path != jpeg_path:
+                        try:
+                            with Image.open(input_path) as im:
+                                if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+                                    has_alpha = True
+                        except:
+                            pass
                     
                     target_fmt = dds_format if (not has_alpha or dds_format == "BC7") else "BC3"
-                    batch_args.extend([input_path, out_file_path, target_fmt])
+                    batch_args.extend([
+                        input_path, 
+                        mask_path, 
+                        str(r), str(g), str(b), 
+                        str(contrast), str(brightness), str(saturation), 
+                        out_file_path, 
+                        target_fmt
+                    ])
                 
                 if conversion_success and batch_args:
                     chunk_size = 64
-                    for i in range(0, len(batch_args), chunk_size * 3):
-                        chunk = batch_args[i:i + chunk_size * 3]
-                        cmd = [as_helper, "--convert-batch-v2", "true"] + chunk
+                    for i in range(0, len(batch_args), chunk_size * 10):
+                        chunk = batch_args[i:i + chunk_size * 10]
+                        cmd = [as_helper, "--convert-batch-v3", "true"] + chunk
                         try:
                             ret = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
                             if ret != 0:
