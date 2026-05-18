@@ -569,11 +569,18 @@ def build_dsf(tile, download_queue):
     else:
         quad_capacity = quad_capacity_high
     pool_quadtree = QuadTree(quad_init_level, quad_capacity)
+    
+    # 5.1 NumPy batch slice and vectorized float2qquad format for high speedup
+    xs = node_coords[0::5] - tile.lon
+    ys = node_coords[1::5] - tile.lat
+    bx_list = [f"{int(16777216 * x):024b}" if x < 1 else "111111111111111111111111" for x in xs]
+    by_list = [f"{int(16777216 * y):024b}" if y < 1 else "111111111111111111111111" for y in ys]
+    
+    # Cache insert method locally to bypass name lookup inside loop
+    insert_method = pool_quadtree.insert
     for i in range(nbr_nodes):
-        pool_quadtree.insert(
-                float2qquad(node_coords[5 * i + 0] - tile.lon),
-                float2qquad(node_coords[5 * i + 1] - tile.lat),
-                quad_init_level)
+        insert_method(bx_list[i], by_list[i], quad_init_level)
+        
     pool_quadtree.clean()
     pool_quadtree.statistics()
     
@@ -589,20 +596,24 @@ def build_dsf(tile, download_queue):
         idx_pool += 1
     pool_param = {}
     node_icoords = numpy.zeros(5 * nbr_nodes, dtype = numpy.uint16)
+    nodes = pool_quadtree.nodes
     for key in pool_quadtree:
         level = len(key[0])
         plist = sorted(list(pool_quadtree[key]["idx_nodes"]))
-        node_icoords[[5 * idx_node for idx_node in plist]] = [
-            int(pool_quadtree.nodes[idx_node][0][level : level + 16], 2)
+        plist_arr = numpy.array(plist, dtype=numpy.int32)
+        idx_0 = 5 * plist_arr
+        idx_1 = idx_0 + 1
+        idx_2 = idx_0 + 2
+        
+        node_icoords[idx_0] = [
+            int(nodes[idx_node][0][level : level + 16], 2)
             for idx_node in plist
         ]
-        node_icoords[[5 * idx_node + 1 for idx_node in plist]] = [
-            int(pool_quadtree.nodes[idx_node][1][level : level + 16], 2)
+        node_icoords[idx_1] = [
+            int(nodes[idx_node][1][level : level + 16], 2)
             for idx_node in plist
         ]
-        altitudes = numpy.array(
-            [node_coords[5 * idx_node + 2] for idx_node in plist]
-        )
+        altitudes = node_coords[idx_2]
         altmin = floor(altitudes.min())
         altmax = ceil(altitudes.max())
         if altmax - altmin < 770:
@@ -618,7 +629,7 @@ def build_dsf(tile, download_queue):
             scale_z = 13107  # 65535=13107*5
             inv_stp = 5
         scal_x = scal_y = 2 ** (-level)
-        node_icoords[[5 * idx_node + 2 for idx_node in plist]] = numpy.round(
+        node_icoords[idx_2] = numpy.round(
             (altitudes - altmin) * inv_stp
         )
         pool_param[key_to_idx_pool[key]] = (
