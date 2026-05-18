@@ -544,8 +544,24 @@ def build_dsf(tile, download_queue):
     til_xs = numpy.clip(til_xs, til_x_min, til_x_max)
     til_ys = numpy.clip(til_ys, til_y_min, til_y_max)
     
-    tri_orthogrid = list(zip(til_xs, til_ys))
-    tri_tex_attr = [dico_customzl[key] for key in tri_orthogrid]
+    # Vectorized custom ZL lookup using 2D NumPy array for huge speedup
+    width = til_x_max - til_x_min + 1
+    height = til_y_max - til_y_min + 1
+    customzl_arr = numpy.empty((width, height), dtype=object)
+    
+    # Pre-fill with a safe default value to prevent any missing key errors
+    default_val = (16 * (til_x_min // 16), 16 * (til_y_min // 16), tile.default_zl, tile.default_website)
+    customzl_arr.fill(default_val)
+    
+    for (tx, ty), val in dico_customzl.items():
+        idx_x = tx - til_x_min
+        idx_y = ty - til_y_min
+        if 0 <= idx_x < width and 0 <= idx_y < height:
+            customzl_arr[idx_x, idx_y] = val
+            
+    idx_xs = numpy.clip(til_xs - til_x_min, 0, width - 1)
+    idx_ys = numpy.clip(til_ys - til_y_min, 0, height - 1)
+    tri_tex_attr = customzl_arr[idx_xs, idx_ys].tolist()
     
     # 5 Compute quadtree
     if (tile.use_masks_for_inland):
@@ -687,6 +703,20 @@ def build_dsf(tile, download_queue):
     # Next, we build DSF mesh points (these take into accound texture 
     # as well), point pools, etc.
 
+    # Cache functions and variables locally to reduce dot resolution overhead
+    _dds_file_name_from_attributes = FNAMES.dds_file_name_from_attributes
+    _mask_file = FNAMES.mask_file
+    _needs_mask = MASK.needs_mask
+    _mask_name_for_texture = MASK.mask_name_for_texture
+    _set_depth_ratio = BATHY.set_depth_ratio
+    _numpy_st_coord = numpy_st_coord
+    _progress_bar = UI.progress_bar
+    _vprint = UI.vprint
+    _build_dir = tile.build_dir
+    _water_tech = tile.water_tech
+    _imprint_masks_to_dds = tile.imprint_masks_to_dds
+    _normal_map_strength = tile.normal_map_strength
+
     step = nbr_tris // 100 + 1
     
     # Tri counter for progress_bars
@@ -700,9 +730,9 @@ def build_dsf(tile, download_queue):
             continue
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         if done % step == 0:
-            UI.progress_bar(1, int(done / step * 0.9))
+            _progress_bar(1, int(done / step * 0.9))
             if UI.red_flag:
-                UI.vprint(1, "DSF construction interrupted.")
+                _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
         texture_attributes = tri_tex_attr[tri]
@@ -719,9 +749,9 @@ def build_dsf(tile, download_queue):
             needs_new_terrain = False
             # if not we need to check with masks values
             if terrain_attributes not in skipped_terrains_for_masking:
-                mask_im = MASK.needs_mask(tile, *texture_attributes)
+                mask_im = _needs_mask(tile, *texture_attributes)
                 if mask_im:
-                    UI.vprint(2, "      Use of an alpha mask.")
+                    _vprint(2, "      Use of an alpha mask.")
                     needs_new_terrain = True
                 else:
                     skipped_terrains_for_masking.add(terrain_attributes)
@@ -729,9 +759,9 @@ def build_dsf(tile, download_queue):
                     try:
                         os.remove(
                             os.path.join(
-                                tile.build_dir,
+                                _build_dir,
                                 "textures",
-                                FNAMES.mask_file(*texture_attributes),
+                                _mask_file(*texture_attributes),
                             )
                         )
                     except:
@@ -745,30 +775,30 @@ def build_dsf(tile, download_queue):
                 
                 # Is it an overlay terrain or the new XP 12 phys water type ?
                 # XP11 style => overlay
-                is_overlay = (tile.water_tech == "XP11 + bathy") 
+                is_overlay = (_water_tech == "XP11 + bathy") 
                 # No alpha channel in DDS => overlay
-                is_overlay |= not tile.imprint_masks_to_dds
+                is_overlay |= not _imprint_masks_to_dds
                 
                 if is_overlay:
                     overlay_terrains.add(terrain_idx)
                 
-                texture_file_name = FNAMES.dds_file_name_from_attributes(
+                texture_file_name = _dds_file_name_from_attributes(
                     *texture_attributes
                 )
                 # do we need to (re)build a texture ?
                 if texture_attributes not in treated_textures:
                     target_tex = os.path.join(
-                            tile.build_dir, "textures", texture_file_name
+                            _build_dir, "textures", texture_file_name
                             )
                     rebuild = False
                     if (not os.path.isfile(target_tex)):
                         rebuild = True
-                    elif (tile.imprint_masks_to_dds):
+                    elif (_imprint_masks_to_dds):
                         # Maybe target_tex was a DXT1, we need DXT5
                         if (os.path.getsize(target_tex) < 20000000):
                             rebuild = True
                         # Maybe masks were updated after target_tex was created
-                        target_mask = MASK.mask_name_for_texture(tile, 
+                        target_mask = _mask_name_for_texture(tile, 
                                           *texture_attributes)
                         if (os.path.isfile(target_mask)):
                             mask_last_modified = os.path.getmtime(target_mask)
@@ -782,18 +812,18 @@ def build_dsf(tile, download_queue):
                         else:
                             print(os.path.getsize(target_tex))
                     
-                    if (rebuild or not tile.imprint_masks_to_dds):
+                    if (rebuild or not _imprint_masks_to_dds):
                         mask_im.save(os.path.join(
-                            tile.build_dir,
+                            _build_dir,
                             "textures",
-                            FNAMES.mask_file(*texture_attributes),
+                            _mask_file(*texture_attributes),
                         )
                     )
 
                     if (rebuild):
                             download_queue.put(texture_attributes)
                     else:
-                        UI.vprint(
+                        _vprint(
                             2,
                             "   Texture file "
                             + texture_file_name
@@ -825,7 +855,7 @@ def build_dsf(tile, download_queue):
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    (s, t) = numpy_st_coord(
+                    (s, t) = _numpy_st_coord(
                         node_coords[5 * n + 1],
                         node_coords[5 * n],
                         *texture_attributes[:3]
@@ -852,7 +882,7 @@ def build_dsf(tile, download_queue):
                             node_icoords[5 * n : 5 * n + 5]
                         )
                         # TODO (improve fetch values)
-                        ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                        ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                             node_bathy, tile)
                         ratio_fetch = 1
                         if int(texture_attributes[2]) >= 18:
@@ -902,7 +932,7 @@ def build_dsf(tile, download_queue):
                         node_icoords[5 * n : 5 * n + 3]
                     )
                     dsf_pools[idx_dsfpool].extend((32768, 32768))
-                    ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                    ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                         node_bathy, tile)
                     # TODO improve bathy and fetch ratio variety
                     ratio_fetch = 1
@@ -926,9 +956,9 @@ def build_dsf(tile, download_queue):
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         
         if done % step == 0:
-            UI.progress_bar(1, int(done / step * 0.9))
+            _progress_bar(1, int(done / step * 0.9))
             if UI.red_flag:
-                UI.vprint(1, "DSF construction interrupted.")
+                _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
         texture_attributes = tri_tex_attr[tri]
@@ -947,13 +977,13 @@ def build_dsf(tile, download_queue):
             is_overlay = tri_type == 1
             if is_overlay:
                 overlay_terrains.add(terrain_idx)
-            texture_file_name = FNAMES.dds_file_name_from_attributes(
+            texture_file_name = _dds_file_name_from_attributes(
                 *texture_attributes
             )
             # do we need to download a new texture ?
             if texture_attributes not in treated_textures:
                 target_tex = os.path.join(
-                            tile.build_dir, "textures", texture_file_name
+                            _build_dir, "textures", texture_file_name
                             )
                 rebuild = False
                 if (not os.path.isfile(target_tex)):
@@ -964,7 +994,7 @@ def build_dsf(tile, download_queue):
                 if (rebuild):
                     download_queue.put(texture_attributes)
                 else:
-                    UI.vprint(
+                    _vprint(
                         2,
                         "   Texture file "
                         + texture_file_name
@@ -992,7 +1022,7 @@ def build_dsf(tile, download_queue):
             if node_hash in textured_nodes:
                 (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
             else:
-                (s, t) = numpy_st_coord(
+                (s, t) = _numpy_st_coord(
                     node_coords[5 * n + 1],
                     node_coords[5 * n],
                     *texture_attributes[:3]
@@ -1064,7 +1094,7 @@ def build_dsf(tile, download_queue):
                         node_icoords[5 * n : 5 * n + 3]
                     )
                     dsf_pools[idx_dsfpool].extend((32768, 32768))
-                    ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                    ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                         node_bathy, tile)
                     ratio_fetch = 1
                     dsf_pools[idx_dsfpool].extend((int(65535 * ratio_fetch),

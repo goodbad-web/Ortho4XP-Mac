@@ -243,3 +243,33 @@ def check_and_restore_cached_image(file_path):
                     
     return False
 
+
+def flush_tile_imagery(lat, lon):
+    """
+    Copy all cached imagery for the completed tile (lat, lon) from RAM Disk back to SSD,
+    and remove them from RAM Disk to free up space during batch builds.
+    """
+    import O4_File_Names as FNAMES
+    ortho_dir = os.path.abspath(FNAMES.Imagery_dir)
+    
+    if not os.path.islink(ortho_dir):
+        return False
+        
+    backup_dir = ortho_dir + "_backup"
+    tile_subpath = os.path.join(FNAMES.long_latlon(lat, lon), FNAMES.short_latlon(lat, lon))
+    ram_tile_dir = os.path.join(ortho_dir, tile_subpath)
+    ssd_tile_dir = os.path.join(backup_dir, tile_subpath)
+    
+    if os.path.exists(ram_tile_dir):
+        UI.vprint(1, f"[RAMDisk] Flushing tile +{lat}+{lon} imagery cache to SSD to free space...")
+        merge_directories(ram_tile_dir, ssd_tile_dir)
+        try:
+            shutil.rmtree(ram_tile_dir, ignore_errors=True)
+            UI.vprint(1, f"[RAMDisk] Successfully freed RAM Disk space for tile +{lat}+{lon}.")
+        except Exception as e:
+            UI.vprint(2, f"[RAMDisk] Warning: Failed to clear RAM Disk tile directory: {e}")
+        return True
+        
+    return False
+
+

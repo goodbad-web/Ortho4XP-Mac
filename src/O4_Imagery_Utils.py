@@ -1731,6 +1731,7 @@ def build_jpeg_ortho(
                     tile.lon,
                     true_zl,
                     providers_dict[rlayer["layer_code"]],
+                )
                 true_jpeg_path = os.path.join(true_file_dir, true_file_name)
                 O4_RAMDisk_Utils.check_and_restore_cached_image(true_jpeg_path)
                 if not os.path.isfile(true_jpeg_path):

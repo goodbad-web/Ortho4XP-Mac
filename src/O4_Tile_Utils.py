@@ -198,6 +198,7 @@ def _build_tile(tile):
             dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
             if conversion_success and use_gpu and dds_converter == "TextureConverter" and "dar" in sys.platform:
                 from PIL import Image
+                import O4_RAMDisk_Utils
                 UI.vprint(1, "-> Executing ultra-fast GPU Batch DDS Conversion via ASHelper...")
                 as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
                 batch_args = []
@@ -224,7 +225,7 @@ def _build_tile(tile):
                     elif os.path.exists(tmp_png):
                         input_path = tmp_png
                         temp_files_to_delete.append(tmp_png)
-                    elif jpeg_path and os.path.exists(jpeg_path):
+                    elif jpeg_path and (os.path.exists(jpeg_path) or O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)):
                         input_path = jpeg_path
                     else:
                         UI.vprint(1, f"ERROR: Input source image not found for {out_file_name}")
@@ -339,6 +340,11 @@ def _build_tile(tile):
             pass
     if UI.cleaning_level > 1 and not tile.grouped and conversion_success:
         remove_unwanted_textures(tile)
+    try:
+        import O4_RAMDisk_Utils
+        O4_RAMDisk_Utils.flush_tile_imagery(tile.lat, tile.lon)
+    except Exception as e:
+        UI.vprint(2, f"[RAMDisk] Warning: Failed to flush tile imagery: {e}")
     UI.timings_and_bottom_line(timer)
     UI.logprint(
         "Step 3 for tile lat=", tile.lat, ", lon=", tile.lon, ": normal exit."
