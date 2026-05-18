@@ -6,6 +6,7 @@ import O4_Vector_Utils as VECT
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_UI_Utils as UI
+import O4_RAMDisk_Utils
 import time
 import os
 import sys
@@ -1730,10 +1731,9 @@ def build_jpeg_ortho(
                     tile.lon,
                     true_zl,
                     providers_dict[rlayer["layer_code"]],
-                )
-                if not os.path.isfile(
-                    os.path.join(true_file_dir, true_file_name)
-                ):
+                true_jpeg_path = os.path.join(true_file_dir, true_file_name)
+                O4_RAMDisk_Utils.check_and_restore_cached_image(true_jpeg_path)
+                if not os.path.isfile(true_jpeg_path):
                     UI.vprint(
                         1,
                         "   Downloading missing orthophoto "
@@ -1801,7 +1801,9 @@ def build_jpeg_ortho(
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
-        if not os.path.isfile(os.path.join(file_dir, file_name)):
+        jpeg_path = os.path.join(file_dir, file_name)
+        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
+        if not os.path.isfile(jpeg_path):
             UI.vprint(1, "   Downloading missing orthophoto " + file_name)
             if not download_jpeg_ortho(
                 file_dir, file_name, *texture_attributes
@@ -2533,6 +2535,8 @@ def convert_texture(
         )
         jpeg_path = os.path.join(file_dir, jpeg_file_name)
     
+    if jpeg_path:
+        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
     is_combined = (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not jpeg_path or not os.path.exists(jpeg_path)
@@ -2546,6 +2550,8 @@ def convert_texture(
         
     if provider_code in providers_dict:
         file_to_convert = jpeg_path
+    if provider_code in providers_dict:
+        O4_RAMDisk_Utils.check_and_restore_cached_image(os.path.join(file_dir, jpeg_file_name))
     if (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not os.path.exists(os.path.join(file_dir, jpeg_file_name))
@@ -2582,8 +2588,10 @@ def convert_texture(
     elif (
         providers_dict[provider_code]["color_filters"] != "none"
     ) or masked_texture or (int(zoomlevel) >= 18):
+        jpeg_full_path = os.path.join(file_dir, jpeg_file_name)
+        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_full_path)
         big_image = Image.open(
-            os.path.join(file_dir, jpeg_file_name), "r"
+            jpeg_full_path, "r"
         ).convert("RGB")
         if providers_dict[provider_code]["color_filters"] != "none":
             big_image = color_transform(

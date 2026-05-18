@@ -187,3 +187,59 @@ def unmount_ram_disk(use_orthophotos=False):
             UI.vprint(0, f"[RAMDisk] Error detaching RAM disk: {e}")
             return False
     return True
+
+def check_and_restore_cached_image(file_path):
+    """
+    If the requested file_path (which points inside Orthophotos) doesn't exist on RAM disk,
+    but does exist in Orthophotos_backup (the SSD cache), copy it over on-demand.
+    Returns True if the file exists on RAM disk (either originally or after restoring).
+    """
+    if not file_path:
+        return False
+        
+    if os.path.exists(file_path):
+        return True
+        
+    import O4_File_Names as FNAMES
+    ortho_dir = os.path.abspath(FNAMES.Imagery_dir)
+    
+    # RAM Disk is active only when Orthophotos is a symlink pointing to the RAM Disk
+    if os.path.islink(ortho_dir):
+        backup_dir = ortho_dir + "_backup"
+        abs_file_path = os.path.abspath(file_path)
+        
+        # Ensure the file_path is indeed inside the Orthophotos directory
+        if abs_file_path.startswith(ortho_dir + os.sep) or abs_file_path == ortho_dir:
+            rel_path = os.path.relpath(abs_file_path, ortho_dir)
+            backup_file_path = os.path.join(backup_dir, rel_path)
+            
+            if os.path.exists(backup_file_path):
+                # Double-check file existence to avoid redundant copy steps
+                if os.path.exists(abs_file_path):
+                    return True
+                    
+                try:
+                    os.makedirs(os.path.dirname(abs_file_path), exist_ok=True)
+                    
+                    # Atomic write utilizing temporary file to eliminate race conditions
+                    tmp_file_path = abs_file_path + f".{os.getpid()}.tmp"
+                    shutil.copy2(backup_file_path, tmp_file_path)
+                    try:
+                        os.replace(tmp_file_path, abs_file_path)
+                    except Exception as replace_err:
+                        # If replacing failed because another process already created the file, clean up and ignore
+                        if os.path.exists(abs_file_path):
+                            try:
+                                os.remove(tmp_file_path)
+                            except:
+                                pass
+                        else:
+                            raise replace_err
+                            
+                    UI.vprint(2, f"[RAMDisk] Restored cached image on-demand: {os.path.basename(file_path)}")
+                    return True
+                except Exception as e:
+                    UI.vprint(2, f"[RAMDisk] Warning: Failed to restore cached image {file_path}: {e}")
+                    
+    return False
+
