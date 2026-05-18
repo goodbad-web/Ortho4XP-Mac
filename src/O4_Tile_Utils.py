@@ -237,6 +237,7 @@ def _build_tile(tile):
                         possible_mask_path = os.path.join(tile.build_dir, "textures", FNAMES.mask_file(til_x_left, til_y_top, zoomlevel, provider_code))
                         if os.path.exists(possible_mask_path):
                             mask_path = possible_mask_path
+                            temp_files_to_delete.append(possible_mask_path)
                     
                     r, g, b = 1.0, 1.0, 1.0
                     contrast, brightness, saturation = 1.0, 0.0, 1.0
