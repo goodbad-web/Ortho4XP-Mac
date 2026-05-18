@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import time
 import shutil
 import queue
@@ -189,6 +191,79 @@ def _build_tile(tile):
             )
 
             conversion_success = (success_count == len(convert_list))
+            
+            # GPU Batch DDS Conversion integration for macOS
+            use_gpu = getattr(UI, 'use_gpu_acceleration', True)
+            dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
+            if conversion_success and use_gpu and dds_converter == "TextureConverter" and "dar" in sys.platform:
+                from PIL import Image
+                UI.vprint(1, "-> Executing ultra-fast GPU Batch DDS Conversion via ASHelper...")
+                as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+                batch_args = []
+                temp_files_to_delete = []
+                
+                for item in convert_list:
+                    tile, til_x_left, til_y_top, zoomlevel, provider_code = item
+                    out_file_name = FNAMES.dds_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
+                    out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
+                    png_file_name = out_file_name.replace("dds", "png")
+                    upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", out_file_name.replace(".dds", "_upscaled.png"))
+                    tmp_png = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
+                    
+                    if provider_code in IMG.providers_dict:
+                        jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
+                        file_dir = FNAMES.jpeg_file_dir_from_attributes(tile.lat, tile.lon, zoomlevel, IMG.providers_dict[provider_code])
+                        jpeg_path = os.path.join(file_dir, jpeg_file_name)
+                    else:
+                        jpeg_path = None
+                    
+                    if os.path.exists(upscaled_tmp):
+                        input_path = upscaled_tmp
+                        temp_files_to_delete.append(upscaled_tmp)
+                    elif os.path.exists(tmp_png):
+                        input_path = tmp_png
+                        temp_files_to_delete.append(tmp_png)
+                    elif jpeg_path and os.path.exists(jpeg_path):
+                        input_path = jpeg_path
+                    else:
+                        UI.vprint(1, f"ERROR: Input source image not found for {out_file_name}")
+                        conversion_success = False
+                        break
+                    
+                    # Detect alpha channel for correct format selection (fallback to BC3/DXT5 if alpha present)
+                    has_alpha = False
+                    try:
+                        with Image.open(input_path) as im:
+                            if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+                                has_alpha = True
+                    except:
+                        pass
+                    
+                    target_fmt = dds_format if (not has_alpha or dds_format == "BC7") else "BC3"
+                    batch_args.extend([input_path, out_file_path, target_fmt])
+                
+                if conversion_success and batch_args:
+                    chunk_size = 64
+                    for i in range(0, len(batch_args), chunk_size * 3):
+                        chunk = batch_args[i:i + chunk_size * 3]
+                        cmd = [as_helper, "--convert-batch-v2", "true"] + chunk
+                        try:
+                            ret = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                            if ret != 0:
+                                UI.vprint(1, f"ERROR: GPU Batch DDS conversion failed with return code {ret}")
+                                conversion_success = False
+                                break
+                        except Exception as e:
+                            UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
+                            conversion_success = False
+                            break
+                    
+                    for temp_file in temp_files_to_delete:
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
+
             if not conversion_success:
                 UI.lvprint(0, f"WARNING: {len(convert_list) - success_count} textures failed to convert.")
                 UI.lvprint(0, "Skipping cleanup to protect existing data.")

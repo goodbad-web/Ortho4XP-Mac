@@ -2596,7 +2596,7 @@ def convert_texture(
     # Optional AI Upscale using Neural Engine
     if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
         # Add pid to avoid conflicts during multiprocessing
-        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + f"_upscaled_{os.getpid()}.png")
+        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
         UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
         if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
             file_to_convert = upscaled_tmp
@@ -2610,6 +2610,10 @@ def convert_texture(
         dds_format = getattr(UI, 'dds_format', 'BC3')
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
+            # GPUバッチ一括変換時は、各ワーカーでは準備のみを行いメインプロセスで一括処理するため早期リターン
+            if getattr(UI, 'use_gpu_acceleration', True):
+                return 1
+            
             # Native Apple Silicon conversion via ASHelper
             executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
             target_fmt = dds_format if (not dxt5 or dds_format == "BC7") else "BC3"

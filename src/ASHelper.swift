@@ -83,6 +83,27 @@ kernel void compressTexture(texture2d<float, access::read> input [[texture(0)]],
 }
 """
 
+class MetalCompressor {
+    static let shared: MetalCompressor? = MetalCompressor()
+    
+    let dev: MTLDevice
+    let pipe: MTLComputePipelineState
+    let q: MTLCommandQueue
+    let loader: MTKTextureLoader
+    
+    private init?() {
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let lib = try? dev.makeLibrary(source: metalSource, options: nil),
+              let fn = lib.makeFunction(name: "compressTexture"),
+              let pipe = try? dev.makeComputePipelineState(function: fn),
+              let q = dev.makeCommandQueue() else { return nil }
+        self.dev = dev
+        self.pipe = pipe
+        self.q = q
+        self.loader = MTKTextureLoader(device: dev)
+    }
+}
+
 func getRawRGBA(cgImage: CGImage) -> [UInt8] {
     let w = cgImage.width; let h = cgImage.height
     var raw = [UInt8](repeating: 0, count: w * h * 4)
@@ -91,9 +112,12 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
 }
 
 func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
-    guard let dev = MTLCreateSystemDefaultDevice(), let lib = try? dev.makeLibrary(source: metalSource, options: nil), let fn = lib.makeFunction(name: "compressTexture"), let pipe = try? dev.makeComputePipelineState(function: fn), let q = dev.makeCommandQueue() else { return nil }
+    guard let comp = MetalCompressor.shared else { return nil }
+    let dev = comp.dev
+    let pipe = comp.pipe
+    let q = comp.q
+    let loader = comp.loader
     
-    let loader = MTKTextureLoader(device: dev)
     let options: [MTKTextureLoader.Option: Any] = [
         .SRGB: false,
         .generateMipmaps: true,
@@ -214,3 +238,22 @@ func upscale(inputPath: String, outputPath: String) {
 let args = ProcessInfo.processInfo.arguments; if args.count < 4 { exit(1) }
 if args[1] == "--upscale" { upscale(inputPath: args[2], outputPath: args[3]) }
 else if args[1] == "--convert" { convert(inputPath: args[2], outputPath: args[3], format: args.count > 4 ? args[4] : "BC3", useGPU: args.contains("--gpu")) }
+else if args[1] == "--convert-batch" {
+    guard args.count >= 6 else { exit(1) }
+    let format = args[2]
+    let useGPU = args[3] == "true"
+    var idx = 4
+    while idx + 1 < args.count {
+        convert(inputPath: args[idx], outputPath: args[idx+1], format: format, useGPU: useGPU)
+        idx += 2
+    }
+}
+else if args[1] == "--convert-batch-v2" {
+    guard args.count >= 6 else { exit(1) }
+    let useGPU = args[2] == "true"
+    var idx = 3
+    while idx + 2 < args.count {
+        convert(inputPath: args[idx], outputPath: args[idx+1], format: args[idx+2], useGPU: useGPU)
+        idx += 3
+    }
+}
