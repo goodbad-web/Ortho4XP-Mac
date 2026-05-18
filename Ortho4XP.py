@@ -69,9 +69,10 @@ if __name__ == '__main__':
             if len(sys.argv)==3:
                 try:
                     tile=CFG.Tile(lat,lon,'')
+                    tile.read_from_config()
                 except Exception as e:
                     print(e)
-                    print("ERROR: could not read tile config file."); sys.exit()
+                    print("ERROR: could not initialize tile config."); sys.exit()
             else:
                 try:
                     provider_code=sys.argv[3]
