@@ -348,6 +348,11 @@ too low to grab these details.",
             "values" : ("XP12", "XP11 + bathy"),
             "hint" : "Water tech type. XP12 uses a new (partly in construction) rendering tech, XP11 + bathy uses a more traditionnal blend. Both allows for 3D water."
     },
+    "clamp_land_elevation": {
+        "type": bool,
+        "default": False,
+        "hint": "When True, forces any mesh vertices with negative elevation (below sea level) to exactly 0m. This prevents X-Plane 12 from overriding dry land with seawater in regions like reclaimed land or polders."
+    },
     #"add_low_res_sea_ovl": {
     #    "type": bool,
     #    "default": False,
@@ -481,6 +486,7 @@ list_mesh_vars = [
     "water_smoothing",
     "use_gpu_for_dem_smoothing",
     "iterate",
+    "clamp_land_elevation",
 ]
 list_mask_vars = [
     "mask_zl",

@@ -306,6 +306,10 @@ def post_process_nodes_altitudes(tile):
             vertices[6 * v + 3] = 0
             vertices[6 * v + 4] = 0
             
+    if getattr(tile, "clamp_land_elevation", False):
+        UI.vprint(1, "   Clamping land elevations below 0m to 0m.")
+        vertices[2::6] = numpy.maximum(vertices[2::6], 0.0)
+            
     UI.vprint(1, "-> Writing output nodes file.")
     with open(FNAMES.output_node_file(tile), "w") as f_node:
         f_node.write(init_line_f_node)
