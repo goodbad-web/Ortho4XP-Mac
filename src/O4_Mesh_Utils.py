@@ -325,6 +325,15 @@ def write_mesh_file(tile, vertices):
     )
     f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_vert = len(vertices) // 6
+    if nbr_vert > 1000000:
+        UI.vprint(
+            0,
+            "\nWARNING: Final node count ({:,}) exceeds the Metal absolute limit of 1,000,000!".format(nbr_vert)
+        )
+        UI.vprint(
+            0,
+            "         This tile may fail to load or crash in X-Plane 12 with Metal API.\n"
+        )
     nbr_tri = int(f_ele.readline().split()[0])
     f = open(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon), "w")
     f.write("MeshVersionFormatted 2\n")
@@ -534,9 +543,13 @@ def extract_mesh_to_obj(
 def build_mesh(tile):
     if not UI.is_building_all:
         UI.initialize_build_log(tile.build_dir)
+    tile.mesh_retry_count = 0
+    tile.original_curvature_tol = tile.curvature_tol
     try:
         return _build_mesh(tile)
     finally:
+        if hasattr(tile, "original_curvature_tol"):
+            tile.curvature_tol = tile.original_curvature_tol
         UI.flush_build_log(tile.build_dir)
 
 def _build_mesh(tile):
@@ -647,7 +660,7 @@ def _build_mesh(tile):
     if max_tris <= 0 or max_tris >= 5e7:
         max_tris = 5e6
     max_steiner = max_tris / 1.9 - input_nodes
-    max_steiner = max(max_steiner, 2e5)
+    max_steiner = max(max_steiner, 2e4)
 
     limit_tris = "S" + str(max_steiner)
     Tri_option = (
@@ -746,6 +759,24 @@ def _build_mesh(tile):
     if UI.red_flag:
         UI.exit_message_and_bottom_line()
         return 0
+
+    nbr_vert = len(vertices) // 6
+    if nbr_vert > 1000000 and getattr(tile, "mesh_retry_count", 0) < 3:
+        tile.mesh_retry_count += 1
+        new_tol = tile.curvature_tol * 1.5
+        UI.vprint(
+            0,
+            "\n[Auto-Retry] Final node count ({:,}) exceeds the Metal limit of 1,000,000!".format(nbr_vert)
+        )
+        UI.vprint(
+            0,
+            "             Increasing curvature_tol from {:.4f} to {:.4f} (Attempt {}/3)...".format(
+                tile.curvature_tol, new_tol, tile.mesh_retry_count
+            )
+        )
+        tile.curvature_tol = new_tol
+        UI.is_working = 0  # Re-enable execution for the retry
+        return _build_mesh(tile)
 
     write_mesh_file(tile, vertices)
     #

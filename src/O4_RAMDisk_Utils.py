@@ -248,6 +248,7 @@ def flush_tile_imagery(lat, lon):
     """
     Copy all cached imagery for the completed tile (lat, lon) from RAM Disk back to SSD,
     and remove them from RAM Disk to free up space during batch builds.
+    Handles both normal and grouped folder structures.
     """
     import O4_File_Names as FNAMES
     ortho_dir = os.path.abspath(FNAMES.Imagery_dir)
@@ -256,20 +257,36 @@ def flush_tile_imagery(lat, lon):
         return False
         
     backup_dir = ortho_dir + "_backup"
-    tile_subpath = os.path.join(FNAMES.long_latlon(lat, lon), FNAMES.short_latlon(lat, lon))
-    ram_tile_dir = os.path.join(ortho_dir, tile_subpath)
-    ssd_tile_dir = os.path.join(backup_dir, tile_subpath)
+    flushed = False
     
-    if os.path.exists(ram_tile_dir):
-        UI.vprint(1, f"[RAMDisk] Flushing tile +{lat}+{lon} imagery cache to SSD to free space...")
-        merge_directories(ram_tile_dir, ssd_tile_dir)
+    # 1. Handle normal structure: Orthophotos/short_latlon/
+    normal_rel = FNAMES.short_latlon(lat, lon)
+    ram_normal_dir = os.path.join(ortho_dir, normal_rel)
+    ssd_normal_dir = os.path.join(backup_dir, normal_rel)
+    if os.path.exists(ram_normal_dir):
+        UI.vprint(1, f"[RAMDisk] Flushing tile {normal_rel} imagery cache to SSD to free space...")
+        merge_directories(ram_normal_dir, ssd_normal_dir)
         try:
-            shutil.rmtree(ram_tile_dir, ignore_errors=True)
-            UI.vprint(1, f"[RAMDisk] Successfully freed RAM Disk space for tile +{lat}+{lon}.")
+            shutil.rmtree(ram_normal_dir, ignore_errors=True)
+            UI.vprint(1, f"[RAMDisk] Successfully freed RAM Disk space for normal tile: {normal_rel}.")
+            flushed = True
         except Exception as e:
-            UI.vprint(2, f"[RAMDisk] Warning: Failed to clear RAM Disk tile directory: {e}")
-        return True
-        
-    return False
+            UI.vprint(2, f"[RAMDisk] Warning: Failed to clear normal RAM Disk tile directory: {e}")
+
+    # 2. Handle grouped structure: Orthophotos/long_latlon/
+    grouped_rel = FNAMES.long_latlon(lat, lon)
+    ram_grouped_dir = os.path.join(ortho_dir, grouped_rel)
+    ssd_grouped_dir = os.path.join(backup_dir, grouped_rel)
+    if os.path.exists(ram_grouped_dir):
+        UI.vprint(1, f"[RAMDisk] Flushing tile {grouped_rel} (grouped) imagery cache to SSD to free space...")
+        merge_directories(ram_grouped_dir, ssd_grouped_dir)
+        try:
+            shutil.rmtree(ram_grouped_dir, ignore_errors=True)
+            UI.vprint(1, f"[RAMDisk] Successfully freed RAM Disk space for grouped tile: {grouped_rel}.")
+            flushed = True
+        except Exception as e:
+            UI.vprint(2, f"[RAMDisk] Warning: Failed to clear grouped RAM Disk tile directory: {e}")
+
+    return flushed
 
 

@@ -13,17 +13,7 @@ def set_depth_ratio(n, node_is_coast, node_bathy, tile):
             min(10 * tile.ratio_bathy * node_bathy[n] / 255, 1),
             0.1)
 
-def recut_water_tris(node_coords, tri_idx, tri_types):
-    nbr_nodes = len(node_coords) // 5
-    nbr_tris = len(tri_types)
-    node_types = numpy.zeros(nbr_nodes, dtype = numpy.uint8)
-    for i in range(nbr_tris):
-        t = 1 << tri_types[i]
-        node_types[tri_idx[3 * i + 0]] |= t 
-        node_types[tri_idx[3 * i + 1]] |= t 
-        node_types[tri_idx[3 * i + 2]] |= t
-    node_is_coast = ((node_types & 1) != 0) & ((node_types & 6) != 0)
-    return (nbr_nodes, node_coords, node_types, node_is_coast, nbr_tris, tri_idx, tri_types)
+from O4_Recut_Water import recut_water_tris
     
 
 
