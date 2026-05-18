@@ -647,7 +647,7 @@ def _build_mesh(tile):
     if max_tris <= 0 or max_tris >= 5e7:
         max_tris = 5e6
     max_steiner = max_tris / 1.9 - input_nodes
-    max_steiner = max(max_steiner, 5e5)
+    max_steiner = max(max_steiner, 2e5)
 
     limit_tris = "S" + str(max_steiner)
     Tri_option = (

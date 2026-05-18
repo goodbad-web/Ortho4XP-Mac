@@ -1663,7 +1663,7 @@ def download_jpeg_ortho(
                     with Image.open(parent_file_path) as parent_img:
                         offset_x = (til_x_16 - til_x_left_16) * 256
                         offset_y = (til_y_16 - til_y_top_16) * 256
-                        crop_size = factor * 256
+                        crop_size = 4096 // factor
                         
                         cropped = parent_img.crop((offset_x, offset_y, offset_x + crop_size, offset_y + crop_size))
                         high_quality_img = cropped.resize((4096, 4096), Image.BICUBIC)

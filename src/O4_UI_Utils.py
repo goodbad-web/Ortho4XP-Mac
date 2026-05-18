@@ -148,7 +148,8 @@ def initialize_build_log(build_dir):
         os.makedirs(build_dir, exist_ok=True)
         log_path = os.path.join(build_dir, "Ortho4XP_build.log")
         if os.path.exists(log_path):
-            os.remove(log_path)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n\n{'='*20} New Step Started: {time.strftime('%c')} {'='*20}\n\n")
     except Exception as e:
         logprint("Failed to initialize build log:", e)
 
