@@ -775,7 +775,7 @@ class Ortho4XP_Config(tk.Toplevel):
         for j in range(8):
             self.frame_cfg.columnconfigure(j, weight=1)
         self.frame_cfg.rowconfigure(0, weight=1)
-        for j in range(6):
+        for j in range(7):
             self.frame_lastbtn.columnconfigure(j, weight=1)
         self.frame_lastbtn.rowconfigure(0, weight=1)
 
@@ -1057,11 +1057,19 @@ class Ortho4XP_Config(tk.Toplevel):
         self.button5.grid(
             row=0, column=4, padx=5, pady=self.pady, sticky=N + S + E + W
         )
+        self.button_clean = ttk.Button(
+            self.frame_lastbtn,
+            text="Clean Tmp Data",
+            command=self.clean_tiles_tmp_files,
+        )
+        self.button_clean.grid(
+            row=0, column=5, padx=5, pady=self.pady, sticky=N + S + E + W
+        )
         self.button6 = ttk.Button(
             self.frame_lastbtn, text="     Exit     ", command=self.destroy
         )
         self.button6.grid(
-            row=0, column=5, padx=5, pady=self.pady, sticky=N + S + E + W
+            row=0, column=6, padx=5, pady=self.pady, sticky=N + S + E + W
         )
 
         # Initialize fields and variables
@@ -1319,6 +1327,55 @@ class Ortho4XP_Config(tk.Toplevel):
                     os.execv(sys.executable, [sys.executable] + sys.argv)
                 except Exception as e:
                     UI.lvprint(1, f"Failed to restart: {e}")
+
+    def clean_tiles_tmp_files(self):
+        import tkinter.messagebox as messagebox
+        import glob
+        
+        tiles_dir = os.path.join(UI.Ortho4XP_dir, "Tiles")
+        if not os.path.isdir(tiles_dir):
+            messagebox.showinfo("Clean Tiles", "Tiles directory does not exist.", parent=self)
+            return
+            
+        confirm = messagebox.askyesno(
+            "Clean Tiles",
+            "Are you sure you want to delete all temporary geometry files (Data+*) and leftover PNGs across all tiles?\n\nThis will free up several gigabytes of disk space and won't affect X-Plane gameplay.",
+            parent=self
+        )
+        if not confirm:
+            return
+            
+        deleted_count = 0
+        deleted_bytes = 0
+        
+        # 1. Delete Data+* files
+        for path in glob.glob(os.path.join(tiles_dir, "zOrtho4XP_*", "Data+*")):
+            try:
+                sz = os.path.getsize(path)
+                os.remove(path)
+                deleted_count += 1
+                deleted_bytes += sz
+            except Exception as e:
+                UI.vprint(2, f"Failed to delete {path}: {str(e)}")
+                
+        # 2. Delete leftover PNGs in textures
+        for path in glob.glob(os.path.join(tiles_dir, "zOrtho4XP_*", "textures", "*.png")):
+            if os.path.basename(path) == "water_transition.png":
+                continue
+            try:
+                sz = os.path.getsize(path)
+                os.remove(path)
+                deleted_count += 1
+                deleted_bytes += sz
+            except Exception as e:
+                UI.vprint(2, f"Failed to delete {path}: {str(e)}")
+                
+        mb_saved = deleted_bytes / (1024 * 1024)
+        messagebox.showinfo(
+            "Clean Tiles",
+            f"Successfully cleaned up temporary files!\n\nDeleted: {deleted_count} files\nDisk Space Saved: {mb_saved:.1f} MB",
+            parent=self
+        )
 
     def popup(self, header, input_text):
         self.popupwindow = tk.Toplevel()
