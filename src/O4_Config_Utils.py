@@ -426,6 +426,12 @@ too low to grab these details.",
         "default": False,
         "hint": "Optionally handle downloaded imagery (Orthophotos) in the macOS RAM disk. Automatically backs up existing photos and restores them on exit.",
     },
+    "build_overlays_in_all_in_one": {
+        "type": bool,
+        "default": False,
+        "hint": "When set, the 'All in one' process will automatically execute overlay extraction (Extract overlays) after building the DSF/Imagery.",
+        "short_name": "build_overlays_in_all",
+    },
 }
 
 list_app_vars = [
@@ -507,6 +513,7 @@ list_dsf_vars = [
     "terrain_casts_shadows",
     "use_decal_on_terrain",
     "write_build_log",
+    "build_overlays_in_all_in_one",
 ]
 list_other_vars = ["custom_dem", "fill_nodata"]
 list_tile_vars = (

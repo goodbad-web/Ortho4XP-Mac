@@ -379,6 +379,12 @@ def _build_all(tile):
     if UI.red_flag:
         UI.exit_message_and_bottom_line("")
         return 0
+    if getattr(tile, 'build_overlays_in_all_in_one', False):
+        UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
+        OVL.build_overlay(tile.lat, tile.lon)
+        if UI.red_flag:
+            UI.exit_message_and_bottom_line("")
+            return 0
     UI.is_working = 0
     return 1
 
