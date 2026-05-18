@@ -2419,6 +2419,7 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
 def init_worker(config_data):
     global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd
     global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
+    global is_worker_process
     
     # Restore globals from passed config
     use_magick = config_data['use_magick']
@@ -2435,6 +2436,7 @@ def init_worker(config_data):
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
     UI.use_neural_upscale = config_data.get('use_neural_upscale', False)
+    is_worker_process = True
 
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
@@ -2537,8 +2539,9 @@ def convert_texture(
     )
     use_upscale = getattr(UI, 'use_neural_upscale', False)
     use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
+    is_worker = globals().get('is_worker_process', False)
     
-    if use_gpu_batch and not is_combined and not use_upscale and type == "dds":
+    if use_gpu_batch and is_worker and not is_combined and not use_upscale and type == "dds":
         return 1
         
     if provider_code in providers_dict:
@@ -2625,7 +2628,7 @@ def convert_texture(
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # GPUバッチ一括変換時は、各ワーカーでは準備のみを行いメインプロセスで一括処理するため早期リターン
-            if getattr(UI, 'use_gpu_acceleration', True):
+            if is_worker and getattr(UI, 'use_gpu_acceleration', True):
                 return 1
             
             # Native Apple Silicon conversion via ASHelper

@@ -3,7 +3,7 @@ import sys
 from math import ceil
 import tkinter as tk
 import tkinter.ttk as ttk
-from tkinter import RIDGE, N, S, E, W, filedialog
+from tkinter import RIDGE, N, S, E, W, filedialog, messagebox
 import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 import O4_DEM_Utils as DEM
@@ -1236,8 +1236,27 @@ class Ortho4XP_Config(tk.Toplevel):
 
     def apply_changes(self):
         errors = []
+        restart_required_vars = [
+            "use_ram_disk",
+            "ram_disk_size_gb",
+            "use_ram_disk_for_orthophotos",
+            "custom_scenery_dir",
+            "custom_overlay_src"
+        ]
+        restart_needed = False
+        changed_vars = []
         for var in list_tile_vars + list_app_vars:
             try:
+                target = (
+                    cfg_vars[var]["module"] + "." + var
+                    if "module" in cfg_vars[var]
+                    else var
+                )
+                try:
+                    current_val = eval(target)
+                except:
+                    current_val = None
+
                 value_str = self.v_[var].get()
                 if cfg_vars[var]["type"] == bool:
                     val = (value_str.lower() == "true")
@@ -1246,6 +1265,10 @@ class Ortho4XP_Config(tk.Toplevel):
                 else:
                     val = cfg_vars[var]["type"](value_str)
                 
+                if var in restart_required_vars and current_val != val:
+                    restart_needed = True
+                    changed_vars.append(var)
+
                 if "module" in cfg_vars[var]:
                     module_name = cfg_vars[var]["module"]
                     if module_name == "UI": setattr(UI, var, val)
@@ -1275,6 +1298,20 @@ class Ortho4XP_Config(tk.Toplevel):
                 + "\n* ".join(errors)
             )
             self.popup("ERROR", error_text)
+            restart_needed = False
+
+        if restart_needed:
+            msg = "The following settings have been changed and require a restart to take effect:\n\n"
+            msg += "\n".join([f"- {v}" for v in changed_vars])
+            msg += "\n\nWould you like to save the configuration and restart Ortho4XP now?"
+            if messagebox.askyesno("Restart Required", msg, parent=self):
+                self.write_global_cfg()
+                import sys
+                import os
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception as e:
+                    UI.lvprint(1, f"Failed to restart: {e}")
 
     def popup(self, header, input_text):
         self.popupwindow = tk.Toplevel()

@@ -65,8 +65,8 @@ def vprint(min_verbosity, *args):
     msg = " ".join([str(x) for x in args])
     if verbosity >= min_verbosity:
         print(msg)
-    if write_build_log:
-        build_log_buffer.append(msg)
+        if write_build_log:
+            build_log_buffer.append(msg)
 
 
 ################################################################################
@@ -89,10 +89,10 @@ def lvprint(min_verbosity, *args):
     msg = " ".join([str(x) for x in args])
     if verbosity >= min_verbosity:
         print(msg)
-    if log:
-        logprint(msg)
-    if write_build_log:
-        build_log_buffer.append(msg)
+        if log:
+            logprint(msg)
+        if write_build_log:
+            build_log_buffer.append(msg)
 
 
 def get_config_summary():

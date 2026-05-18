@@ -172,7 +172,8 @@ def _build_tile(tile):
                 'Ortho4XP_dir': UI.Ortho4XP_dir,
                 'verbosity': UI.verbosity,
                 'cleaning_level': UI.cleaning_level,
-                'use_neural_upscale': getattr(tile, 'use_neural_upscale', False)
+                'use_neural_upscale': getattr(tile, 'use_neural_upscale', False),
+                'is_worker': True
             }
             # Collect conversion arguments from queue
             convert_list = []

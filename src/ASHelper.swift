@@ -105,6 +105,7 @@ class MetalCompressor {
 }
 
 // Memory Cache for mask images to eliminate repetitive disk I/O
+let maskCacheLock = NSLock()
 var maskCache: [String: CIImage] = [:]
 
 func getRawRGBA(cgImage: CGImage) -> [UInt8] {
@@ -224,11 +225,18 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     // 1. Blend mask if present (via in-memory Mask Cache)
     if maskPath != "none" && maskPath != "" {
         var maskCI: CIImage? = nil
+        maskCacheLock.lock()
         if let cached = maskCache[maskPath] {
             maskCI = cached
-        } else if FileManager.default.fileExists(atPath: maskPath), let loaded = CIImage(contentsOf: URL(fileURLWithPath: maskPath)) {
-            maskCache[maskPath] = loaded
-            maskCI = loaded
+            maskCacheLock.unlock()
+        } else {
+            maskCacheLock.unlock()
+            if FileManager.default.fileExists(atPath: maskPath), let loaded = CIImage(contentsOf: URL(fileURLWithPath: maskPath)) {
+                maskCacheLock.lock()
+                maskCache[maskPath] = loaded
+                maskCI = loaded
+                maskCacheLock.unlock()
+            }
         }
         
         if let mCI = maskCI {
@@ -447,20 +455,40 @@ else if args[1] == "--convert-batch-v2" {
 else if args[1] == "--convert-batch-v3" {
     guard args.count >= 12 else { exit(1) }
     let useGPU = args[2] == "true"
+    
+    struct BatchTask {
+        let jpeg: String
+        let mask: String
+        let r: Double
+        let g: Double
+        let b: Double
+        let contrast: Double
+        let brightness: Double
+        let saturation: Double
+        let output: String
+        let format: String
+    }
+    
+    var tasks: [BatchTask] = []
     var idx = 3
     while idx + 9 < args.count {
-        let jpeg = args[idx]
-        let mask = args[idx+1]
-        let r = Double(args[idx+2]) ?? 1.0
-        let g = Double(args[idx+3]) ?? 1.0
-        let b = Double(args[idx+4]) ?? 1.0
-        let contrast = Double(args[idx+5]) ?? 1.0
-        let brightness = Double(args[idx+6]) ?? 0.0
-        let saturation = Double(args[idx+7]) ?? 1.0
-        let output = args[idx+8]
-        let format = args[idx+9]
-        
-        convertWithPreprocess(jpegPath: jpeg, maskPath: mask, r: r, g: g, b: b, contrast: contrast, brightness: brightness, saturation: saturation, outputPath: output, format: format, useGPU: useGPU)
+        tasks.append(BatchTask(
+            jpeg: args[idx],
+            mask: args[idx+1],
+            r: Double(args[idx+2]) ?? 1.0,
+            g: Double(args[idx+3]) ?? 1.0,
+            b: Double(args[idx+4]) ?? 1.0,
+            contrast: Double(args[idx+5]) ?? 1.0,
+            brightness: Double(args[idx+6]) ?? 0.0,
+            saturation: Double(args[idx+7]) ?? 1.0,
+            output: args[idx+8],
+            format: args[idx+9]
+        ))
         idx += 10
+    }
+    
+    DispatchQueue.concurrentPerform(iterations: tasks.count) { i in
+        let t = tasks[i]
+        convertWithPreprocess(jpegPath: t.jpeg, maskPath: t.mask, r: t.r, g: t.g, b: t.b, contrast: t.contrast, brightness: t.brightness, saturation: t.saturation, outputPath: t.output, format: t.format, useGPU: useGPU)
     }
 }
