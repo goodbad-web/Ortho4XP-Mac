@@ -360,10 +360,21 @@ class Ortho4XP_GUI(tk.Tk):
         self.pgrb3.grid(row=0, column=2, padx=5, pady=0)
 
         # Console
-        self.console = tk.Text(self.frame_console, bd=0, bg=UI.ENTRY_BG, fg=UI.FG_COLOR, insertbackground=UI.FG_COLOR)
-        self.console.grid(row=0, column=0, sticky=N + S + E + W)
-        self.frame_console.rowconfigure(0, weight=1)
+        self.frame_console.rowconfigure(0, weight=0)
+        self.frame_console.rowconfigure(1, weight=1)
         self.frame_console.columnconfigure(0, weight=1)
+
+        self.btn_clear = ttk.Button(
+            self.frame_console,
+            text="Clear",
+            command=self.clear_console,
+            style="Flat.TButton",
+            takefocus=False,
+        )
+        self.btn_clear.grid(row=0, column=0, padx=5, pady=2, sticky=E)
+
+        self.console = tk.Text(self.frame_console, bd=0, bg=UI.ENTRY_BG, fg=UI.FG_COLOR, insertbackground=UI.FG_COLOR)
+        self.console.grid(row=1, column=0, sticky=N + S + E + W)
 
         # Update
         self.console_queue = queue.Queue()
@@ -396,6 +407,9 @@ class Ortho4XP_GUI(tk.Tk):
             self.custom_build_dir.set("")
 
     # GUI methods
+    def clear_console(self):
+        self.console_queue.put(None)
+
     def write(self, line):
         self.console_queue.put(line)
 

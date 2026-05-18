@@ -1124,6 +1124,15 @@ def build_dsf(tile, download_queue):
 
     UI.vprint(1, "-> Encoding of the DSF file")
     UI.vprint(1, "     Final nbr of nodes: " + str(len_textured_nodes))
+    if len_textured_nodes > 1000000:
+        UI.vprint(
+            0,
+            "\nWARNING: Final DSF node count ({:,}) exceeds the Metal absolute limit of 1,000,000!".format(len_textured_nodes)
+        )
+        UI.vprint(
+            0,
+            "         This tile may fail to load or crash in X-Plane 12 with Metal API.\n"
+        )
     UI.vprint(2, "     Final nbr of cross pool tris: " + str(total_cross_pool))
 
     # Now is time to write our DSF to disk, the exact binary format is 

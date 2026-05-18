@@ -329,14 +329,14 @@ def write_mesh_file(tile, vertices):
     )
     f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_vert = len(vertices) // 6
-    if nbr_vert > 1000000:
+    if nbr_vert > 900000:
         UI.vprint(
             0,
-            "\nWARNING: Final node count ({:,}) exceeds the Metal absolute limit of 1,000,000!".format(nbr_vert)
+            "\nWARNING: Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
         )
         UI.vprint(
             0,
-            "         This tile may fail to load or crash in X-Plane 12 with Metal API.\n"
+            "         The final DSF node count might exceed the 1,000,000 Metal absolute limit and crash X-Plane 12.\n"
         )
     nbr_tri = int(f_ele.readline().split()[0])
     f = open(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon), "w")
@@ -765,12 +765,12 @@ def _build_mesh(tile):
         return 0
 
     nbr_vert = len(vertices) // 6
-    if nbr_vert > 1000000 and getattr(tile, "mesh_retry_count", 0) < 3:
+    if nbr_vert > 900000 and getattr(tile, "mesh_retry_count", 0) < 3:
         tile.mesh_retry_count += 1
         new_tol = tile.curvature_tol * 1.5
         UI.vprint(
             0,
-            "\n[Auto-Retry] Final node count ({:,}) exceeds the Metal limit of 1,000,000!".format(nbr_vert)
+            "\n[Auto-Retry] Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
         )
         UI.vprint(
             0,
