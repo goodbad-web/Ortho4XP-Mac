@@ -1632,45 +1632,6 @@ def download_jpeg_ortho(
             e,
         )
         return 0
-    # Quality Check & High-Quality Crop Fallback for upgraded ZL
-    file_path = os.path.join(file_dir, file_name)
-    if zoomlevel > 16:
-        try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) < 150000:
-                UI.vprint(1, f"   [Quality Check] {file_name} is too small ({os.path.getsize(file_path)} bytes). Attempting high-quality crop from ZL16.")
-                parent_zl = 16
-                diff = zoomlevel - parent_zl
-                factor = 2 ** diff
-                
-                til_x_16 = til_x_left // factor
-                til_y_16 = til_y_top // factor
-                
-                til_x_left_16 = (til_x_16 // 16) * 16
-                til_y_top_16 = (til_y_16 // 16) * 16
-                
-                parent_file_name = FNAMES.jpeg_file_name_from_attributes(til_x_left_16, til_y_top_16, parent_zl, provider_code)
-                [latmax, lonmin] = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
-                parent_lat = int(floor(latmax))
-                parent_lon = int(floor(lonmin))
-                parent_file_dir = FNAMES.jpeg_file_dir_from_attributes(parent_lat, parent_lon, parent_zl, provider)
-                parent_file_path = os.path.join(parent_file_dir, parent_file_name)
-                
-                if not os.path.exists(parent_file_path):
-                    UI.vprint(1, f"   Downloading parent ZL16 orthophoto: {parent_file_name}")
-                    download_jpeg_ortho(parent_file_dir, parent_file_name, til_x_left_16, til_y_top_16, parent_zl, provider_code)
-                
-                if os.path.exists(parent_file_path):
-                    with Image.open(parent_file_path) as parent_img:
-                        offset_x = (til_x_16 - til_x_left_16) * 256
-                        offset_y = (til_y_16 - til_y_top_16) * 256
-                        crop_size = 4096 // factor
-                        
-                        cropped = parent_img.crop((offset_x, offset_y, offset_x + crop_size, offset_y + crop_size))
-                        high_quality_img = cropped.resize((4096, 4096), Image.BICUBIC)
-                        high_quality_img.save(file_path, "JPEG", quality=90)
-                        UI.vprint(1, f"   [Quality Check] Successfully generated high-quality ZL{zoomlevel} crop for {file_name} from {parent_file_name}.")
-        except Exception as e:
-            UI.vprint(1, f"   [Quality Check] Failed to fallback: {e}")
     return 1
 
 

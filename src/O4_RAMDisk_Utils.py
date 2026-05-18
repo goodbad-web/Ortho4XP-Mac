@@ -134,7 +134,7 @@ def unmount_ram_disk(use_orthophotos=False):
     tmp_backup = tmp_path + "_backup"
     
     # 1. Clean up Orthophotos symlink and restore backup if requested
-    if use_orthophotos:
+    if use_orthophotos or os.path.islink(ortho_path) or os.path.exists(ortho_backup):
         try:
             if os.path.islink(ortho_path):
                 ram_ortho_path = os.path.realpath(ortho_path)
@@ -176,7 +176,7 @@ def unmount_ram_disk(use_orthophotos=False):
         UI.vprint(1, f"[RAMDisk] Detaching RAM disk from {ram_disk_path}...")
         try:
             subprocess.run(
-                ["hdiutil", "detach", ram_disk_path],
+                ["hdiutil", "detach", "-force", ram_disk_path],
                 capture_output=True,
                 text=True,
                 check=True

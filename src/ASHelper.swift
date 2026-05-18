@@ -131,9 +131,15 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     guard let mtlTexture = dev.makeTexture(descriptor: desc) else { return nil }
     
     // 2. Render preprocessed CIImage directly into the MTLTexture level 0 [100% Zero-Copy]
+    // [Y-Flip Fix] CIImage has bottom-left origin, while MTLTexture has top-left origin.
+    // We must vertically flip the image so it compiles right-side up in X-Plane.
+    let flippedCI = finalCI
+        .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
+        .transformed(by: CGAffineTransform(translationX: 0, y: bounds.height))
+    
     let ctx = CIContext(options: [.useSoftwareRenderer: false])
     let colorSpace = CGColorSpaceCreateDeviceRGB()
-    ctx.render(finalCI, to: mtlTexture, commandBuffer: nil, bounds: bounds, colorSpace: colorSpace)
+    ctx.render(flippedCI, to: mtlTexture, commandBuffer: nil, bounds: bounds, colorSpace: colorSpace)
     
     // 3. Generate lower mipmap levels directly inside VRAM using GPU Blit Encoder
     guard let cmb = q.makeCommandBuffer() else { return nil }
@@ -240,9 +246,25 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
         }
         
         if let mCI = maskCI {
+            // [Fix] Scale the mask to match the high-resolution source image (srcCI) extent,
+            // preventing CIBlendWithAlphaMask from downscaling finalCI to the mask's low resolution.
+            let scaleX = srcCI.extent.width / mCI.extent.width
+            let scaleY = srcCI.extent.height / mCI.extent.height
+            var resizedMask = mCI
+            if scaleX != 1.0 || scaleY != 1.0 {
+                let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
+                scaleFilter.setValue(mCI, forKey: kCIInputImageKey)
+                scaleFilter.setValue(scaleX, forKey: kCIInputScaleKey)
+                scaleFilter.setValue(scaleY / scaleX, forKey: "inputAspectRatio")
+                if let scaled = scaleFilter.outputImage {
+                    let originReset = scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.origin.x, y: -scaled.extent.origin.y))
+                    resizedMask = originReset.cropped(to: srcCI.extent)
+                }
+            }
+            
             let blendFilter = CIFilter(name: "CIBlendWithAlphaMask")!
             blendFilter.setValue(srcCI, forKey: kCIInputImageKey)
-            blendFilter.setValue(mCI, forKey: kCIInputMaskImageKey)
+            blendFilter.setValue(resizedMask, forKey: kCIInputMaskImageKey)
             if let blended = blendFilter.outputImage {
                 finalCI = blended
             }
