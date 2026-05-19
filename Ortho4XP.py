@@ -28,8 +28,17 @@ if __name__ == '__main__':
     if not os.path.isdir(FNAMES.Utils_dir):
         print("Missing ",FNAMES.Utils_dir,"directory, check your install. Exiting.")
         sys.exit()   
+    import signal
+    def sig_handler(signum, frame):
+        print(f"\n[Ortho4XP] Caught termination signal ({signum}). Exiting cleanly...")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
         
     import O4_RAMDisk_Utils
+    # 1. Recover any orphaned symbolic links from a previous crash/abrupt termination
+    O4_RAMDisk_Utils.recover_orphaned_symlinks()
+    
     use_ram_disk = getattr(CFG.UI, 'use_ram_disk', False)
     use_ram_disk_for_orthophotos = getattr(CFG.UI, 'use_ram_disk_for_orthophotos', False)
     if use_ram_disk:

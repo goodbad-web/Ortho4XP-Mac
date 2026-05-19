@@ -168,8 +168,6 @@ def unmount_ram_disk(use_orthophotos=False):
             pass # normal directory, no symlink to clean
     except Exception as e:
         UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
-    except Exception as e:
-        UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
         
     # 3. Unmount RAM disk
     if os.path.exists(ram_disk_path):
@@ -187,6 +185,92 @@ def unmount_ram_disk(use_orthophotos=False):
             UI.vprint(0, f"[RAMDisk] Error detaching RAM disk: {e}")
             return False
     return True
+
+def recover_orphaned_symlinks():
+    """
+    Check if we have orphaned symlinks left over from a previous crash/termination.
+    If so, restore SSD backups and force detach any orphaned mounted RAM Disk.
+    This guarantees a clean, SSD-backed workspace before any new execution.
+    """
+    if sys.platform != 'darwin':
+        return False
+        
+    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    tmp_path = os.path.abspath(FNAMES.Tmp_dir)
+    ortho_path = os.path.abspath(FNAMES.Imagery_dir)
+    ortho_backup = ortho_path + "_backup"
+    tmp_backup = tmp_path + "_backup"
+    recovered = False
+    
+    # 1. Recover Orthophotos if symlink exists OR backup exists
+    if os.path.islink(ortho_path) or os.path.exists(ortho_backup):
+        UI.vprint(1, "[RAMDisk] Orphaned Orthophotos symlink or backup detected! Restoring SSD cache...")
+        try:
+            if os.path.islink(ortho_path):
+                ram_ortho_path = os.path.realpath(ortho_path)
+                # If the symlink's target directory exists (e.g. RAM Disk is still mounted) and SSD backup exists, merge
+                if os.path.exists(ram_ortho_path) and os.path.exists(ortho_backup):
+                    merge_directories(ram_ortho_path, ortho_backup)
+                os.unlink(ortho_path)
+            
+            if os.path.exists(ortho_backup):
+                if os.path.exists(ortho_path):
+                    if os.path.isdir(ortho_path):
+                        # Merge if a regular folder got created somehow
+                        merge_directories(ortho_backup, ortho_path)
+                        shutil.rmtree(ortho_backup, ignore_errors=True)
+                    else:
+                        os.remove(ortho_path)
+                        os.rename(ortho_backup, ortho_path)
+                else:
+                    os.rename(ortho_backup, ortho_path)
+                UI.vprint(1, f"[RAMDisk] Successfully restored 'Orthophotos' from backup.")
+            else:
+                os.makedirs(ortho_path, exist_ok=True)
+            recovered = True
+        except Exception as e:
+            UI.vprint(0, f"[RAMDisk] Error recovering Orthophotos symlink: {e}")
+
+    # 2. Recover tmp if symlink exists OR backup exists
+    if os.path.islink(tmp_path) or os.path.exists(tmp_backup):
+        UI.vprint(1, "[RAMDisk] Orphaned tmp symlink or backup detected! Restoring SSD cache...")
+        try:
+            if os.path.islink(tmp_path):
+                os.unlink(tmp_path)
+            if os.path.exists(tmp_backup):
+                if os.path.exists(tmp_path):
+                    if os.path.isdir(tmp_path):
+                        merge_directories(tmp_backup, tmp_path)
+                        shutil.rmtree(tmp_backup, ignore_errors=True)
+                    else:
+                        os.remove(tmp_path)
+                        os.rename(tmp_backup, tmp_path)
+                else:
+                    os.rename(tmp_backup, tmp_path)
+                UI.vprint(1, f"[RAMDisk] Successfully restored 'tmp' from backup.")
+            else:
+                os.makedirs(tmp_path, exist_ok=True)
+            recovered = True
+        except Exception as e:
+            UI.vprint(0, f"[RAMDisk] Error recovering tmp symlink: {e}")
+
+    # 3. Clean up the mounted RAM disk to be perfectly sure
+    if os.path.exists(ram_disk_path):
+        UI.vprint(1, f"[RAMDisk] Orphaned RAM Disk mount detected. Detaching...")
+        try:
+            subprocess.run(
+                ["hdiutil", "detach", "-force", ram_disk_path],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            UI.vprint(1, "[RAMDisk] Orphaned RAM Disk detached successfully.")
+            recovered = True
+        except Exception as e:
+            # It's fine if detaching fails here as long as SSD paths are recovered
+            UI.vprint(2, f"[RAMDisk] Warning: Failed to force detach RAM Disk (might be unmounted): {e}")
+
+    return recovered
 
 def check_and_restore_cached_image(file_path):
     """

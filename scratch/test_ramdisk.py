@@ -140,6 +140,60 @@ def run_test():
     # Clean up the dummy cache and merged files to keep workspace clean
     os.remove(restored_cache_file)
     os.remove(restored_temp_file)
+
+    # 4. Test Recovery/Self-Healing from Abrupt Termination
+    print("\n--- 4. Testing Self-Healing Recovery (Simulation of Abrupt Termination) ---")
+    # Simulate a crash: mount the RAM disk, write to it, but DO NOT call unmount_ram_disk
+    mounted = O4_RAMDisk_Utils.mount_ram_disk(size_gb=2, use_orthophotos=True)
+    if not mounted:
+        print("ERROR: Recovery mount failed!")
+        return False
+        
+    # Write a new dummy image inside the RAM-linked Orthophotos to ensure it gets recovered
+    temp_recover_file = os.path.join(ortho_abs_path, "recover_me.txt")
+    with open(temp_recover_file, "w") as f:
+        f.write("Crash recovery data")
+        
+    # Verify we are in the symlink state
+    if not os.path.islink(tmp_abs_path) or not os.path.islink(ortho_abs_path):
+        print("ERROR: Setup did not create links for recovery simulation!")
+        return False
+        
+    print("Simulated crash state: Links exist and RAM Disk is active.")
+    
+    # Trigger our recovery logic!
+    print("Executing recover_orphaned_symlinks()...")
+    recovered = O4_RAMDisk_Utils.recover_orphaned_symlinks()
+    if not recovered:
+        print("ERROR: recover_orphaned_symlinks() reported no recovery done or failed!")
+        return False
+        
+    # Check that directories are fully restored to regular SSD folders
+    if os.path.islink(tmp_abs_path) or os.path.islink(ortho_abs_path):
+        print("ERROR: Symbolic links were not removed during recovery!")
+        return False
+        
+    ortho_backup_path = ortho_abs_path + "_backup"
+    if os.path.exists(ortho_backup_path):
+        print("ERROR: Orthophotos backup folder still remains after recovery!")
+        return False
+        
+    # Verify the RAM-written recovery file was safely merged to the SSD Orthophotos folder
+    ssd_recovered_file = os.path.join(ortho_abs_path, "recover_me.txt")
+    if not os.path.exists(ssd_recovered_file):
+        print("ERROR: RAM-written recovery file was lost during self-healing!")
+        return False
+        
+    with open(ssd_recovered_file, "r") as f:
+        content = f.read()
+    if content != "Crash recovery data":
+        print(f"ERROR: Recovered file content mismatch: {content}")
+        return False
+        
+    # Clean up recovery test files
+    os.remove(ssd_recovered_file)
+    print("Recovery / Self-Healing verified successfully.")
+    
     print("\n=== ALL TESTS PASSED SUCCESSFULLY! ===")
     return True
 
