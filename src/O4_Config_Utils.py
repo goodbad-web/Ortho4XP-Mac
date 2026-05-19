@@ -103,14 +103,14 @@ a particular server.",
         "type": str,
         "default": "nvcompress",
         "values": ("nvcompress", "TextureConverter", "magick"),
-        "hint": "The tool used to convert orthophotos to DDS. nvcompress is standard, TextureConverter is for Apple Silicon Metal acceleration, and magick is a fallback.",
+        "hint": "The tool used to convert orthophotos to DDS. nvcompress is standard and is the only tool that supports BC7 here; TextureConverter is for Apple Silicon Metal acceleration, and magick is a fallback.",
     },
     "dds_format": {
         "module": "UI",
         "type": str,
         "default": "BC3",
         "values": ("BC1", "BC3", "BC7"),
-        "hint": "The texture compression format. BC3 (DXT5) is standard with alpha, BC1 (DXT1) has no alpha, and BC7 is modern high-quality format supported by XP12.",
+        "hint": "The texture compression format. BC3 (DXT5) is standard with alpha, BC1 (DXT1) has no alpha, and BC7 is only supported when the DDS converter is nvcompress.",
     },
     "use_gpu_acceleration": {
         "module": "UI",
@@ -564,7 +564,7 @@ try:
         if line[0] == "#":
             continue
         try:
-            (var, value) = line.split("=")
+            (var, value) = line.split("=", 1)
             var = var.strip()
             value = value.strip()
             # compatibility with config files from version <= 1.20
@@ -677,7 +677,7 @@ class Tile:
                 if line[0] == "#":
                     continue
                 try:
-                    (var, value) = line.split("=")
+                    (var, value) = line.split("=", 1)
                     # compatibility with config files from version <= 1.20
                     if value and value[0] in ('"', "'"):
                         value = value[1:]
@@ -1170,7 +1170,7 @@ class Ortho4XP_Config(tk.Toplevel):
             if line[0] == "#":
                 continue
             try:
-                (var, value) = line.split("=")
+                (var, value) = line.split("=", 1)
                 # compatibility with config files from version <= 1.20
                 if value and value[0] in ('"', "'"):
                     value = value[1:]
@@ -1229,7 +1229,7 @@ class Ortho4XP_Config(tk.Toplevel):
             if line[0] == "#":
                 continue
             try:
-                (var, value) = line.split("=")
+                (var, value) = line.split("=", 1)
                 # compatibility with config files from version <= 1.20
                 if value and value[0] in ('"', "'"):
                     value = value[1:]
@@ -1320,6 +1320,18 @@ class Ortho4XP_Config(tk.Toplevel):
             )
             self.popup("ERROR", error_text)
             restart_needed = False
+
+        dds_error = IMG.dds_format_support_error(
+            getattr(UI, "dds_converter", cfg_vars["dds_converter"]["default"]),
+            getattr(UI, "dds_format", cfg_vars["dds_format"]["default"]),
+        )
+        if dds_error:
+            self.popup(
+                "ERROR",
+                dds_error + "\nDDS format has been reset to BC3.",
+            )
+            setattr(UI, "dds_format", "BC3")
+            self.v_["dds_format"].set("BC3")
 
         if restart_needed:
             msg = "The following settings have been changed and require a restart to take effect:\n\n"

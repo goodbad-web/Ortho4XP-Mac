@@ -910,6 +910,10 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         self.canvas.grid(row=0, column=0, sticky=N + S + E + W)
 
     def preview_tile(self, lat, lon):
+        self._tile_preview_request_id = getattr(
+            self, "_tile_preview_request_id", 0
+        ) + 1
+        request_id = self._tile_preview_request_id
         self.zoomlevel = int(self.zl_combo.get())
         zoomlevel = self.zoomlevel
         provider_code = self.map_combo.get()
@@ -934,16 +938,35 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
                 target=IMG.create_tile_preview, args=fargs_ctp
             )
             self.ctp_thread.start()
-            fargs_dispp = [filepreview, lat, lon]
-            dispp_thread = threading.Thread(
-                target=self.show_tile_preview, args=fargs_dispp
+            self.after(
+                50,
+                lambda: self._wait_for_tile_preview(
+                    request_id, filepreview, lat, lon
+                ),
             )
-            dispp_thread.start()
         else:
-            self.show_tile_preview(filepreview, lat, lon)
+            self.show_tile_preview(request_id, filepreview, lat, lon)
         return
 
-    def show_tile_preview(self, filepreview, lat, lon):
+    def _wait_for_tile_preview(self, request_id, filepreview, lat, lon):
+        if request_id != getattr(self, "_tile_preview_request_id", 0):
+            return
+        try:
+            if self.ctp_thread.is_alive():
+                self.after(
+                    50,
+                    lambda: self._wait_for_tile_preview(
+                        request_id, filepreview, lat, lon
+                    ),
+                )
+                return
+        except:
+            pass
+        self.show_tile_preview(request_id, filepreview, lat, lon)
+
+    def show_tile_preview(self, request_id, filepreview, lat, lon):
+        if request_id != getattr(self, "_tile_preview_request_id", 0):
+            return
         for item in self.polyobj_list:
             try:
                 self.canvas.delete(item)
@@ -1543,9 +1566,22 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         return
 
     def threaded_preview(self):
-        threading.Thread(target=self.preview_existing_tiles).start()
+        self._preview_request_id = getattr(self, "_preview_request_id", 0) + 1
+        request_id = self._preview_request_id
+        self._preview_result = None
+        tiles_todo = list(self.dico_tiles_todo.keys())
+        working_dir = self.working_dir
+        grouped = self.grouped
+        self._preview_thread = threading.Thread(
+            target=self.preview_existing_tiles,
+            args=(request_id, working_dir, grouped, tiles_todo),
+        )
+        self._preview_thread.start()
+        self.after(50, lambda: self._poll_preview_existing_tiles(request_id))
 
-    def preview_existing_tiles(self):
+    def preview_existing_tiles(
+        self, request_id, working_dir, grouped, tiles_todo
+    ):
         dico_color = {
             11: "blue",
             12: "blue",
@@ -1557,13 +1593,12 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             18: "orange",
             19: "red",
         }
-        if self.dico_tiles_done:
-            for tile in self.dico_tiles_done:
-                for objid in self.dico_tiles_done[tile][:2]:
-                    self.canvas.delete(objid)
-            self.dico_tiles_done = {}
-        if not self.grouped:
-            for dir_name in os.listdir(self.working_dir):
+        tiles_done = {}
+        if not os.path.isdir(working_dir):
+            self._preview_result = (request_id, tiles_done, tiles_todo)
+            return
+        if not grouped:
+            for dir_name in os.listdir(working_dir):
                 if "XP_" in dir_name:
                     try:
                         lat = int(dir_name.split("XP_")[1][:3])
@@ -1573,13 +1608,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                     # With the enlarged accepetance rule for directory name 
                     # there might be more than one tile for the same (lat,lon),
                     # we skip all but the first encountered.
-                    if (lat, lon) in self.dico_tiles_done:
+                    if (lat, lon) in tiles_done:
                         continue
-                    [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
-                    [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
                     if os.path.isfile(
                         os.path.join(
-                            self.working_dir,
+                            working_dir,
                             dir_name,
                             "Earth nav data",
                             FNAMES.long_latlon(lat, lon) + ".dsf",
@@ -1590,7 +1623,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         try:
                             tmpf = open(
                                 os.path.join(
-                                    self.working_dir,
+                                    working_dir,
                                     dir_name,
                                     "Ortho4XP_"
                                     + FNAMES.short_latlon(lat, lon)
@@ -1603,7 +1636,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                             try:
                                 tmpf = open(
                                     os.path.join(
-                                        self.working_dir,
+                                        working_dir,
                                         dir_name,
                                         "Ortho4XP.cfg",
                                     ),
@@ -1630,24 +1663,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                             content = prov + "\n" + str(zl)
                         else:
                             content = "?"
-                        self.dico_tiles_done[(lat, lon)] = (
-                            self.canvas.create_rectangle(
-                                x0, y0, x1, y1, fill=color, stipple="gray12"
-                            )
-                            if not OsX
-                            else self.canvas.create_rectangle(
-                                x0, y0, x1, y1, outline="black"
-                            ),
-                            self.canvas.create_text(
-                                (x0 + x1) // 2,
-                                (y0 + y1) // 2,
-                                justify=CENTER,
-                                text=content,
-                                fill="black",
-                                font=("Helvetica", "12", "normal"),
-                            ),
-                            dir_name,
-                        )
+                        linked = False
                         link = os.path.join(
                             CFG.custom_scenery_dir,
                             "zOrtho4XP_" + FNAMES.short_latlon(lat, lon),
@@ -1655,46 +1671,30 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         if os.path.isdir(link):
                             if os.path.samefile(
                                 os.path.realpath(link),
-                                os.path.realpath(
-                                    os.path.join(self.working_dir, dir_name)
-                                ),
+                                os.path.realpath(os.path.join(working_dir, dir_name)),
                             ):
-                                if not OsX:
-                                    self.canvas.itemconfig(
-                                        self.dico_tiles_done[(lat, lon)][0],
-                                        stipple="gray50",
-                                    )
-                                else:
-                                    self.canvas.itemconfig(
-                                        self.dico_tiles_done[(lat, lon)][1],
-                                        font=(
-                                            "Helvetica",
-                                            "12",
-                                            "bold underline",
-                                        ),
-                                    )
-        elif self.grouped and os.path.isdir(
-            os.path.join(self.working_dir, "Earth nav data")
+                                linked = True
+                        tiles_done[(lat, lon)] = (color, content, dir_name, linked)
+        elif grouped and os.path.isdir(
+            os.path.join(working_dir, "Earth nav data")
         ):
-            for dir_name in os.listdir(
-                os.path.join(self.working_dir, "Earth nav data")
-            ):
+            for dir_name in os.listdir(os.path.join(working_dir, "Earth nav data")):
                 for file_name in os.listdir(
-                    os.path.join(self.working_dir, "Earth nav data", dir_name)
+                    os.path.join(working_dir, "Earth nav data", dir_name)
                 ):
                     try:
                         lat = int(file_name[0:3])
                         lon = int(file_name[3:7])
                     except:
                         continue
-                    [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
-                    [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
+                    if (lat, lon) in tiles_done:
+                        continue
                     color = "blue"
                     content = ""
                     try:
                         tmpf = open(
                             os.path.join(
-                                self.working_dir,
+                                working_dir,
                                 "Ortho4XP_"
                                 + FNAMES.short_latlon(lat, lon)
                                 + ".cfg",
@@ -1722,47 +1722,79 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         content = prov + "\n" + str(zl)
                     else:
                         content = "?"
-                    self.dico_tiles_done[(lat, lon)] = (
-                        self.canvas.create_rectangle(
-                            x0, y0, x1, y1, fill=color, stipple="gray12"
-                        )
-                        if not OsX
-                        else self.canvas.create_rectangle(
-                            x0, y0, x1, y1, outline="black"
-                        ),
-                        self.canvas.create_text(
-                            (x0 + x1) // 2,
-                            (y0 + y1) // 2,
-                            justify=CENTER,
-                            text=content,
-                            fill="black",
-                            font=("Helvetica", "12", "normal"),
-                        ),
-                        dir_name,
+                    linked = False
+                    link = os.path.join(
+                        CFG.custom_scenery_dir,
+                        "zOrtho4XP_" + os.path.basename(working_dir),
                     )
-            link = os.path.join(
-                CFG.custom_scenery_dir,
-                "zOrtho4XP_" + os.path.basename(self.working_dir),
-            )
-            if os.path.isdir(link):
-                if os.path.samefile(
-                    os.path.realpath(link), os.path.realpath(self.working_dir)
-                ):
-                    for (lat0, lon0) in self.dico_tiles_done:
-                        if "dar" not in sys.platform:
-                            self.canvas.itemconfig(
-                                self.dico_tiles_done[(lat, lon)][0],
-                                stipple="gray50",
-                            )
-                        else:
-                            self.canvas.itemconfig(
-                                self.dico_tiles_done[(lat, lon)][1],
-                                font=("Helvetica", "12", "bold underline"),
-                            )
-        for (lat, lon) in self.dico_tiles_todo:
+                    if os.path.isdir(link) and os.path.samefile(
+                        os.path.realpath(link), os.path.realpath(working_dir)
+                    ):
+                        linked = True
+                    tiles_done[(lat, lon)] = (color, content, dir_name, linked)
+        self._preview_result = (request_id, tiles_done, tiles_todo)
+        return
+
+    def _poll_preview_existing_tiles(self, request_id):
+        if request_id != getattr(self, "_preview_request_id", 0):
+            return
+        try:
+            if self._preview_thread.is_alive():
+                self.after(
+                    50, lambda: self._poll_preview_existing_tiles(request_id)
+                )
+                return
+        except:
+            return
+        if self._preview_result is None:
+            return
+        result_request_id, tiles_done, tiles_todo = self._preview_result
+        if result_request_id != request_id:
+            return
+        self._preview_result = None
+        self.apply_preview_existing_tiles(tiles_done, tiles_todo)
+
+    def apply_preview_existing_tiles(self, tiles_done, tiles_todo):
+        if self.dico_tiles_done:
+            for tile in self.dico_tiles_done:
+                for objid in self.dico_tiles_done[tile][:2]:
+                    self.canvas.delete(objid)
+        self.dico_tiles_done = {}
+        for (lat, lon), item in tiles_done.items():
+            color, content, dir_name, link = item
             [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
             [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
-            self.canvas.delete(self.dico_tiles_todo[(lat, lon)])
+            rect = (
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=color, stipple="gray12"
+                )
+                if not OsX
+                else self.canvas.create_rectangle(
+                    x0, y0, x1, y1, outline="black"
+                )
+            )
+            text = self.canvas.create_text(
+                (x0 + x1) // 2,
+                (y0 + y1) // 2,
+                justify=CENTER,
+                text=content,
+                fill="black",
+                font=("Helvetica", "12", "normal"),
+            )
+            self.dico_tiles_done[(lat, lon)] = (rect, text, dir_name)
+            if link:
+                if not OsX:
+                    self.canvas.itemconfig(rect, stipple="gray50")
+                else:
+                    self.canvas.itemconfig(
+                        text, font=("Helvetica", "12", "bold underline")
+                    )
+        for (lat, lon) in tiles_todo:
+            [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
+            [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
+            objid = self.dico_tiles_todo.get((lat, lon))
+            if objid:
+                self.canvas.delete(objid)
             self.dico_tiles_todo[(lat, lon)] = (
                 self.canvas.create_rectangle(
                     x0, y0, x1, y1, fill="red", stipple="gray12"
@@ -1891,12 +1923,12 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 for (lat0, lon0) in self.dico_tiles_done:
                     if not OsX:
                         self.canvas.itemconfig(
-                            self.dico_tiles_done[(lat, lon)][0],
+                            self.dico_tiles_done[(lat0, lon0)][0],
                             stipple="gray12",
                         )
                     else:
                         self.canvas.itemconfig(
-                            self.dico_tiles_done[(lat, lon)][1],
+                            self.dico_tiles_done[(lat0, lon0)][1],
                             font=("Helvetica", "12", "normal"),
                         )
                 return
@@ -1929,7 +1961,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                     )
                 else:
                     self.canvas.itemconfig(
-                        self.dico_tiles_done[(lat, lon)][1],
+                        self.dico_tiles_done[(lat0, lon0)][1],
                         font=("Helvetica", "12", "bold underline"),
                     )
         return

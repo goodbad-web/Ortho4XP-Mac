@@ -244,16 +244,18 @@ def post_process_nodes_altitudes(tile):
     UI.vprint(1, "-> Post processing of altitudes according to vector data")
     f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_tri = int(f_ele.readline().split()[0])
+    tri_rows = []
     water_tris = set()
     sea_tris = set()
     interp_alt_tris = set()
     for i in range(nbr_tri):
         line = f_ele.readline()
         if not line: break
+        parts = line.split()
+        tri_rows.append(" ".join(parts[1:]))
         # triangle attributes are powers of 2, except for the dummy attributed
         if line[-2] == "0":
             continue
-        parts = line.split()
         if len(parts) < 5: continue
         (v1, v2, v3, attr) = [int(x) - 1 for x in parts[1:5]]
         attr += 1
@@ -317,17 +319,16 @@ def post_process_nodes_altitudes(tile):
         indices = numpy.arange(1, len(v_matrix) + 1).reshape((-1, 1))
         out_data = numpy.hstack([indices, v_matrix])
         numpy.savetxt(f_node, out_data, fmt='%d %.15f %.15f %.15f %.15f %.15f %.15f')
-    return vertices
+    return vertices, tri_rows
 
 
 ################################################################################
-def write_mesh_file(tile, vertices):
+def write_mesh_file(tile, vertices, tri_rows=None):
     UI.vprint(
         1,
         "-> Writing final mesh to the file "
         + FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon),
     )
-    f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_vert = len(vertices) // 6
     if nbr_vert > 900000:
         UI.vprint(
@@ -338,7 +339,16 @@ def write_mesh_file(tile, vertices):
             0,
             "         The final DSF node count might exceed the 1,000,000 Metal absolute limit and crash X-Plane 12.\n"
         )
-    nbr_tri = int(f_ele.readline().split()[0])
+    if tri_rows is None:
+        f_ele = open(FNAMES.output_ele_file(tile), "r")
+        nbr_tri = int(f_ele.readline().split()[0])
+        tri_rows = []
+        for _ in range(nbr_tri):
+            line = f_ele.readline()
+            tri_rows.append(" ".join(line.split()[1:]))
+        f_ele.close()
+    else:
+        nbr_tri = len(tri_rows)
     f = open(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon), "w")
     f.write("MeshVersionFormatted 2\n")
     f.write("Dimension 3\n\n")
@@ -366,9 +376,8 @@ def write_mesh_file(tile, vertices):
     f.write("\n")
     f.write("Triangles\n")
     f.write(str(nbr_tri) + "\n")
-    for i in range(0, nbr_tri):
-        f.write(" ".join(f_ele.readline().split()[1:]) + "\n")
-    f_ele.close()
+    for row in tri_rows:
+        f.write(row + "\n")
     f.close()
     return
 
@@ -592,9 +601,7 @@ def _build_mesh(tile):
             return 0
         try:
             fill_nodata = tile.fill_nodata or "to zero"
-            source = (
-                (";" in tile.custom_dem) and tile.custom_dem.split(";")[0]
-            ) or tile.custom_dem
+            source = tile.custom_dem.split(";", 1)[0] if tile.custom_dem else ""
             tile.dem = DEM.DEM(
                 tile.lat, tile.lon, source, fill_nodata, info_only=True
             )
@@ -617,10 +624,14 @@ def _build_mesh(tile):
             return 0
     else:
         try:
-            source = (
-                (";" in tile.custom_dem)
-                and tile.custom_dem.split(";")[tile.iterate]
-            ) or tile.custom_dem
+            sources = tile.custom_dem.split(";") if tile.custom_dem else [""]
+            if len(sources) > 1 and tile.iterate >= len(sources):
+                UI.exit_message_and_bottom_line(
+                    "\nERROR: custom_dem has fewer sources than iterate index.",
+                    " Please check your custom_dem entry.",
+                )
+                return 0
+            source = sources[tile.iterate] if len(sources) > 1 else sources[0]
             tile.dem = DEM.DEM(
                 tile.lat, tile.lon, source, fill_nodata=False, info_only=True
             )
@@ -758,7 +769,7 @@ def _build_mesh(tile):
         UI.exit_message_and_bottom_line()
         return 0
 
-    vertices = post_process_nodes_altitudes(tile)
+    vertices, tri_rows = post_process_nodes_altitudes(tile)
 
     if UI.red_flag:
         UI.exit_message_and_bottom_line()
@@ -782,7 +793,7 @@ def _build_mesh(tile):
         UI.is_working = 0  # Re-enable execution for the retry
         return _build_mesh(tile)
 
-    write_mesh_file(tile, vertices)
+    write_mesh_file(tile, vertices, tri_rows)
     #
     if UI.cleaning_level:
         try:
@@ -977,4 +988,3 @@ def read_mesh_file(mesh_file):
 
     return (mesh_version, nbr_nodes, node_coords, nbr_tris, tri_idx, tri_types)
 ##############################################################################
-

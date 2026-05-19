@@ -513,10 +513,10 @@ def build_dsf(tile, download_queue):
 
     # 2 Remap tri_types in (0,1,2)
     has_water = 7 if (mesh_version >= 1.3) else 3
-    for i in range(nbr_tris):
-        t = tri_types[i] & has_water
-        t = t and (2 * (t > 1 or tile.use_masks_for_inland) or 1)
-        tri_types[i] = t
+    tri_types &= has_water
+    tri_types[tri_types > 1] = 2
+    if tile.use_masks_for_inland:
+        tri_types[tri_types == 1] = 2
 
     # 3 Recut water tris for XP12
     UI.vprint(1, "-> Adapting water triangles to XP12 requirements")
@@ -732,8 +732,8 @@ def build_dsf(tile, download_queue):
     
     # Tri counter for progress_bars
     done = 0
-    
 
+    
     # First potentially masked water tris
     for tri in range(nbr_tris):
         tri_type = tri_types[tri]
@@ -799,40 +799,44 @@ def build_dsf(tile, download_queue):
                 # do we need to (re)build a texture ?
                 if texture_attributes not in treated_textures:
                     target_tex = os.path.join(
-                            _build_dir, "textures", texture_file_name
-                            )
-                    rebuild = False
-                    if (not os.path.isfile(target_tex)):
-                        rebuild = True
-                    elif (_imprint_masks_to_dds):
-                        # Maybe target_tex was a DXT1, we need DXT5
-                        if (os.path.getsize(target_tex) < 20000000):
-                            rebuild = True
-                        # Maybe masks were updated after target_tex was created
-                        target_mask = _mask_name_for_texture(tile, 
-                                          *texture_attributes)
-                        if (os.path.isfile(target_mask)):
-                            mask_last_modified = os.path.getmtime(target_mask)
-                            tex_last_modified = os.path.getmtime(target_tex)
-                            if (tex_last_modified < mask_last_modified):
-                                rebuild = True
-                    else: 
-                        # maybe target_tex was a DXT5, it should ne a DXT1
-                        if (os.path.getsize(target_tex) > 20000000):
-                            rebuild = True
-                        else:
-                            print(os.path.getsize(target_tex))
-                    
-                    if (rebuild or not _imprint_masks_to_dds):
-                        mask_im.save(os.path.join(
-                            _build_dir,
-                            "textures",
-                            _mask_file(*texture_attributes),
-                        )
+                        _build_dir, "textures", texture_file_name
                     )
+                    rebuild = False
+                    if not os.path.isfile(target_tex):
+                        rebuild = True
+                    else:
+                        target_tex_size = os.path.getsize(target_tex)
+                        if _imprint_masks_to_dds:
+                            # Maybe target_tex was a DXT1, we need DXT5
+                            if target_tex_size < 20000000:
+                                rebuild = True
+                            # Maybe masks were updated after target_tex was created
+                            target_mask = _mask_name_for_texture(
+                                tile, *texture_attributes
+                            )
+                            if os.path.isfile(target_mask):
+                                mask_last_modified = os.path.getmtime(target_mask)
+                                tex_last_modified = os.path.getmtime(target_tex)
+                                if tex_last_modified < mask_last_modified:
+                                    rebuild = True
+                        else:
+                            # maybe target_tex was a DXT5, it should ne a DXT1
+                            if target_tex_size > 20000000:
+                                rebuild = True
+                            else:
+                                print(target_tex_size)
 
-                    if (rebuild):
-                            download_queue.put(texture_attributes)
+                    if rebuild or not _imprint_masks_to_dds:
+                        mask_im.save(
+                            os.path.join(
+                                _build_dir,
+                                "textures",
+                                _mask_file(*texture_attributes),
+                            )
+                        )
+
+                    if rebuild:
+                        download_queue.put(texture_attributes)
                     else:
                         _vprint(
                             2,
@@ -1265,6 +1269,7 @@ def build_dsf(tile, download_queue):
         if dsf_pool_length[k] != 0:
             dico_new_dsf_pool[k] = new_idx_dsfpool
             new_idx_dsfpool += 1
+    pool_lookup = dico_new_dsf_pool.__getitem__
 
     # Commands atom
     # we first compute its size :
@@ -1334,27 +1339,24 @@ def build_dsf(tile, download_queue):
 
                 blocks = len(textured_tris[terrain_idx][idx_dsfpool]) // 510
                 data_array = textured_tris[terrain_idx][idx_dsfpool]
-                # Prepare remapped pool/pos indices if necessary, but here we need to remap pool idx
-                # This part is complex due to dico_new_dsf_pool remapping. 
-                # If remapping is simple or already done, we can vectorize.
-                # Since dico_new_dsf_pool is used, we still need a loop, but we can minimize pack calls.
                 for j in range(blocks):
                     f.write(struct.pack("<BB", 24, 255))  # PATCH TRIANGLE CROSS-POOL + COUNT
                     chunk = data_array[510 * j : 510 * (j + 1)]
-                    # Remap pool indices (even positions)
-                    # We can't easily vectorize the dico lookup without a loop, 
-                    # but we can pack the whole chunk at once.
-                    remapped = array.array('H', chunk)
-                    for k in range(255):
-                        remapped[2*k] = dico_new_dsf_pool[chunk[2*k]]
+                    remapped = array.array("H", chunk)
+                    remapped[0::2] = array.array(
+                        "H",
+                        (pool_lookup(pool_idx) for pool_idx in chunk[0::2]),
+                    )
                     f.write(remapped.tobytes())
                 remaining_tri_p = (len(data_array) % 510) // 2
                 if remaining_tri_p != 0:
                     f.write(struct.pack("<BB", 24, remaining_tri_p))  # PATCH TRIANGLE CROSS-POOL + COUNT
                     chunk = data_array[510 * blocks : ]
-                    remapped = array.array('H', chunk)
-                    for k in range(remaining_tri_p):
-                        remapped[2*k] = dico_new_dsf_pool[chunk[2*k]]
+                    remapped = array.array("H", chunk)
+                    remapped[0::2] = array.array(
+                        "H",
+                        (pool_lookup(pool_idx) for pool_idx in chunk[0::2]),
+                    )
                     f.write(remapped.tobytes())
 
     # DEMS atom

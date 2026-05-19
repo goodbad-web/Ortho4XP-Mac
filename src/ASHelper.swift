@@ -22,6 +22,13 @@ struct DDSHeaderDX10 {
     func toData() -> Data { var d = Data(); var t = self; withUnsafeBytes(of: &t) { d.append(contentsOf: $0) }; return d }
 }
 
+func fail(_ message: String) -> Never {
+    if let data = (message + "\n").data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+    exit(1)
+}
+
 let metalSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -224,6 +231,9 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
 }
 
 func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Double, b: Double, contrast: Double, brightness: Double, saturation: Double, outputPath: String, format: String, useGPU: Bool) {
+    guard format != "BC7" else {
+        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
+    }
     let jpegURL = URL(fileURLWithPath: jpegPath)
     guard let srcCI = CIImage(contentsOf: jpegURL) else { exit(1) }
     var finalCI = srcCI
@@ -387,6 +397,9 @@ func upscale(inputPath: String, outputPath: String) {
 }
 
 func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) {
+    guard format != "BC7" else {
+        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
+    }
     let url = URL(fileURLWithPath: inputPath); guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { exit(1) }
     let w = img.width; let h = img.height; let isBC7 = (format == "BC7"); let isBC3 = (format == "BC3")
     let formatCode: UInt32 = isBC7 ? 2 : (isBC3 ? 1 : 0)
@@ -458,6 +471,9 @@ else if args[1] == "--convert" { convert(inputPath: args[2], outputPath: args[3]
 else if args[1] == "--convert-batch" {
     guard args.count >= 6 else { exit(1) }
     let format = args[2]
+    guard format != "BC7" else {
+        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
+    }
     let useGPU = args[3] == "true"
     var idx = 4
     while idx + 1 < args.count {
@@ -507,6 +523,10 @@ else if args[1] == "--convert-batch-v3" {
             format: args[idx+9]
         ))
         idx += 10
+    }
+    
+    if tasks.contains(where: { $0.format == "BC7" }) {
+        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
     }
     
     DispatchQueue.concurrentPerform(iterations: tasks.count) { i in

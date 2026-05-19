@@ -115,7 +115,7 @@ def _build_masks(tile, for_imagery=False):
     if not os.path.exists(dest_dir):
         os.makedirs(dest_dir)
     
-    # Select nearby meshes
+    # Select nearby meshes once and reuse them in the mesh scan and mask build
     mesh_list = select_neighbor_meshes(tile)
 
     # Delete old masks
@@ -124,16 +124,21 @@ def _build_masks(tile, for_imagery=False):
     
     # Record water tris form mesh (and portions of nearby meshes)
     UI.vprint(1, "-> Reading mesh data")
-    (dico_sea, dico_inland) = record_water_tris(tile, )
+    (dico_sea, dico_inland) = record_water_tris(tile, mesh_list)
 
     UI.vprint(1, "-> Construction of the masks")
+
+    (til_x_min, til_y_min) = GEO.wgs84_to_orthogrid(
+        tile.lat + 1, tile.lon, tile.mask_zl
+    )
+    (til_x_max, til_y_max) = GEO.wgs84_to_orthogrid(
+        tile.lat, tile.lon + 1, tile.mask_zl
+    )
 
     if tile.masks_use_DEM_too:
         try:
             fill_nodata = tile.fill_nodata or "to zero"
-            source = (
-                (";" in tile.custom_dem) and tile.custom_dem.split(";")[0]
-            ) or tile.custom_dem
+            source = tile.custom_dem
             tile.dem = DEM.DEM(
                 tile.lat, tile.lon, source, fill_nodata, info_only=False
             )
@@ -146,11 +151,6 @@ def _build_masks(tile, for_imagery=False):
 
     #################################
     def build_mask(til_x, til_y):
-
-        (til_x_min, til_y_min) = GEO.wgs84_to_orthogrid(
-            tile.lat + 1, tile.lon, tile.mask_zl)
-        (til_x_max, til_y_max) = GEO.wgs84_to_orthogrid(
-            tile.lat, tile.lon + 1, tile.mask_zl)
         if (til_x < til_x_min or til_x > til_x_max or til_y < til_y_min or 
             til_y > til_y_max):
             return 1
@@ -393,24 +393,9 @@ def build_custom_pre_mask(til_x, til_y, sea_level, tile):
 ################################################################################
 
 ################################################################################
-def record_water_tris(tile):
-    mesh_list = []
-    for close_lat in range(tile.lat - 1, tile.lat + 2):
-        for close_lon in range(tile.lon - 1, tile.lon + 2):
-            close_build_dir = (
-                tile.build_dir
-                if tile.grouped
-                else tile.build_dir.replace(
-                    FNAMES.tile_dir(tile.lat, tile.lon),
-                    FNAMES.tile_dir(close_lat, close_lon),
-                )
-            )
-            close_mesh_file_name = FNAMES.mesh_file(
-                close_build_dir, close_lat, close_lon
-            )
-            if os.path.isfile(close_mesh_file_name):
-                mesh_list.append(close_mesh_file_name)
-    ####################
+def record_water_tris(tile, mesh_list=None):
+    if mesh_list is None:
+        mesh_list = select_neighbor_meshes(tile)
     dico_sea = {}
     dico_inland = {}
     ####################
@@ -420,93 +405,94 @@ def record_water_tris(tile):
     [til_x_max, til_y_max] = GEO.wgs84_to_orthogrid(
         tile.lat, tile.lon + 1, tile.mask_zl
     )
-    UI.vprint(1, "-> Deleting existing masks")
-    for til_x in range(til_x_min, til_x_max + 1, 16):
-        for til_y in range(til_y_min, til_y_max + 1, 16):
-            try:
-                os.remove(
-                    os.path.join(dest_dir, FNAMES.legacy_mask(til_x, til_y))
-                )
-            except:
-                pass
     for mesh_file_name in mesh_list:
         try:
             UI.vprint(1, "   * ", mesh_file_name)
             with open(mesh_file_name, "r") as f:
-                lines = f.readlines()
-            
-            mesh_version = float(lines[0].strip().split()[-1])
-            has_water = 7 if mesh_version >= 1.3 else 3
-            
-            # Find Vertices
-            ptr = 0
-            while ptr < len(lines) and "Vertices" not in lines[ptr]:
-                ptr += 1
-            ptr += 1
-            nbr_pt_in = int(float(lines[ptr].split()[0]))
-            ptr += 1
-            # Skip ID column (index 0) if it exists, or handle coordinates
-            # MeshVersionFormatted 2 doesn't have IDs in vertices, just x y z 0
-            pt_in = numpy.array([l.split()[:3] for l in lines[ptr:ptr+nbr_pt_in]], dtype=float)
-            ptr += nbr_pt_in
-            
-            # Find Triangles
-            while ptr < len(lines) and "Triangles" not in lines[ptr]:
-                ptr += 1
-            ptr += 1
-            nbr_tri_in = int(float(lines[ptr].split()[0]))
-            ptr += 1
-            tri_data = numpy.array([l.split()[:4] for l in lines[ptr:ptr+nbr_tri_in]], dtype=float).astype(int)
-            # tri_data: v1 v2 v3 attr
-            
-            # Vectorized water triangle detection
-            # tri_data: v1, v2, v3, attr
-            # attributes are at index 3, add 1 to match original logic
-            attrs = tri_data[:, 3] + 1
-            mask_tris = (attrs & has_water) > 0
-            if not tile.use_masks_for_inland:
-                mask_tris &= (attrs & has_water) >= 2
-            
-            water_indices = numpy.where(mask_tris)[0]
-            for i in water_indices:
-                # v1, v2, v3 are at indices 0, 1, 2. They are 1-based, so subtract 1.
-                n1, n2, n3 = tri_data[i, 0:3] - 1
-                lon1, lat1 = pt_in[n1, 0:2] 
-                lon2, lat2 = pt_in[n2, 0:2]
-                lon3, lat3 = pt_in[n3, 0:2]
-                bary_lat = (lat1 + lat2 + lat3) / 3
-                bary_lon = (lon1 + lon2 + lon3) / 3
-                (til_x, til_y) = GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mask_zl)
-                if (til_x < til_x_min - 16 or til_x > til_x_max + 16 or 
-                    til_y < til_y_min - 16 or til_y > til_y_max + 16):
-                    continue
-                
-                (til_x2, til_y2) = GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mask_zl + 2)
-                a = (til_x2 // 16) % 4
-                b = (til_y2 // 16) % 4
-                
-                target_dico = dico_sea if (attrs[i] & has_water) >= 2 or tile.use_masks_for_inland else dico_inland
-                
-                # Helper to add triangle to dico
-                def add_to_dico(tx, ty):
-                    if (tx, ty) in target_dico:
-                        target_dico[(tx, ty)].append((lat1, lon1, lat2, lon2, lat3, lon3))
-                    elif tx == til_x and ty == til_y:
-                        target_dico[(tx, ty)] = [(lat1, lon1, lat2, lon2, lat3, lon3)]
-    
-                add_to_dico(til_x, til_y)
-                if a == 0:
-                    add_to_dico(til_x - 16, til_y)
-                    if b == 0: add_to_dico(til_x - 16, til_y - 16)
-                    elif b == 3: add_to_dico(til_x - 16, til_y + 16)
-                elif a == 3:
-                    add_to_dico(til_x + 16, til_y)
-                    if b == 0: add_to_dico(til_x + 16, til_y - 16)
-                    elif b == 3: add_to_dico(til_x + 16, til_y + 16)
-                if b == 0:
-                    add_to_dico(til_x, til_y - 16)
-                elif b == 3:
-                    add_to_dico(til_x, til_y + 16)
+                mesh_version = float(f.readline().strip().split()[-1])
+                has_water = 7 if mesh_version >= 1.3 else 3
+
+                line = f.readline()
+                while line and "Vertices" not in line:
+                    line = f.readline()
+                if not line:
+                    raise ValueError("Vertices section not found")
+                nbr_pt_in = int(float(f.readline().split()[0]))
+                pt_in = numpy.empty((nbr_pt_in, 2), dtype=float)
+                for i in range(nbr_pt_in):
+                    pt_in[i] = [float(x) for x in f.readline().split()[:2]]
+
+                line = f.readline()
+                while line and "Triangles" not in line:
+                    line = f.readline()
+                if not line:
+                    raise ValueError("Triangles section not found")
+                nbr_tri_in = int(float(f.readline().split()[0]))
+                for _ in range(nbr_tri_in):
+                    parts = f.readline().split()
+                    if len(parts) < 4:
+                        continue
+                    n1, n2, n3 = [int(float(x)) - 1 for x in parts[:3]]
+                    attr = int(float(parts[3])) + 1
+                    if not (attr & has_water):
+                        continue
+                    if not tile.use_masks_for_inland and (attr & has_water) < 2:
+                        continue
+
+                    lon1, lat1 = pt_in[n1]
+                    lon2, lat2 = pt_in[n2]
+                    lon3, lat3 = pt_in[n3]
+                    bary_lat = (lat1 + lat2 + lat3) / 3
+                    bary_lon = (lon1 + lon2 + lon3) / 3
+                    (til_x, til_y) = GEO.wgs84_to_orthogrid(
+                        bary_lat, bary_lon, tile.mask_zl
+                    )
+                    if (
+                        til_x < til_x_min - 16
+                        or til_x > til_x_max + 16
+                        or til_y < til_y_min - 16
+                        or til_y > til_y_max + 16
+                    ):
+                        continue
+
+                    (til_x2, til_y2) = GEO.wgs84_to_orthogrid(
+                        bary_lat, bary_lon, tile.mask_zl + 2
+                    )
+                    a = (til_x2 // 16) % 4
+                    b = (til_y2 // 16) % 4
+                    target_dico = (
+                        dico_sea
+                        if (attr & has_water) >= 2 or tile.use_masks_for_inland
+                        else dico_inland
+                    )
+
+                    def add_to_dico(tx, ty):
+                        if (tx, ty) in target_dico:
+                            target_dico[(tx, ty)].append(
+                                (lat1, lon1, lat2, lon2, lat3, lon3)
+                            )
+                        elif tx == til_x and ty == til_y:
+                            target_dico[(tx, ty)] = [
+                                (lat1, lon1, lat2, lon2, lat3, lon3)
+                            ]
+
+                    add_to_dico(til_x, til_y)
+                    if a == 0:
+                        add_to_dico(til_x - 16, til_y)
+                        if b == 0:
+                            add_to_dico(til_x - 16, til_y - 16)
+                        elif b == 3:
+                            add_to_dico(til_x - 16, til_y + 16)
+                    elif a == 3:
+                        add_to_dico(til_x + 16, til_y)
+                        if b == 0:
+                            add_to_dico(til_x + 16, til_y - 16)
+                        elif b == 3:
+                            add_to_dico(til_x + 16, til_y + 16)
+                    if b == 0:
+                        add_to_dico(til_x, til_y - 16)
+                    elif b == 3:
+                        add_to_dico(til_x, til_y + 16)
         except Exception as e:
             UI.lvprint(1, f"Mesh file {mesh_file_name} could not be read ({e}). Skipped.")
             continue

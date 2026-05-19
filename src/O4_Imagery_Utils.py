@@ -59,6 +59,15 @@ use_magick = False
 use_texture_converter = False
 as_helper_cmd = None
 
+
+def dds_format_support_error(dds_converter, dds_format):
+    if dds_format == "BC7" and dds_converter != "nvcompress":
+        return (
+            "BC7 DDS output is only supported with nvcompress; "
+            f"{dds_converter} cannot be used."
+        )
+    return None
+
 if "dar" in sys.platform:
     # 1. Try native 'magick' (Apple Silicon optimization)
     # We prioritize magick over textureconverter because the latter produces 
@@ -80,10 +89,10 @@ if "dar" in sys.platform:
             use_texture_converter = True
         else:
             use_texture_converter = False
-            dds_convert_cmd = os.path.join(
-                UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
-            )
             use_magick = False
+        dds_convert_cmd = os.path.join(
+            UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
+        )
     
     # Apple Silicon Helper for Neural Engine / Media Engine
     as_helper_cmd = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
@@ -1813,95 +1822,22 @@ def build_combined_ortho(
     (y1, x1) = GEO.gtile_to_wgs84(til_x_left + 16, til_y_top + 16, zoomlevel)
     mask_weight_below = numpy.zeros((4096, 4096), dtype=numpy.uint16)
     for rlayer in combined_providers_dict[provider_code][::-1]:
-        mask = has_data(
-            (x0, y0, x1, y1),
-            rlayer["extent_code"],
-            return_mask=True,
-            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
-            if rlayer["priority"] == "mask"
-            else False,
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=True,
+            clean_mask=False,
         )
-        if not mask:
+        if layer is None:
             continue
-        # we turn the image mask into an array
-        mask = numpy.array(mask, dtype=numpy.uint16)
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
-        )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        if not os.path.isfile(os.path.join(true_file_dir, true_file_name)):
-            UI.vprint(
-                1,
-                "   Downloading missing orthophoto "
-                + true_file_name
-                + " (for combining in "
-                + provider_code
-                + ")\n",
-            )
-            download_jpeg_ortho(
-                true_file_dir,
-                true_file_name,
-                true_til_x_left,
-                true_til_y_top,
-                true_zl,
-                rlayer["layer_code"],
-            )
-        else:
-            UI.vprint(
-                2,
-                "   The orthophoto "
-                + true_file_name
-                + " (for combining in "
-                + provider_code
-                + ") is already present.\n",
-            )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
-        # in case the smoothing of the extent mask was too strong we remove the
-        # the mask (where it is nor 0 nor 255) the pixels for which the true_im
-        # is all white
-        # true_arr=numpy.array(true_im).astype(numpy.uint16)
-        # mask[(numpy.sum(true_arr,axis=2)>=715)*(mask>=1)*(mask<=253)]=0
-        # mask[(numpy.sum(true_arr,axis=2)<=15)*(mask>=1)*(mask<=253)]=0
+        true_im, mask = layer
         if rlayer["priority"] == "low":
             # low priority layers, do not increase mask_weight_below
             wasnt_zero = (mask_weight_below + mask) != 0
@@ -2238,122 +2174,47 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
     # we do not need to bother with masks then
     if len(local_combined_providers_dict[provider_code]) == 1:
         rlayer = local_combined_providers_dict[provider_code][0]
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=False,
         )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
+        true_im, _ = layer
         UI.vprint(2, "Finished imprinting", til_x_left, til_y_top)
         return true_im
     # the real situation now where there are more than one layer with data
     for rlayer in local_combined_providers_dict[provider_code][::-1]:
-        mask = has_data(
-            (x0, y0, x1, y1),
-            rlayer["extent_code"],
-            return_mask=True,
-            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
-            if rlayer["priority"] == "mask"
-            else False,
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=True,
+            clean_mask=False,
         )
-        if not mask:
+        if layer is None:
             continue
-        # we turn the image mask into an array
-        mask = numpy.array(mask, dtype=numpy.uint16)
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
-        )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
+        true_im, mask = layer
         # in case the smoothing of the extent mask was too strong we remove the
         # the mask (where it is nor 0 nor 255) the pixels for which the true_im
         # is all white or all black
-        true_arr = numpy.array(true_im).astype(numpy.uint16)
-        mask[
-            (numpy.sum(true_arr, axis=2) >= 735) * (mask >= 1) * (mask <= 253)
-        ] = 0
-        mask[
-            (numpy.sum(true_arr, axis=2) <= 35) * (mask >= 1) * (mask <= 253)
-        ] = 0
+        true_arr = numpy.asarray(true_im, dtype=numpy.uint16)
+        true_sum = numpy.sum(true_arr, axis=2)
+        mask_valid = (mask >= 1) * (mask <= 253)
+        mask[(true_sum >= 735) * mask_valid] = 0
+        mask[(true_sum <= 35) * mask_valid] = 0
         if rlayer["priority"] == "low":
             # low priority layers, do not increase mask_weight_below
             wasnt_zero = (mask_weight_below + mask) != 0
@@ -2374,6 +2235,92 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
         big_image = Image.composite(true_im, big_image, mask)
     UI.vprint(2, "Finished imprinting", til_x_left, til_y_top)
     return big_image
+
+
+def _prepare_combined_layer(
+    tile,
+    til_x_left,
+    til_y_top,
+    zoomlevel,
+    rlayer,
+    x0,
+    y0,
+    x1,
+    y1,
+    collect_mask=False,
+    clean_mask=False,
+):
+    provider = providers_dict[rlayer["layer_code"]]
+    if collect_mask:
+        mask = has_data(
+            (x0, y0, x1, y1),
+            rlayer["extent_code"],
+            return_mask=True,
+            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
+            if rlayer["priority"] == "mask"
+            else False,
+        )
+        if not mask:
+            return None
+        mask = numpy.asarray(mask, dtype=numpy.uint16)
+    else:
+        mask = None
+
+    true_til_x_left = til_x_left
+    true_til_y_top = til_y_top
+    true_zl = zoomlevel
+    crop = False
+    if "max_zl" in provider:
+        max_zl = int(provider["max_zl"])
+        if max_zl < zoomlevel:
+            (latmed, lonmed) = GEO.gtile_to_wgs84(
+                til_x_left + 8, til_y_top + 8, zoomlevel
+            )
+            (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
+                latmed, lonmed, max_zl
+            )
+            true_zl = max_zl
+            crop = True
+            pixx0 = round(
+                256 * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
+            )
+            pixy0 = round(
+                256 * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
+            )
+            pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
+            pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
+
+    true_file_name = FNAMES.jpeg_file_name_from_attributes(
+        true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
+    )
+    true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
+        tile.lat, tile.lon, true_zl, provider
+    )
+    true_file_path = os.path.join(true_file_dir, true_file_name)
+    UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
+    with Image.open(true_file_path) as source_im:
+        true_im = color_transform(source_im, rlayer["color_code"])
+        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
+            UI.vprint(2, "Blur of a mask !")
+            true_im = true_im.filter(
+                ImageFilter.GaussianBlur(
+                    tile.sea_texture_blur * 2 ** (true_zl - 17)
+                )
+            )
+        if crop:
+            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
+                (4096, 4096), Image.BICUBIC
+            )
+        true_im = true_im.copy()
+
+    if collect_mask and clean_mask:
+        true_arr = numpy.asarray(true_im, dtype=numpy.uint16)
+        true_sum = numpy.sum(true_arr, axis=2)
+        mask_valid = (mask >= 1) * (mask <= 253)
+        mask[(true_sum >= 735) * mask_valid] = 0
+        mask[(true_sum <= 35) * mask_valid] = 0
+
+    return true_im, mask
 
 
 ################################################################################
@@ -2411,6 +2358,12 @@ def convert_texture(
             til_x_left, til_y_top, zoomlevel, provider_code
         )
         png_file_name = out_file_name.replace("dds", "png")
+        dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
+        dds_format = getattr(UI, 'dds_format', 'BC3')
+        dds_error = dds_format_support_error(dds_converter, dds_format)
+        if dds_error:
+            UI.vprint(1, f"   Error: {dds_error}")
+            return 0
     elif type == "tif":
         out_file_name = FNAMES.geotiff_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2593,8 +2546,6 @@ def convert_texture(
     # eventually the dds conversion
     if type == "dds":
         out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
-        dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
-        dds_format = getattr(UI, 'dds_format', 'BC3')
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # GPUバッチ一括変換時は、各ワーカーでは準備のみを行いメインプロセスで一括処理するため早期リターン

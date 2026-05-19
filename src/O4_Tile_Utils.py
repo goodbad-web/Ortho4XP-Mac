@@ -151,6 +151,7 @@ def _build_tile(tile):
             download_queue.put("quit")
         download_thread.join()
         if convert_launched:
+            dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
             dds_format = getattr(UI, 'dds_format', 'BC3')
             UI.vprint(
                 1,
@@ -181,21 +182,25 @@ def _build_tile(tile):
                 item = convert_queue.get()
                 if item != "quit":
                     convert_list.append(item)
-            
-            success_count = multiprocessing_pool(
-                IMG.convert_texture,
-                convert_list,
-                max_convert_slots,
-                progress=dico_conv_progress,
-                init_func=IMG.init_worker,
-                init_args=config_data
-            )
 
-            conversion_success = (success_count == len(convert_list))
+            dds_error = IMG.dds_format_support_error(dds_converter, dds_format)
+            if dds_error:
+                UI.vprint(1, f"ERROR: {dds_error}")
+                success_count = 0
+                conversion_success = False
+            else:
+                success_count = multiprocessing_pool(
+                    IMG.convert_texture,
+                    convert_list,
+                    max_convert_slots,
+                    progress=dico_conv_progress,
+                    init_func=IMG.init_worker,
+                    init_args=config_data
+                )
+                conversion_success = (success_count == len(convert_list))
             
             # GPU Batch DDS Conversion integration for macOS
             use_gpu = getattr(UI, 'use_gpu_acceleration', True)
-            dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
             if conversion_success and use_gpu and dds_converter == "TextureConverter" and "dar" in sys.platform:
                 from PIL import Image
                 import O4_RAMDisk_Utils
