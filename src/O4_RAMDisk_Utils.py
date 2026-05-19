@@ -5,22 +5,93 @@ import shutil
 import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 
+RAM_DISK_PATH = "/Volumes/Ortho4XP_RAM_Disk"
+
+def is_ram_disk_active(ram_disk_path=RAM_DISK_PATH):
+    if sys.platform != 'darwin' or not os.path.exists(ram_disk_path):
+        return False
+    if os.path.ismount(ram_disk_path):
+        return True
+    try:
+        result = subprocess.run(
+            ["diskutil", "info", ram_disk_path],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        return result.returncode == 0 and "Mounted: Yes" in result.stdout
+    except Exception:
+        return False
+
+def safe_merge_directories(src_dir, dest_dir):
+    if not src_dir or not os.path.exists(src_dir):
+        return False
+    merge_directories(src_dir, dest_dir)
+    return True
+
+def restore_path_from_backup(path, backup_path):
+    if not os.path.exists(backup_path):
+        return False
+    if os.path.islink(path):
+        os.unlink(path)
+    if os.path.exists(path):
+        if os.path.isdir(path):
+            safe_merge_directories(backup_path, path)
+            shutil.rmtree(backup_path, ignore_errors=True)
+        else:
+            os.remove(path)
+            os.rename(backup_path, path)
+    else:
+        os.rename(backup_path, path)
+    return True
+
+def restore_path_after_failed_mount(path, backup_path):
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        if restore_path_from_backup(path, backup_path):
+            return
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        UI.vprint(0, f"[RAMDisk] Error rolling back {path}: {e}")
+
+def detach_ram_disk(ram_disk_path=RAM_DISK_PATH, log_prefix="[RAMDisk]"):
+    if not is_ram_disk_active(ram_disk_path):
+        return True
+    try:
+        subprocess.run(
+            ["hdiutil", "detach", "-force", ram_disk_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        UI.vprint(1, f"{log_prefix} RAM disk detached successfully.")
+        return True
+    except Exception as e:
+        UI.vprint(0, f"{log_prefix} Error detaching RAM disk: {e}")
+        return False
+
 def mount_ram_disk(size_gb=4, use_orthophotos=False):
     if sys.platform != 'darwin':
         UI.vprint(1, "[RAMDisk] RAM disk is only supported on macOS.")
         return False
         
-    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    ram_disk_path = RAM_DISK_PATH
     tmp_path = os.path.abspath(FNAMES.Tmp_dir)
     ortho_path = os.path.abspath(FNAMES.Imagery_dir)
+    tmp_backup = tmp_path + "_backup"
+    ortho_backup = ortho_path + "_backup"
+    created_ram_disk = False
     
     # 1. Check if RAM disk is already mounted
-    if os.path.exists(ram_disk_path):
+    if is_ram_disk_active(ram_disk_path):
         UI.vprint(1, f"[RAMDisk] RAM disk is already mounted at {ram_disk_path}")
     else:
         UI.vprint(1, f"[RAMDisk] Creating {size_gb}GB RAM disk on macOS...")
         # 1 GB = 2097152 sectors
         sectors = size_gb * 2097152
+        device_node = None
         try:
             # Attach RAM disk
             result = subprocess.run(
@@ -39,9 +110,12 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
                 text=True,
                 check=True
             )
+            created_ram_disk = True
             UI.vprint(1, f"[RAMDisk] Formatted and mounted RAM disk at {ram_disk_path}")
         except Exception as e:
             UI.vprint(0, f"[RAMDisk] Error creating RAM disk: {e}")
+            if device_node:
+                subprocess.run(["hdiutil", "detach", "-force", device_node], capture_output=True, text=True)
             return False
             
     # 2. Setup the symlink for tmp folder
@@ -57,11 +131,10 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
             if not os.listdir(tmp_path):
                 os.rmdir(tmp_path)
             else:
-                backup_path = tmp_path + "_backup"
-                if os.path.exists(backup_path):
-                    shutil.rmtree(backup_path, ignore_errors=True)
-                os.rename(tmp_path, backup_path)
-                UI.vprint(1, f"[RAMDisk] Non-empty 'tmp' folder backed up to '{backup_path}'.")
+                if os.path.exists(tmp_backup):
+                    shutil.rmtree(tmp_backup, ignore_errors=True)
+                os.rename(tmp_path, tmp_backup)
+                UI.vprint(1, f"[RAMDisk] Non-empty 'tmp' folder backed up to '{tmp_backup}'.")
             os.symlink(ram_disk_path, tmp_path)
         elif os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -72,6 +145,9 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
         UI.vprint(1, f"[RAMDisk] Linked {tmp_path} -> {ram_disk_path}")
     except Exception as e:
         UI.vprint(0, f"[RAMDisk] Error setting up symbolic link: {e}")
+        restore_path_after_failed_mount(tmp_path, tmp_backup)
+        if created_ram_disk:
+            detach_ram_disk(ram_disk_path)
         return False
 
     # 3. Setup the symlink for Orthophotos folder if requested
@@ -92,7 +168,6 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
                 if not os.listdir(ortho_path):
                     os.rmdir(ortho_path)
                 else:
-                    ortho_backup = ortho_path + "_backup"
                     if os.path.exists(ortho_backup):
                         shutil.rmtree(ortho_backup, ignore_errors=True)
                     os.rename(ortho_path, ortho_backup)
@@ -106,6 +181,10 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
                 UI.vprint(1, f"[RAMDisk] Linked Orthophotos -> {ram_ortho_path}")
         except Exception as e:
             UI.vprint(0, f"[RAMDisk] Error setting up Orthophotos symlink: {e}")
+            restore_path_after_failed_mount(ortho_path, ortho_backup)
+            restore_path_after_failed_mount(tmp_path, tmp_backup)
+            if created_ram_disk:
+                detach_ram_disk(ram_disk_path)
             return False
 
     return True
@@ -127,7 +206,7 @@ def unmount_ram_disk(use_orthophotos=False):
     if sys.platform != 'darwin':
         return False
         
-    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    ram_disk_path = RAM_DISK_PATH
     tmp_path = os.path.abspath(FNAMES.Tmp_dir)
     ortho_path = os.path.abspath(FNAMES.Imagery_dir)
     ortho_backup = ortho_path + "_backup"
@@ -140,7 +219,7 @@ def unmount_ram_disk(use_orthophotos=False):
                 ram_ortho_path = os.path.realpath(ortho_path)
                 if os.path.exists(ram_ortho_path) and os.path.exists(ortho_backup):
                     UI.vprint(1, "[RAMDisk] Merging newly downloaded Orthophotos back to SSD cache...")
-                    merge_directories(ram_ortho_path, ortho_backup)
+                    safe_merge_directories(ram_ortho_path, ortho_backup)
                 
                 os.unlink(ortho_path)
                 if os.path.exists(ortho_backup):
@@ -150,8 +229,11 @@ def unmount_ram_disk(use_orthophotos=False):
                     os.makedirs(ortho_path, exist_ok=True)
                     if os.path.exists(ram_ortho_path):
                         UI.vprint(1, "[RAMDisk] Merging newly downloaded Orthophotos back to SSD cache...")
-                        merge_directories(ram_ortho_path, ortho_path)
+                        safe_merge_directories(ram_ortho_path, ortho_path)
                     UI.vprint(1, "[RAMDisk] Restored 'Orthophotos' directory.")
+            elif os.path.exists(ortho_backup):
+                restore_path_from_backup(ortho_path, ortho_backup)
+                UI.vprint(1, f"[RAMDisk] Restored 'Orthophotos' directory from '{ortho_backup}'.")
             elif os.path.isdir(ortho_path):
                 pass
         except Exception as e:
@@ -162,31 +244,23 @@ def unmount_ram_disk(use_orthophotos=False):
         if os.path.islink(tmp_path):
             os.unlink(tmp_path)
             if os.path.exists(tmp_backup):
-                os.rename(tmp_backup, tmp_path)
+                restore_path_from_backup(tmp_path, tmp_backup)
                 UI.vprint(1, f"[RAMDisk] Restored 'tmp' directory from '{tmp_backup}'.")
             else:
                 os.makedirs(tmp_path, exist_ok=True)
                 UI.vprint(1, "[RAMDisk] Restored empty 'tmp' directory.")
+        elif os.path.exists(tmp_backup):
+            restore_path_from_backup(tmp_path, tmp_backup)
+            UI.vprint(1, f"[RAMDisk] Restored 'tmp' directory from '{tmp_backup}'.")
         elif os.path.isdir(tmp_path):
             pass # normal directory, no symlink to clean
     except Exception as e:
         UI.vprint(0, f"[RAMDisk] Error removing symlink: {e}")
         
     # 3. Unmount RAM disk
-    if os.path.exists(ram_disk_path):
+    if is_ram_disk_active(ram_disk_path):
         UI.vprint(1, f"[RAMDisk] Detaching RAM disk from {ram_disk_path}...")
-        try:
-            subprocess.run(
-                ["hdiutil", "detach", "-force", ram_disk_path],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            UI.vprint(1, "[RAMDisk] RAM disk detached successfully.")
-            return True
-        except Exception as e:
-            UI.vprint(0, f"[RAMDisk] Error detaching RAM disk: {e}")
-            return False
+        return detach_ram_disk(ram_disk_path)
     return True
 
 def recover_orphaned_symlinks():
@@ -198,12 +272,20 @@ def recover_orphaned_symlinks():
     if sys.platform != 'darwin':
         return False
         
-    ram_disk_path = "/Volumes/Ortho4XP_RAM_Disk"
+    ram_disk_path = RAM_DISK_PATH
     tmp_path = os.path.abspath(FNAMES.Tmp_dir)
     ortho_path = os.path.abspath(FNAMES.Imagery_dir)
     ortho_backup = ortho_path + "_backup"
     tmp_backup = tmp_path + "_backup"
     recovered = False
+    has_orphan_state = (
+        os.path.islink(tmp_path)
+        or os.path.exists(tmp_backup)
+        or os.path.islink(ortho_path)
+        or os.path.exists(ortho_backup)
+    )
+    if not has_orphan_state:
+        return False
     
     # 1. Recover Orthophotos if symlink exists OR backup exists
     if os.path.islink(ortho_path) or os.path.exists(ortho_backup):
@@ -214,25 +296,16 @@ def recover_orphaned_symlinks():
                 ram_ortho_path = os.path.realpath(ortho_path)
                 # If the symlink target exists, preserve RAM-written imagery before removing the link.
                 if os.path.exists(ram_ortho_path) and os.path.exists(ortho_backup):
-                    merge_directories(ram_ortho_path, ortho_backup)
+                    safe_merge_directories(ram_ortho_path, ortho_backup)
                 os.unlink(ortho_path)
             
             if os.path.exists(ortho_backup):
-                if os.path.exists(ortho_path):
-                    if os.path.isdir(ortho_path):
-                        # Merge if a regular folder got created somehow
-                        merge_directories(ortho_backup, ortho_path)
-                        shutil.rmtree(ortho_backup, ignore_errors=True)
-                    else:
-                        os.remove(ortho_path)
-                        os.rename(ortho_backup, ortho_path)
-                else:
-                    os.rename(ortho_backup, ortho_path)
+                restore_path_from_backup(ortho_path, ortho_backup)
                 UI.vprint(1, f"[RAMDisk] Successfully restored 'Orthophotos' from backup.")
             else:
                 os.makedirs(ortho_path, exist_ok=True)
                 if ram_ortho_path and os.path.exists(ram_ortho_path):
-                    merge_directories(ram_ortho_path, ortho_path)
+                    safe_merge_directories(ram_ortho_path, ortho_path)
             recovered = True
         except Exception as e:
             UI.vprint(0, f"[RAMDisk] Error recovering Orthophotos symlink: {e}")
@@ -244,15 +317,7 @@ def recover_orphaned_symlinks():
             if os.path.islink(tmp_path):
                 os.unlink(tmp_path)
             if os.path.exists(tmp_backup):
-                if os.path.exists(tmp_path):
-                    if os.path.isdir(tmp_path):
-                        merge_directories(tmp_backup, tmp_path)
-                        shutil.rmtree(tmp_backup, ignore_errors=True)
-                    else:
-                        os.remove(tmp_path)
-                        os.rename(tmp_backup, tmp_path)
-                else:
-                    os.rename(tmp_backup, tmp_path)
+                restore_path_from_backup(tmp_path, tmp_backup)
                 UI.vprint(1, f"[RAMDisk] Successfully restored 'tmp' from backup.")
             else:
                 os.makedirs(tmp_path, exist_ok=True)
@@ -261,7 +326,7 @@ def recover_orphaned_symlinks():
             UI.vprint(0, f"[RAMDisk] Error recovering tmp symlink: {e}")
 
     # 3. Clean up the mounted RAM disk to be perfectly sure
-    if os.path.exists(ram_disk_path):
+    if recovered and is_ram_disk_active(ram_disk_path):
         UI.vprint(1, f"[RAMDisk] Orphaned RAM Disk mount detected. Detaching...")
         try:
             subprocess.run(

@@ -42,10 +42,12 @@ if __name__ == '__main__':
     use_ram_disk = getattr(CFG.UI, 'use_ram_disk', False)
     use_ram_disk_for_orthophotos = getattr(CFG.UI, 'use_ram_disk_for_orthophotos', False)
     if use_ram_disk:
-        O4_RAMDisk_Utils.mount_ram_disk(
+        use_ram_disk = O4_RAMDisk_Utils.mount_ram_disk(
             size_gb=getattr(CFG.UI, 'ram_disk_size_gb', 4),
             use_orthophotos=use_ram_disk_for_orthophotos
         )
+        if not use_ram_disk:
+            print("[Ortho4XP] RAM disk setup failed. Continuing without RAM disk.")
         
     try:
         for directory in (FNAMES.Preview_dir, FNAMES.Provider_dir, FNAMES.Extent_dir, FNAMES.Filter_dir, FNAMES.OSM_dir,
