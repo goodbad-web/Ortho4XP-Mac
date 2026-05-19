@@ -148,7 +148,10 @@ def unmount_ram_disk(use_orthophotos=False):
                     UI.vprint(1, f"[RAMDisk] Restored and merged 'Orthophotos' from '{ortho_backup}'.")
                 else:
                     os.makedirs(ortho_path, exist_ok=True)
-                    UI.vprint(1, "[RAMDisk] Restored empty 'Orthophotos' directory.")
+                    if os.path.exists(ram_ortho_path):
+                        UI.vprint(1, "[RAMDisk] Merging newly downloaded Orthophotos back to SSD cache...")
+                        merge_directories(ram_ortho_path, ortho_path)
+                    UI.vprint(1, "[RAMDisk] Restored 'Orthophotos' directory.")
             elif os.path.isdir(ortho_path):
                 pass
         except Exception as e:
@@ -206,9 +209,10 @@ def recover_orphaned_symlinks():
     if os.path.islink(ortho_path) or os.path.exists(ortho_backup):
         UI.vprint(1, "[RAMDisk] Orphaned Orthophotos symlink or backup detected! Restoring SSD cache...")
         try:
+            ram_ortho_path = None
             if os.path.islink(ortho_path):
                 ram_ortho_path = os.path.realpath(ortho_path)
-                # If the symlink's target directory exists (e.g. RAM Disk is still mounted) and SSD backup exists, merge
+                # If the symlink target exists, preserve RAM-written imagery before removing the link.
                 if os.path.exists(ram_ortho_path) and os.path.exists(ortho_backup):
                     merge_directories(ram_ortho_path, ortho_backup)
                 os.unlink(ortho_path)
@@ -227,6 +231,8 @@ def recover_orphaned_symlinks():
                 UI.vprint(1, f"[RAMDisk] Successfully restored 'Orthophotos' from backup.")
             else:
                 os.makedirs(ortho_path, exist_ok=True)
+                if ram_ortho_path and os.path.exists(ram_ortho_path):
+                    merge_directories(ram_ortho_path, ortho_path)
             recovered = True
         except Exception as e:
             UI.vprint(0, f"[RAMDisk] Error recovering Orthophotos symlink: {e}")
@@ -372,5 +378,3 @@ def flush_tile_imagery(lat, lon):
             UI.vprint(2, f"[RAMDisk] Warning: Failed to clear grouped RAM Disk tile directory: {e}")
 
     return flushed
-
-
