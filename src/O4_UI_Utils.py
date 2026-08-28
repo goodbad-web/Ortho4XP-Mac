@@ -45,7 +45,7 @@ except:
 ################################################################################
 def progress_bar(nbr, percentage, message=None):
     if gui:
-        gui.pgrb_queue.put((nbr, percentage))
+        gui.pgrb_queue.put((nbr, percentage, message))
     else:
         # Command line progress bar
         bar_length = 30
@@ -54,7 +54,8 @@ def progress_bar(nbr, percentage, message=None):
         prefix = "Progress"
         if nbr == 2: prefix = "Downloads"
         elif nbr == 3: prefix = "DDS Conv "
-        sys.stdout.write(f"\r{prefix}: [{bar}] {percentage:3d}%")
+        suffix = f" - {message}" if message else ""
+        sys.stdout.write(f"\r{prefix}: [{bar}] {percentage:3d}%{suffix}")
         sys.stdout.flush()
         if percentage >= 100:
             sys.stdout.write('\n')
@@ -67,6 +68,8 @@ def vprint(min_verbosity, *args):
         print(msg)
         if write_build_log:
             build_log_buffer.append(msg)
+        if gui:
+            gui.status_queue.put(msg)
 
 
 ################################################################################
@@ -93,6 +96,8 @@ def lvprint(min_verbosity, *args):
             logprint(msg)
         if write_build_log:
             build_log_buffer.append(msg)
+        if gui:
+            gui.status_queue.put(msg)
 
 
 def get_config_summary():

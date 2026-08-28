@@ -17,7 +17,11 @@ class parallel_worker(threading.Thread):
             args = self._queue.get()
             if isinstance(args, str) and args == "quit":
                 try:
-                    UI.progress_bar(self._progress["bar"], 100)
+                    UI.progress_bar(
+                        self._progress["bar"],
+                        100,
+                        self._progress.get("message"),
+                    )
                 except:
                     pass
                 return 1
@@ -31,6 +35,7 @@ class parallel_worker(threading.Thread):
                         * self._progress["done"]
                         / (self._progress["done"] + self._queue.qsize())
                     ),
+                    self._progress.get("message"),
                 )
             if UI.red_flag:
                 return 0
@@ -87,7 +92,11 @@ def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=N
                     success += 1
                 if progress:
                     progress["done"] += 1
-                    UI.progress_bar(progress["bar"], int(100 * done / total))
+                    UI.progress_bar(
+                        progress["bar"],
+                        int(100 * done / total),
+                        progress.get("message"),
+                    )
                 if done % log_step == 0 or done == total:
                     UI.vprint(1, f"   ... {done}/{total} ({int(100 * done / total)}%)")
                 if UI.red_flag:

@@ -87,10 +87,22 @@ class Ortho4XP_GUI(tk.Tk):
             foreground=UI.ENTRY_FG,
             insertcolor=UI.FG_COLOR,
         )
+        O4.configure(
+            "Compact.TButton",
+            padding=(4, 1),
+            background=UI.BTN_BG,
+            foreground=UI.FG_COLOR,
+            highlightbackground=UI.BTN_BG,
+            selectbackground=UI.BTN_BG,
+            highlightcolor=UI.BTN_BG,
+            highlightthickness=0,
+            relief="flat",
+        )
         self.option_add("*Font", "TkFixedFont")
 
         # Let UI know ourself
         UI.gui = self
+        self.status_queue = queue.Queue()
         # Initialize providers combobox entries
         self.map_list = sorted(
             [
@@ -140,6 +152,7 @@ class Ortho4XP_GUI(tk.Tk):
             self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_top.grid(row=0, column=0, sticky=N + S + W + E)
+        self.frame_top.columnconfigure(0, weight=1)
         self.frame_console = tk.Frame(
             self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
@@ -152,25 +165,39 @@ class Ortho4XP_GUI(tk.Tk):
         self.frame_steps = tk.Frame(
             self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
         )
-        self.frame_steps.grid(row=2, column=0, sticky=N + S + W + E)
+        self.frame_steps.grid(row=1, column=0, sticky=N + S + W + E)
+        self.frame_aux = tk.Frame(
+            self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
+        )
+        self.frame_aux.grid(row=2, column=0, sticky=N + S + W + E)
         self.frame_bars = tk.Frame(
             self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
         )
         self.frame_bars.grid(row=3, column=0, sticky=N + S + W + E)
+        for i in range(3):
+            self.frame_bars.columnconfigure(i, weight=1)
         # Level 2
         self.frame_folder = tk.Frame(
             self.frame_tile, border=0, padx=0, pady=0, bg=UI.BG_COLOR
         )
         self.frame_folder.grid(
-            row=1, column=0, columnspan=8, sticky=N + S + W + E
+            row=2, column=0, columnspan=8, sticky=N + S + W + E
         )
 
         # Widgets instances and placement
         # First row (Tile data)
+        tk.Label(
+            self.frame_tile,
+            text="Input",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, columnspan=8, sticky=W + E)
+
         self.lat = tk.StringVar()
         self.lat.trace("w", self.tile_change)
         tk.Label(self.frame_tile, text="Latitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR).grid(
-            row=0, column=0, padx=5, pady=5, sticky=E + W
+            row=1, column=0, padx=5, pady=5, sticky=E + W
         )
         self.lat_entry = tk.Entry(
             self.frame_tile,
@@ -180,13 +207,13 @@ class Ortho4XP_GUI(tk.Tk):
             textvariable=self.lat,
             insertbackground=UI.FG_COLOR,
         )
-        self.lat_entry.grid(row=0, column=1, padx=5, pady=5, sticky=W)
+        self.lat_entry.grid(row=1, column=1, padx=5, pady=5, sticky=W)
 
         self.lon = tk.StringVar()
         self.lon.trace("w", self.tile_change)
         tk.Label(
             self.frame_tile, anchor=W, text="Longitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
-        ).grid(row=0, column=2, padx=5, pady=5, sticky=E + W)
+        ).grid(row=1, column=2, padx=5, pady=5, sticky=E + W)
         self.lon_entry = tk.Entry(
             self.frame_tile,
             width=4,
@@ -195,13 +222,13 @@ class Ortho4XP_GUI(tk.Tk):
             textvariable=self.lon,
             insertbackground=UI.FG_COLOR,
         )
-        self.lon_entry.grid(row=0, column=3, padx=5, pady=5, sticky=W)
+        self.lon_entry.grid(row=1, column=3, padx=5, pady=5, sticky=W)
 
         self.default_website = tk.StringVar()
         self.default_website.trace("w", self.update_cfg)
         tk.Label(
             self.frame_tile, anchor=W, text="Imagery:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
-        ).grid(row=0, column=4, padx=5, pady=5, sticky=E + W)
+        ).grid(row=1, column=4, padx=5, pady=5, sticky=E + W)
         self.img_combo = ttk.Combobox(
             self.frame_tile,
             values=self.map_list,
@@ -210,13 +237,13 @@ class Ortho4XP_GUI(tk.Tk):
             width=14,
             style="O4.TCombobox",
         )
-        self.img_combo.grid(row=0, column=5, padx=5, pady=5, sticky=W)
+        self.img_combo.grid(row=1, column=5, padx=5, pady=5, sticky=W)
 
         self.default_zl = tk.StringVar()
         self.default_zl.trace("w", self.update_cfg)
         tk.Label(
             self.frame_tile, anchor=W, text="Zoomlevel:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
-        ).grid(row=0, column=6, padx=5, pady=5, sticky=E + W)
+        ).grid(row=1, column=6, padx=5, pady=5, sticky=E + W)
         self.zl_combo = ttk.Combobox(
             self.frame_tile,
             values=self.zl_list,
@@ -225,7 +252,7 @@ class Ortho4XP_GUI(tk.Tk):
             width=3,
             style="O4.TCombobox",
         )
-        self.zl_combo.grid(row=0, column=7, padx=5, pady=5, sticky=W)
+        self.zl_combo.grid(row=1, column=7, padx=5, pady=5, sticky=W)
 
         # Second row (Base Folder)
         self.frame_folder.columnconfigure(1, weight=1)
@@ -251,63 +278,26 @@ class Ortho4XP_GUI(tk.Tk):
             style="Flat.TButton",
         ).grid(row=0, column=2, padx=0, pady=0, sticky=N + S + E + W)
 
-        # Button Icons on top right
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            text="Verify",
-            command=self.check_dependencies,
-            style="Flat.TButton",
-        ).grid(row=0, column=8, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.config_icon,
-            command=self.open_config_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=9, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.loupe_icon,
-            command=self.open_custom_zl_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=10, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.earth_icon,
-            command=self.open_earth_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=11, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.stop_icon,
-            command=self.set_red_flag,
-            style="Flat.TButton",
-        ).grid(row=0, column=12, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.exit_icon,
-            command=self.exit_prg,
-            style="Flat.TButton",
-        ).grid(row=0, column=13, rowspan=2, padx=5, pady=0)
-
         # Third row (Steps)
         for i in range(5):
             self.frame_steps.columnconfigure(i, weight=1)
+        tk.Label(
+            self.frame_steps,
+            text="Run",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, columnspan=5, sticky=W + E)
         ttk.Button(
             self.frame_steps,
             text="Assemble Vector data",
             command=self.build_poly_file,
-        ).grid(row=0, column=0, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=0, padx=5, pady=0, sticky=N + S + E + W)
         build_mesh_button = ttk.Button(
             self.frame_steps, text="Triangulate 3D Mesh"
         )  # ,command=self.build_mesh)
         build_mesh_button.grid(
-            row=0, column=1, padx=5, pady=0, sticky=N + S + E + W
+            row=1, column=1, padx=5, pady=0, sticky=N + S + E + W
         )
         build_mesh_button.bind("<ButtonPress-1>", self.build_mesh)
         build_mesh_button.bind("<Shift-ButtonPress-1>", self.sort_mesh)
@@ -317,7 +307,7 @@ class Ortho4XP_GUI(tk.Tk):
             self.frame_steps, text=" Draw Water Masks  "
         )  # ,command=self.build_masks)
         build_masks_button.grid(
-            row=0, column=2, padx=5, pady=0, sticky=N + S + E + W
+            row=1, column=2, padx=5, pady=0, sticky=N + S + E + W
         )
         build_masks_button.bind("<ButtonPress-1>", self.build_masks)
         build_masks_button.bind("<Shift-ButtonPress-1>", self.build_masks)
@@ -325,39 +315,167 @@ class Ortho4XP_GUI(tk.Tk):
             self.frame_steps,
             text=" Build Imagery/DSF ",
             command=self.build_tile,
-        ).grid(row=0, column=3, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=3, padx=5, pady=0, sticky=N + S + E + W)
         ttk.Button(
             self.frame_steps, text="    All in one     ", command=self.build_all
-        ).grid(row=0, column=4, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=4, padx=5, pady=0, sticky=N + S + E + W)
+
+        # Support section
+        self.frame_aux.columnconfigure(0, weight=1)
+        tk.Label(
+            self.frame_aux,
+            text="Support",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, sticky=W + E)
+        self.frame_aux_main = tk.Frame(
+            self.frame_aux, border=0, padx=0, pady=0, bg=UI.BG_COLOR
+        )
+        self.frame_aux_main.grid(row=1, column=0, sticky=N + S + W + E)
+        for i in range(6):
+            self.frame_aux_main.columnconfigure(i, weight=1)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Verify",
+            command=self.check_dependencies,
+            style="Compact.TButton",
+        ).grid(row=0, column=0, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Config",
+            command=self.open_config_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=1, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Preview",
+            command=self.open_earth_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=2, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Custom ZL",
+            command=self.open_custom_zl_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=3, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Stop",
+            command=self.set_red_flag,
+            style="Compact.TButton",
+        ).grid(row=0, column=4, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Exit",
+            command=self.exit_prg,
+            style="Compact.TButton",
+        ).grid(row=0, column=5, padx=3, pady=0, sticky=N + S + E + W)
 
         # Fourth row (Progress bars and controls)
         # Label(self.frame_left,anchor=W,text="DSF/Masks progress",
         # bg="light green")
+        self.progress_titles = {
+            1: "Vector / mesh / masks",
+            2: "Downloads",
+            3: "DDS conversion",
+        }
         self.pgrb1v = tk.IntVar()
         self.pgrb2v = tk.IntVar()
         self.pgrb3v = tk.IntVar()
         self.pgrbv = {1: self.pgrb1v, 2: self.pgrb2v, 3: self.pgrb3v}
+        self.pgrb_detail = {
+            1: tk.StringVar(value="Idle"),
+            2: tk.StringVar(value="Idle"),
+            3: tk.StringVar(value="Idle"),
+        }
+        self.pgrb_pct = {
+            1: tk.StringVar(value="0%"),
+            2: tk.StringVar(value="0%"),
+            3: tk.StringVar(value="0%"),
+        }
+        for i in range(3):
+            tk.Label(
+                self.frame_bars,
+                text=self.progress_titles[i + 1],
+                fg=UI.FG_COLOR,
+                bg=UI.BG_COLOR,
+            ).grid(row=0, column=i, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb1 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb1v,
         )
-        self.pgrb1.grid(row=0, column=0, padx=5, pady=0)
+        self.pgrb1.grid(row=1, column=0, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[1],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=0, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[1],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=0, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb2 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb2v,
         )
-        self.pgrb2.grid(row=0, column=1, padx=5, pady=0)
+        self.pgrb2.grid(row=1, column=1, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[2],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=1, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[2],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=1, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb3 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb3v,
         )
-        self.pgrb3.grid(row=0, column=2, padx=5, pady=0)
+        self.pgrb3.grid(row=1, column=2, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[3],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=2, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[3],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=2, padx=5, pady=(0, 2), sticky=W + E)
+        self.status_var = tk.StringVar(value="Idle")
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.status_var,
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+            justify=LEFT,
+        ).grid(row=4, column=0, columnspan=3, padx=5, pady=(4, 0), sticky=W + E)
 
         # Console
         self.frame_console.rowconfigure(0, weight=0)
@@ -381,6 +499,7 @@ class Ortho4XP_GUI(tk.Tk):
         self.console_update()
         self.pgrb_queue = queue.Queue()
         self.pgrb_update()
+        self.status_update()
 
         # Redirection
         self.stdout_orig = sys.stdout
@@ -435,11 +554,27 @@ class Ortho4XP_GUI(tk.Tk):
     def pgrb_update(self):
         try:
             while 1:
-                (nbr, value) = self.pgrb_queue.get_nowait()
+                item = self.pgrb_queue.get_nowait()
+                if len(item) == 3:
+                    (nbr, value, message) = item
+                else:
+                    (nbr, value) = item
+                    message = None
                 self.pgrbv[nbr].set(value)
+                self.pgrb_pct[nbr].set(f"{value}%")
+                if message:
+                    self.pgrb_detail[nbr].set(str(message))
         except queue.Empty:
             pass
         self.callback_pgrb = self.after(100, self.pgrb_update)
+
+    def status_update(self):
+        try:
+            while 1:
+                self.status_var.set(self.status_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.callback_status = self.after(100, self.status_update)
 
     def tile_change(self, *args):
         # HACK : user preference is to not trash custom_dem and zone_list on 
@@ -618,6 +753,7 @@ class Ortho4XP_GUI(tk.Tk):
 
     def set_red_flag(self):
         UI.red_flag = True
+        self.status_var.set("Stop requested. Waiting for the current step to stop...")
 
     def check_dependencies(self):
         UI.vprint(0, "\nChecking dependencies...")
@@ -669,6 +805,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             pass
         self.after_cancel(self.callback_pgrb)
+        self.after_cancel(self.callback_status)
         self.after_cancel(self.callback_console)
         sys.stdout = self.stdout_orig
         self.destroy()

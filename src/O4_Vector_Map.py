@@ -37,6 +37,7 @@ def _build_poly_file(tile):
     UI.logprint(
         "Step 1 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
     )
+    UI.progress_bar(1, 0, "Building vector data")
     UI.vprint(
         0,
         "\nStep 1 : Building vector data for tile "

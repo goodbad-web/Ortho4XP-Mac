@@ -30,7 +30,7 @@ def download_textures(tile, download_queue, convert_queue):
             return 1
         return 0
 
-    dico_dl_progress = {"done": 0, "bar": 2}
+    dico_dl_progress = {"done": 0, "bar": 2, "message": "Downloading textures"}
     dl_workers = parallel_launch(
         download_task,
         download_queue,
@@ -143,7 +143,7 @@ def _build_tile(tile):
         download_thread.start()
         download_launched = True
         if not skip_converts:
-            dico_conv_progress = {"done": 0, "bar": 3}
+            dico_conv_progress = {"done": 0, "bar": 3, "message": "Converting DDS textures"}
             convert_launched = True
     build_dsf_thread.join()
     if download_launched:
@@ -230,7 +230,7 @@ def _build_tile(tile):
                     elif os.path.exists(tmp_png):
                         input_path = tmp_png
                         temp_files_to_delete.append(tmp_png)
-                    elif jpeg_path and (os.path.exists(jpeg_path) or O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)):
+                    elif jpeg_path and IMG._jpeg_file_is_ready(jpeg_path):
                         input_path = jpeg_path
                     else:
                         UI.vprint(1, f"ERROR: Input source image not found for {out_file_name}")
@@ -279,7 +279,9 @@ def _build_tile(tile):
                         target_fmt
                     ])
                 
+                batch_attempted = False
                 if conversion_success and batch_args:
+                    batch_attempted = True
                     chunk_size = 64
                     for i in range(0, len(batch_args), chunk_size * 10):
                         chunk = batch_args[i:i + chunk_size * 10]
@@ -294,7 +296,21 @@ def _build_tile(tile):
                             UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
                             conversion_success = False
                             break
-                    
+                
+                if batch_attempted and not conversion_success:
+                    UI.vprint(1, "-> Falling back to CPU DDS conversion via ASHelper...")
+                    original_gpu = getattr(UI, 'use_gpu_acceleration', True)
+                    cpu_success_count = 0
+                    try:
+                        UI.use_gpu_acceleration = False
+                        for item in convert_list:
+                            cpu_success_count += IMG.convert_texture(*item)
+                    finally:
+                        UI.use_gpu_acceleration = original_gpu
+                    success_count = cpu_success_count
+                    conversion_success = (cpu_success_count == len(convert_list))
+
+                if conversion_success and batch_args:
                     for temp_file in temp_files_to_delete:
                         try:
                             os.remove(temp_file)

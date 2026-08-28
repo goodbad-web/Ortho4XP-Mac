@@ -84,6 +84,7 @@ def _build_masks(tile, for_imagery=False):
     UI.logprint(
         "Step 2.5 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
     )
+    UI.progress_bar(1, 0, "Building masks")
     UI.vprint(
         0,
         "\nStep 2.5 : Building masks for tile "
@@ -523,11 +524,16 @@ def blur_mask(img_array, tile, sea_level):
         # convolution with a hat function (using cv2.sepFilter2D for extreme speedup)
         kernel = numpy.array(list(range(1, blur_width)) + [blur_width] + list(range(blur_width - 1, 0, -1)), dtype=numpy.float32)
         kernel = kernel / (blur_width ** 2)
-        if getattr(tile, "use_gpu_for_masks", False):
-            gpu_img = cv2.UMat(img_array)
-            gpu_blurred = cv2.sepFilter2D(gpu_img, -1, kernel, kernel)
-            b_img_array = gpu_blurred.get()
-        else:
+        use_gpu = getattr(tile, "use_gpu_for_masks", False)
+        if use_gpu:
+            try:
+                gpu_img = cv2.UMat(img_array)
+                gpu_blurred = cv2.sepFilter2D(gpu_img, -1, kernel, kernel)
+                b_img_array = gpu_blurred.get()
+            except Exception as e:
+                UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                use_gpu = False
+        if not use_gpu:
             b_img_array = cv2.sepFilter2D(img_array, -1, kernel, kernel)
         b_img_array = 2 * numpy.minimum(b_img_array, 127)
         b_img_array = b_img_array.astype(numpy.uint8)
@@ -538,19 +544,27 @@ def blur_mask(img_array, tile, sea_level):
         sigma1 = blur_width / 1.7
         use_gpu = getattr(tile, "use_gpu_for_masks", False)
         if use_gpu:
-            gpu_img = cv2.UMat(img_array)
-            gpu_blurred1 = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
-            blurred1 = gpu_blurred1.get()
-        else:
+            try:
+                gpu_img = cv2.UMat(img_array)
+                gpu_blurred1 = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
+                blurred1 = gpu_blurred1.get()
+            except Exception as e:
+                UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                use_gpu = False
+        if not use_gpu:
             blurred1 = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma1, sigmaY=sigma1)
         b_img_array = (blurred1 > 0).astype(numpy.uint8) * 255
         # blur it
         sigma2 = blur_width
         if use_gpu:
-            gpu_b_img = cv2.UMat(b_img_array)
-            gpu_blurred2 = cv2.GaussianBlur(gpu_b_img, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
-            b_img_array = gpu_blurred2.get()
-        else:
+            try:
+                gpu_b_img = cv2.UMat(b_img_array)
+                gpu_blurred2 = cv2.GaussianBlur(gpu_b_img, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
+                b_img_array = gpu_blurred2.get()
+            except Exception as e:
+                UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                use_gpu = False
+        if not use_gpu:
             b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=sigma2, sigmaY=sigma2)
         # nonlinear transform to make the transition quicker at the shore 
         # (gaussian is too flat)
@@ -574,10 +588,14 @@ def blur_mask(img_array, tile, sea_level):
         # still some slight smoothing at the shore
         sigma3 = 2 ** (tile.mask_zl - 14)
         if use_gpu:
-            gpu_img = cv2.UMat(img_array)
-            gpu_smoothed_shore = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
-            smoothed_shore = gpu_smoothed_shore.get()
-        else:
+            try:
+                gpu_img = cv2.UMat(img_array)
+                gpu_smoothed_shore = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
+                smoothed_shore = gpu_smoothed_shore.get()
+            except Exception as e:
+                UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                use_gpu = False
+        if not use_gpu:
             smoothed_shore = cv2.GaussianBlur(img_array, (0, 0), sigmaX=sigma3, sigmaY=sigma3)
         b_img_array = numpy.maximum(b_img_array, smoothed_shore)
     # 3 steps
@@ -597,10 +615,14 @@ def blur_mask(img_array, tile, sea_level):
                 (i + 1) / stepsin, "parabolic"
             ) * (sea_level - shore_level)
             if use_gpu:
-                gpu_mask = cv2.UMat(b_mask_array)
-                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
-                blurred = gpu_blurred.get()
-            else:
+                try:
+                    gpu_mask = cv2.UMat(b_mask_array)
+                    gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
+                    blurred = gpu_blurred.get()
+                except Exception as e:
+                    UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                    use_gpu = False
+            if not use_gpu:
                 blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
             b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
@@ -610,19 +632,27 @@ def blur_mask(img_array, tile, sea_level):
         sea_b_radius_buffered = (midzone + transout) / 3
         if sea_b_radius_buffered > 0:
             if use_gpu:
-                gpu_mask = cv2.UMat(b_mask_array)
-                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
-                b_mask_array = gpu_blurred.get()
-            else:
+                try:
+                    gpu_mask = cv2.UMat(b_mask_array)
+                    gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
+                    b_mask_array = gpu_blurred.get()
+                except Exception as e:
+                    UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                    use_gpu = False
+            if not use_gpu:
                 b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=sea_b_radius_buffered, sigmaY=sea_b_radius_buffered)
             b_mask_array = (b_mask_array > 0).astype(numpy.uint8) * 255
         diff_radius = sea_b_radius_buffered - sea_b_radius
         if diff_radius > 0:
             if use_gpu:
-                gpu_mask = cv2.UMat(b_mask_array)
-                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
-                b_mask_array = gpu_blurred.get()
-            else:
+                try:
+                    gpu_mask = cv2.UMat(b_mask_array)
+                    gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
+                    b_mask_array = gpu_blurred.get()
+                except Exception as e:
+                    UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                    use_gpu = False
+            if not use_gpu:
                 b_mask_array = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=diff_radius, sigmaY=diff_radius)
             b_mask_array = (b_mask_array == 255).astype(numpy.uint8) * 255
         b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = sea_level
@@ -634,10 +664,14 @@ def blur_mask(img_array, tile, sea_level):
                 1 - transition_profile((i + 1) / stepsout, "linear")
             )
             if use_gpu:
-                gpu_mask = cv2.UMat(b_mask_array)
-                gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
-                blurred = gpu_blurred.get()
-            else:
+                try:
+                    gpu_mask = cv2.UMat(b_mask_array)
+                    gpu_blurred = cv2.GaussianBlur(gpu_mask, (0, 0), sigmaX=1, sigmaY=1)
+                    blurred = gpu_blurred.get()
+                except Exception as e:
+                    UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                    use_gpu = False
+            if not use_gpu:
                 blurred = cv2.GaussianBlur(b_mask_array, (0, 0), sigmaX=1, sigmaY=1)
             b_mask_array = (blurred > 0).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
@@ -645,10 +679,14 @@ def blur_mask(img_array, tile, sea_level):
         # To smoothen the thresolding introduced above we do a global short 
         # extent gaussian blur
         if use_gpu:
-            gpu_img = cv2.UMat(b_img_array)
-            gpu_blurred = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=2, sigmaY=2)
-            b_img_array = gpu_blurred.get()
-        else:
+            try:
+                gpu_img = cv2.UMat(b_img_array)
+                gpu_blurred = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=2, sigmaY=2)
+                b_img_array = gpu_blurred.get()
+            except Exception as e:
+                UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
+                use_gpu = False
+        if not use_gpu:
             b_img_array = cv2.GaussianBlur(b_img_array, (0, 0), sigmaX=2, sigmaY=2)
     else:
         # Just a (futile) copy

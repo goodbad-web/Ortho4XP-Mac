@@ -70,29 +70,17 @@ def dds_format_support_error(dds_converter, dds_format):
 
 if "dar" in sys.platform:
     # 1. Try native 'magick' (Apple Silicon optimization)
-    # We prioritize magick over textureconverter because the latter produces 
-    # DX10 headers that are incompatible with X-Plane 12's terrain engine.
+    # We prioritize magick over the bundled nvcompress fallback on macOS.
     magick_cmd = shutil.which("magick")
     if magick_cmd:
         dds_convert_cmd = magick_cmd
         use_magick = True
-        use_texture_converter = False
     else:
         use_magick = False
-        # 2. Try TextureConverter (Metal/GPU optimized)
-        try:
-            texture_converter = subprocess.check_output(["xcrun", "-f", "textureconverter"], text=True).strip()
-        except:
-            texture_converter = None
-        if texture_converter:
-            dds_convert_cmd = texture_converter
-            use_texture_converter = True
-        else:
-            use_texture_converter = False
-            use_magick = False
         dds_convert_cmd = os.path.join(
             UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
         )
+        use_texture_converter = False
     
     # Apple Silicon Helper for Neural Engine / Media Engine
     as_helper_cmd = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
@@ -1641,7 +1629,110 @@ def download_jpeg_ortho(
             e,
         )
         return 0
+    file_path = os.path.join(file_dir, file_name)
+    if zoomlevel > 16 and os.path.exists(file_path):
+        try:
+            if os.path.getsize(file_path) < 512000:
+                UI.vprint(
+                    1,
+                    f"   [Quality Check] {file_name} is small, trying ZL16 crop fallback.",
+                )
+                parent_zl = 16
+                diff = zoomlevel - parent_zl
+                factor = 2 ** diff
+                til_x_16 = til_x_left // factor
+                til_y_16 = til_y_top // factor
+                til_x_left_16 = (til_x_16 // 16) * 16
+                til_y_top_16 = (til_y_16 // 16) * 16
+                parent_file_name = FNAMES.jpeg_file_name_from_attributes(
+                    til_x_left_16,
+                    til_y_top_16,
+                    parent_zl,
+                    provider_code,
+                )
+                latmax, lonmin = GEO.gtile_to_wgs84(
+                    til_x_left, til_y_top, zoomlevel
+                )
+                parent_lat = int(floor(latmax))
+                parent_lon = int(floor(lonmin))
+                parent_file_dir = FNAMES.jpeg_file_dir_from_attributes(
+                    parent_lat,
+                    parent_lon,
+                    parent_zl,
+                    provider,
+                )
+                parent_file_path = os.path.join(
+                    parent_file_dir, parent_file_name
+                )
+                if not _jpeg_file_is_ready(parent_file_path):
+                    UI.vprint(
+                        1,
+                        f"   Downloading parent ZL16 orthophoto: {parent_file_name}",
+                    )
+                    download_jpeg_ortho(
+                        parent_file_dir,
+                        parent_file_name,
+                        til_x_left_16,
+                        til_y_top_16,
+                        parent_zl,
+                        provider_code,
+                    )
+                if _jpeg_file_is_ready(parent_file_path):
+                    with Image.open(parent_file_path) as parent_img:
+                        offset_x = (til_x_16 - til_x_left_16) * 256
+                        offset_y = (til_y_16 - til_y_top_16) * 256
+                        crop_size = factor * 256
+                        cropped = parent_img.crop(
+                            (
+                                offset_x,
+                                offset_y,
+                                offset_x + crop_size,
+                                offset_y + crop_size,
+                            )
+                        )
+                        high_quality_img = cropped.resize(
+                            (4096, 4096), Image.BICUBIC
+                        )
+                        high_quality_img.save(file_path, "JPEG", quality=90)
+                        UI.vprint(
+                            1,
+                            f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",
+                        )
+        except Exception as e:
+            UI.vprint(1, f"   [Quality Check] Failed to fallback: {e}")
     return 1
+
+
+################################################################################
+
+################################################################################
+def _jpeg_file_is_ready(jpeg_path):
+    if not jpeg_path:
+        return False
+    if not os.path.exists(jpeg_path):
+        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
+    if not os.path.isfile(jpeg_path):
+        return False
+    try:
+        with Image.open(jpeg_path) as im:
+            im.verify()
+        return True
+    except Exception:
+        try:
+            os.remove(jpeg_path)
+        except:
+            pass
+        if O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path):
+            try:
+                with Image.open(jpeg_path) as im:
+                    im.verify()
+                return True
+            except Exception:
+                try:
+                    os.remove(jpeg_path)
+                except:
+                    pass
+        return False
 
 
 ################################################################################
@@ -1703,8 +1794,7 @@ def build_jpeg_ortho(
                     providers_dict[rlayer["layer_code"]],
                 )
                 true_jpeg_path = os.path.join(true_file_dir, true_file_name)
-                O4_RAMDisk_Utils.check_and_restore_cached_image(true_jpeg_path)
-                if not os.path.isfile(true_jpeg_path):
+                if not _jpeg_file_is_ready(true_jpeg_path):
                     UI.vprint(
                         1,
                         "   Downloading missing orthophoto "
@@ -1773,8 +1863,7 @@ def build_jpeg_ortho(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
         jpeg_path = os.path.join(file_dir, file_name)
-        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
-        if not os.path.isfile(jpeg_path):
+        if not _jpeg_file_is_ready(jpeg_path):
             UI.vprint(1, "   Downloading missing orthophoto " + file_name)
             if not download_jpeg_ortho(
                 file_dir, file_name, *texture_attributes
@@ -2449,12 +2538,10 @@ def convert_texture(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
         jpeg_path = os.path.join(file_dir, jpeg_file_name)
-    
-    if jpeg_path:
-        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
+    jpeg_ready = _jpeg_file_is_ready(jpeg_path)
     is_combined = (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
-        or not jpeg_path or not os.path.exists(jpeg_path)
+        or not jpeg_ready
     )
     use_upscale = getattr(UI, 'use_neural_upscale', False)
     use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
@@ -2463,13 +2550,10 @@ def convert_texture(
     if use_gpu_batch and is_worker and not is_combined and not use_upscale and type == "dds":
         return 1
         
-    if provider_code in providers_dict:
-        file_to_convert = jpeg_path
-    if provider_code in providers_dict:
-        O4_RAMDisk_Utils.check_and_restore_cached_image(os.path.join(file_dir, jpeg_file_name))
+    file_to_convert = jpeg_path if (provider_code in providers_dict and jpeg_ready) else None
     if (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
-        or not os.path.exists(os.path.join(file_dir, jpeg_file_name))
+        or not jpeg_ready
     ):
         big_image = combine_textures(
             tile, til_x_left, til_y_top, zoomlevel, provider_code
@@ -2504,10 +2588,10 @@ def convert_texture(
         providers_dict[provider_code]["color_filters"] != "none"
     ) or masked_texture or (int(zoomlevel) >= 18):
         jpeg_full_path = os.path.join(file_dir, jpeg_file_name)
-        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_full_path)
-        big_image = Image.open(
-            jpeg_full_path, "r"
-        ).convert("RGB")
+        if not _jpeg_file_is_ready(jpeg_full_path):
+            UI.vprint(1, f"   ERROR: missing orthophoto {jpeg_file_name}")
+            return 0
+        big_image = Image.open(jpeg_full_path, "r").convert("RGB")
         if providers_dict[provider_code]["color_filters"] != "none":
             big_image = color_transform(
                 big_image, providers_dict[provider_code]["color_filters"]
@@ -2532,6 +2616,10 @@ def convert_texture(
         file_to_convert = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
         erase_tmp_png = True
         big_image.save(file_to_convert)
+
+    if file_to_convert is None:
+        UI.vprint(1, f"   ERROR: orthophoto source unavailable for {out_file_name}")
+        return 0
 
     # Optional AI Upscale using Neural Engine
     if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
@@ -2582,13 +2670,35 @@ def convert_texture(
             conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
             UI.vprint(2, f"      nvcompress: Converting texture to DDS ({fmt[1:].upper()})")
 
-        # Execute conversion
-        try:
-            retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            if retcode != 0:
+        tentative = 0
+        while True:
+            try:
+                retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            except Exception as e:
+                UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
+                return 0
+            if retcode == 0:
+                break
+
+            tentative += 1
+            if tentative == 10:
                 UI.vprint(1, f"      Error: DDS conversion failed with return code {retcode} ({dds_converter})")
-        except Exception as e:
-            UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
+                return 0
+
+            if "--gpu" in conv_cmd:
+                conv_cmd = [x for x in conv_cmd if x != "--gpu"]
+                UI.lvprint(
+                    1,
+                    "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
+                    out_file_path,
+                )
+            else:
+                UI.lvprint(
+                    1,
+                    "WARNING: Could not convert texture",
+                    out_file_path,
+                )
+            time.sleep(1 + random.uniform(-0.5, 0.5))
     else:
         (latmax, lonmin) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         (latmin, lonmax) = GEO.gtile_to_wgs84(
@@ -2663,39 +2773,39 @@ def convert_texture(
                 tmp_tif_file_name,
                 os.path.join(FNAMES.Geotiff_dir, out_file_name),
             ]
-    tentative = 0
-    while True:
-        if not subprocess.call(
-            conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        ):
-            break
-        tentative += 1
-        if tentative == 10:
-            UI.lvprint(
-                1,
-                "ERROR: Could not convert texture",
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                "(10 tries)",
-            )
-            break
-        
-        # CPU Fallback: If GPU-accelerated ASHelper failed, try without --gpu next
-        if "--gpu" in conv_cmd:
-            conv_cmd = [x for x in conv_cmd if x != "--gpu"]
-            UI.lvprint(
-                1,
-                "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
-                os.path.join(tile.build_dir, "textures", out_file_name),
-            )
-        else:
-            UI.lvprint(
-                1,
-                "WARNING: Could not convert texture",
-                os.path.join(tile.build_dir, "textures", out_file_name),
-            )
-        
-        # Add random jitter to avoid lockstep retry collisions among multiprocessing workers
-        time.sleep(1 + random.uniform(-0.5, 0.5))
+        tentative = 0
+        while True:
+            if not subprocess.call(
+                conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            ):
+                break
+            tentative += 1
+            if tentative == 10:
+                UI.lvprint(
+                    1,
+                    "ERROR: Could not convert texture",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                    "(10 tries)",
+                )
+                break
+
+            # CPU Fallback: If GPU-accelerated ASHelper failed, try without --gpu next
+            if "--gpu" in conv_cmd:
+                conv_cmd = [x for x in conv_cmd if x != "--gpu"]
+                UI.lvprint(
+                    1,
+                    "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                )
+            else:
+                UI.lvprint(
+                    1,
+                    "WARNING: Could not convert texture",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                )
+
+            # Add random jitter to avoid lockstep retry collisions among multiprocessing workers
+            time.sleep(1 + random.uniform(-0.5, 0.5))
     if erase_tmp_png:
         try:
             os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))

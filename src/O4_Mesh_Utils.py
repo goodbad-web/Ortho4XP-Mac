@@ -580,7 +580,7 @@ def _build_mesh(tile):
         + FNAMES.short_latlon(tile.lat, tile.lon)
         + " : \n--------\n",
     )
-    UI.progress_bar(1, 0)
+    UI.progress_bar(1, 0, "Building mesh")
     poly_file = FNAMES.input_poly_file(tile)
     node_file = FNAMES.input_node_file(tile)
     alt_file = FNAMES.alt_file(tile)

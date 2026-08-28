@@ -160,13 +160,13 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     for level in 0..<mtlTexture.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
         let sz = bW * bH * (mode == 0 ? 8 : 16)
-        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { break }
+        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { return nil }
         buffers.append(buf)
         
-        guard let enc = cmb.makeComputeCommandEncoder() else { break }
+        guard let enc = cmb.makeComputeCommandEncoder() else { return nil }
         var m = mode
         enc.setComputePipelineState(pipe)
-        let view = mtlTexture.makeTextureView(pixelFormat: mtlTexture.pixelFormat, textureType: mtlTexture.textureType, levels: level..<level+1, slices: 0..<1)
+        guard let view = mtlTexture.makeTextureView(pixelFormat: mtlTexture.pixelFormat, textureType: mtlTexture.textureType, levels: level..<level+1, slices: 0..<1) else { return nil }
         enc.setTexture(view, index: 0)
         enc.setBuffer(buf, offset: 0, index: 0)
         enc.setBytes(&m, length: 4, index: 1)
@@ -182,6 +182,95 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
         outData.append(Data(bytes: buf.contents(), count: buf.length))
     }
     return outData
+}
+
+func appendCPUCompressedDDS(finalCI: CIImage, bounds: CGRect, mode: UInt32, out: inout Data) -> Bool {
+    let ctx = CIContext(options: [.useSoftwareRenderer: false])
+    guard let cgImage = ctx.createCGImage(finalCI, from: bounds) else { return false }
+    let raw = getRawRGBA(cgImage: cgImage)
+    let w = Int(bounds.width)
+    let h = Int(bounds.height)
+    let bW = (w + 3) / 4
+    let bH = (h + 3) / 4
+    var dds = Data()
+    for by in 0..<bH {
+        for bx in 0..<bW {
+            if mode >= 1 {
+                var minA: UInt8 = 255
+                var maxA: UInt8 = 0
+                for i in 0..<16 {
+                    let a = raw[(min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4 + 3]
+                    minA = min(minA, a)
+                    maxA = max(maxA, a)
+                }
+                var ab = [UInt8](repeating: 0, count: 8)
+                ab[0] = maxA
+                ab[1] = minA
+                var ai: UInt64 = 0
+                let a0 = Double(maxA)
+                let a1 = Double(minA)
+                let step = (a0 - a1) / 7.0
+                for i in 0..<16 {
+                    let a = Double(raw[(min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4 + 3])
+                    var index: UInt64 = 0
+                    if a0 > a1 {
+                        var minDist = abs(a - a0)
+                        for j in 1...6 {
+                            let val = a0 - Double(j) * step
+                            let dist = abs(a - val)
+                            if dist < minDist { minDist = dist; index = UInt64(j + 1) }
+                        }
+                        if abs(a - a1) < minDist { index = 1 }
+                    }
+                    ai |= (index << (i * 3))
+                }
+                for i in 0..<6 { ab[i + 2] = UInt8((ai >> (i * 8)) & 0xFF) }
+                dds.append(contentsOf: ab)
+            }
+
+            var minC = (r: 255, g: 255, b: 255)
+            var maxC = (r: 0, g: 0, b: 0)
+            for i in 0..<16 {
+                let o = (min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4
+                let r = Int(raw[o]), g = Int(raw[o + 1]), b = Int(raw[o + 2])
+                if (r + g + b) < (minC.r + minC.g + minC.b) { minC = (r, g, b) }
+                if (r + g + b) > (maxC.r + maxC.g + maxC.b) { maxC = (r, g, b) }
+            }
+            let c0 = UInt16(((UInt32(maxC.r) >> 3) << 11) | ((UInt32(maxC.g) >> 2) << 5) | (UInt32(maxC.b) >> 3))
+            let c1 = UInt16(((UInt32(minC.r) >> 3) << 11) | ((UInt32(minC.g) >> 2) << 5) | (UInt32(minC.b) >> 3))
+            let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
+            let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
+            let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
+            let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
+            var blk = [UInt8](repeating: 0, count: 8)
+            blk[0] = UInt8(c0 & 0xFF)
+            blk[1] = UInt8(c0 >> 8)
+            blk[2] = UInt8(c1 & 0xFF)
+            blk[3] = UInt8(c1 >> 8)
+            var idx: UInt32 = 0
+            for i in 0..<16 {
+                let o = (min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4
+                let r = Double(raw[o]), g = Double(raw[o + 1]), b = Double(raw[o + 2])
+                let d0 = (r - r0) * (r - r0) + (g - g0) * (g - g0) + (b - b0) * (b - b0)
+                let d1 = (r - r1) * (r - r1) + (g - g1) * (g - g1) + (b - b1) * (b - b1)
+                let d2 = (r - r2) * (r - r2) + (g - g2) * (g - g2) + (b - b2) * (b - b2)
+                let d3 = (r - r3) * (r - r3) + (g - g3) * (g - g3) + (b - b3) * (b - b3)
+                var index: UInt32 = 0
+                var minDist = d0
+                if d1 < minDist { minDist = d1; index = 1 }
+                if d2 < minDist { minDist = d2; index = 2 }
+                if d3 < minDist { minDist = d3; index = 3 }
+                idx |= (index << (i * 2))
+            }
+            blk[4] = UInt8(idx & 0xFF)
+            blk[5] = UInt8((idx >> 8) & 0xFF)
+            blk[6] = UInt8((idx >> 16) & 0xFF)
+            blk[7] = UInt8((idx >> 24) & 0xFF)
+            dds.append(contentsOf: blk)
+        }
+    }
+    out.append(dds)
+    return true
 }
 
 func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
@@ -206,13 +295,13 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     for level in 0..<tex.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
         let sz = bW * bH * (mode == 0 ? 8 : 16)
-        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { break }
+        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { return nil }
         buffers.append(buf)
         
-        guard let enc = cmb.makeComputeCommandEncoder() else { break }
+        guard let enc = cmb.makeComputeCommandEncoder() else { return nil }
         var m = mode
         enc.setComputePipelineState(pipe)
-        let view = tex.makeTextureView(pixelFormat: tex.pixelFormat, textureType: tex.textureType, levels: level..<level+1, slices: 0..<1)
+        guard let view = tex.makeTextureView(pixelFormat: tex.pixelFormat, textureType: tex.textureType, levels: level..<level+1, slices: 0..<1) else { return nil }
         enc.setTexture(view, index: 0)
         enc.setBuffer(buf, offset: 0, index: 0)
         enc.setBytes(&m, length: 4, index: 1)
@@ -319,17 +408,54 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     var hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
     var out = hdr.toData()
     if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-    
+    var compressed = false
     if useGPU, let gData = compressWithPreprocessedCIImage(finalCI: finalCI, mode: formatCode, useGPU: useGPU) {
         out.append(gData)
-    } else {
-        // Fallback for CPU (CPU manual compression)
-        let ctx = CIContext(options: [.useSoftwareRenderer: false])
-        guard let cgImage = ctx.createCGImage(finalCI, from: bounds) else { exit(1) }
+        compressed = true
+    }
+    if !compressed {
         hdr.mipmapCount = 1
         out = hdr.toData()
         if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-        let raw = getRawRGBA(cgImage: cgImage)
+        if !appendCPUCompressedDDS(finalCI: finalCI, bounds: bounds, mode: formatCode, out: &out) {
+            exit(1)
+        }
+    }
+    
+    try? out.write(to: URL(fileURLWithPath: outputPath))
+}
+
+func upscale(inputPath: String, outputPath: String) {
+    let url = URL(fileURLWithPath: inputPath); guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else { exit(1) }
+    f.setValue(ci, forKey: kCIInputImageKey); f.setValue(2.0, forKey: kCIInputScaleKey)
+    guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else { exit(1) }
+    let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outputPath) as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(dest, cg, nil); CGImageDestinationFinalize(dest)
+}
+
+func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) {
+    guard format != "BC7" else {
+        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
+    }
+    let url = URL(fileURLWithPath: inputPath); guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { exit(1) }
+    let w = img.width; let h = img.height; let isBC7 = (format == "BC7"); let isBC3 = (format == "BC3")
+    let formatCode: UInt32 = isBC7 ? 2 : (isBC3 ? 1 : 0)
+    let mipCount = UInt32(floor(log2(Double(max(w, h)))) + 1)
+    let sz = UInt32(((w + 3) / 4) * ((h + 3) / 4) * (formatCode == 0 ? 8 : 16))
+    var hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
+    var out = hdr.toData()
+    if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
+
+    var compressed = false
+    if useGPU, let gData = compressWithMipmaps(cgImage: img, mode: formatCode) {
+        out.append(gData)
+        compressed = true
+    }
+    if !compressed {
+        hdr.mipmapCount = 1
+        out = hdr.toData()
+        if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
+        let raw = getRawRGBA(cgImage: img)
         var dds = Data()
         let bW = (w+3)/4
         let bH = (h+3)/4
@@ -359,90 +485,12 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
             for i in 0..<16 { let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4; let r=Int(raw[o]),g=Int(raw[o+1]),b=Int(raw[o+2]); if (r+g+b)<(minC.r+minC.g+minC.b){minC=(r,g,b)}; if (r+g+b)>(maxC.r+maxC.g+maxC.b){maxC=(r,g,b)} }
             let c0=UInt16(((UInt32(maxC.r)>>3)<<11)|((UInt32(maxC.g)>>2)<<5)|(UInt32(maxC.b)>>3))
             let c1=UInt16(((UInt32(minC.r)>>3)<<11)|((UInt32(minC.g)>>2)<<5)|(UInt32(minC.b)>>3))
-            
+
             let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
             let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
             let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
             let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
-            
-            var blk=[UInt8](repeating:0,count:8); blk[0]=UInt8(c0&0xFF); blk[1]=UInt8(c0>>8); blk[2]=UInt8(c1&0xFF); blk[3]=UInt8(c1>>8); var idx:UInt32=0
-            for i in 0..<16 {
-                let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4
-                let r=Double(raw[o]), g=Double(raw[o+1]), b=Double(raw[o+2])
-                let d0 = (r-r0)*(r-r0) + (g-g0)*(g-g0) + (b-b0)*(b-b0)
-                let d1 = (r-r1)*(r-r1) + (g-g1)*(g-g1) + (b-b1)*(b-b1)
-                let d2 = (r-r2)*(r-r2) + (g-g2)*(g-g2) + (b-b2)*(b-b2)
-                let d3 = (r-r3)*(r-r3) + (g-g3)*(g-g3) + (b-b3)*(b-b3)
-                var index: UInt32 = 0
-                var minDist = d0
-                if d1 < minDist { minDist = d1; index = 1 }
-                if d2 < minDist { minDist = d2; index = 2 }
-                if d3 < minDist { minDist = d3; index = 3 }
-                idx |= (index << (i * 2))
-            }
-            blk[4]=UInt8(idx&0xFF); blk[5]=UInt8((idx>>8)&0xFF); blk[6]=UInt8((idx>>16)&0xFF); blk[7]=UInt8((idx>>24)&0xFF); dds.append(contentsOf: blk)
-        }}
-        out.append(dds)
-    }
-    
-    try? out.write(to: URL(fileURLWithPath: outputPath))
-}
 
-func upscale(inputPath: String, outputPath: String) {
-    let url = URL(fileURLWithPath: inputPath); guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else { exit(1) }
-    f.setValue(ci, forKey: kCIInputImageKey); f.setValue(2.0, forKey: kCIInputScaleKey)
-    guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else { exit(1) }
-    let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outputPath) as CFURL, UTType.png.identifier as CFString, 1, nil)!
-    CGImageDestinationAddImage(dest, cg, nil); CGImageDestinationFinalize(dest)
-}
-
-func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) {
-    guard format != "BC7" else {
-        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
-    }
-    let url = URL(fileURLWithPath: inputPath); guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { exit(1) }
-    let w = img.width; let h = img.height; let isBC7 = (format == "BC7"); let isBC3 = (format == "BC3")
-    let formatCode: UInt32 = isBC7 ? 2 : (isBC3 ? 1 : 0)
-    let mipCount = UInt32(floor(log2(Double(max(w, h)))) + 1)
-    let sz = UInt32(((w + 3) / 4) * ((h + 3) / 4) * (formatCode == 0 ? 8 : 16))
-    var hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
-    var out = hdr.toData(); if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-    if useGPU, let gData = compressWithMipmaps(cgImage: img, mode: formatCode) { out.append(gData) }
-    else {
-        hdr.mipmapCount = 1; out = hdr.toData(); if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-        let raw = getRawRGBA(cgImage: img); var dds = Data(); let bW = (w+3)/4; let bH = (h+3)/4
-        for by in 0..<bH { for bx in 0..<bW {
-            if formatCode >= 1 {
-                var minA: UInt8 = 255; var maxA: UInt8 = 0
-                for i in 0..<16 { let a = raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3]; minA=min(minA,a); maxA=max(maxA,a) }
-                var ab=[UInt8](repeating:0,count:8); ab[0]=maxA; ab[1]=minA; var ai:UInt64=0
-                let a0 = Double(maxA); let a1 = Double(minA); let step = (a0 - a1) / 7.0
-                for i in 0..<16 {
-                    let a = Double(raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3])
-                    var index: UInt64 = 0
-                    if a0 > a1 {
-                        var minDist = abs(a - a0)
-                        for j in 1...6 {
-                            let val = a0 - Double(j) * step
-                            let dist = abs(a - val)
-                            if dist < minDist { minDist = dist; index = UInt64(j + 1) }
-                        }
-                        if abs(a - a1) < minDist { index = 1 }
-                    }
-                    ai |= (index << (i * 3))
-                }
-                for i in 0..<6 { ab[i+2] = UInt8((ai >> (i * 8)) & 0xFF) }; dds.append(contentsOf: ab)
-            }
-            var minC=(r:255,g:255,b:255); var maxC=(r:0,g:0,b:0)
-            for i in 0..<16 { let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4; let r=Int(raw[o]),g=Int(raw[o+1]),b=Int(raw[o+2]); if (r+g+b)<(minC.r+minC.g+minC.b){minC=(r,g,b)}; if (r+g+b)>(maxC.r+maxC.g+maxC.b){maxC=(r,g,b)} }
-            let c0=UInt16(((UInt32(maxC.r)>>3)<<11)|((UInt32(maxC.g)>>2)<<5)|(UInt32(maxC.b)>>3))
-            let c1=UInt16(((UInt32(minC.r)>>3)<<11)|((UInt32(minC.g)>>2)<<5)|(UInt32(minC.b)>>3))
-            
-            let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
-            let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
-            let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
-            let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
-            
             var blk=[UInt8](repeating:0,count:8); blk[0]=UInt8(c0&0xFF); blk[1]=UInt8(c0>>8); blk[2]=UInt8(c1&0xFF); blk[3]=UInt8(c1>>8); var idx:UInt32=0
             for i in 0..<16 {
                 let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4
@@ -465,11 +513,19 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
     try? out.write(to: URL(fileURLWithPath: outputPath))
 }
 
-let args = ProcessInfo.processInfo.arguments; if args.count < 4 { exit(1) }
-if args[1] == "--upscale" { upscale(inputPath: args[2], outputPath: args[3]) }
-else if args[1] == "--convert" { convert(inputPath: args[2], outputPath: args[3], format: args.count > 4 ? args[4] : "BC3", useGPU: args.contains("--gpu")) }
+let args = ProcessInfo.processInfo.arguments
+guard args.count >= 2 else { fail("ASHelper: missing command.") }
+if args[1] == "--upscale" {
+    guard args.count == 4 else { fail("ASHelper: --upscale expects input and output paths.") }
+    upscale(inputPath: args[2], outputPath: args[3])
+}
+else if args[1] == "--convert" {
+    guard args.count >= 4 else { fail("ASHelper: --convert expects input and output paths.") }
+    convert(inputPath: args[2], outputPath: args[3], format: args.count > 4 ? args[4] : "BC3", useGPU: args.contains("--gpu"))
+}
 else if args[1] == "--convert-batch" {
-    guard args.count >= 6 else { exit(1) }
+    guard args.count >= 6 else { fail("ASHelper: --convert-batch expects a format, GPU flag, and at least one pair.") }
+    guard (args.count - 4) % 2 == 0 else { fail("ASHelper: --convert-batch argument count is invalid.") }
     let format = args[2]
     guard format != "BC7" else {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
@@ -482,7 +538,8 @@ else if args[1] == "--convert-batch" {
     }
 }
 else if args[1] == "--convert-batch-v2" {
-    guard args.count >= 6 else { exit(1) }
+    guard args.count >= 6 else { fail("ASHelper: --convert-batch-v2 expects a GPU flag and at least one triplet.") }
+    guard (args.count - 3) % 3 == 0 else { fail("ASHelper: --convert-batch-v2 argument count is invalid.") }
     let useGPU = args[2] == "true"
     var idx = 3
     while idx + 2 < args.count {
@@ -491,7 +548,8 @@ else if args[1] == "--convert-batch-v2" {
     }
 }
 else if args[1] == "--convert-batch-v3" {
-    guard args.count >= 12 else { exit(1) }
+    guard args.count >= 13 else { fail("ASHelper: --convert-batch-v3 expects a GPU flag and at least one task.") }
+    guard (args.count - 3) % 10 == 0 else { fail("ASHelper: --convert-batch-v3 argument count is invalid.") }
     let useGPU = args[2] == "true"
     
     struct BatchTask {
