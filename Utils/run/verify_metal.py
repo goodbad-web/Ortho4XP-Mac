@@ -335,7 +335,7 @@ def main() -> int:
     try:
         import PIL  # noqa: F401
     except ImportError as error:
-        fail(f"Pillow is required; use .venv-test or set ORTHO4XP_PYTHON: {error}")
+        fail(f"Pillow is required; run ./install_mac.sh or set ORTHO4XP_PYTHON: {error}")
 
     metal_available, probe_output, host_metal_supported = parse_probe(args.probe)
     artifact_dir = Path(tempfile.mkdtemp(prefix="ortho4xp-metal-"))

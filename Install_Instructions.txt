@@ -84,4 +84,4 @@ cd /path/to/Ortho4XP
 ./install_mac.sh
 
 4) Launch Ortho4XP
-python3 Ortho4XP.py
+.venv/bin/python Ortho4XP.py

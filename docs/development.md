@@ -6,11 +6,10 @@
 
 ```sh
 ./install_mac.sh
-source .venv/bin/activate
-python3 Ortho4XP.py
+.venv/bin/python Ortho4XP.py
 ```
 
-`Ortho4XP.py` を引数なしで起動するとGUI、`python3 Ortho4XP.py <lat> <lon>` では既存タイル設定、`python3 Ortho4XP.py <lat> <lon> <imagery> <zl>` では指定値でCLI処理を行う。
+`Ortho4XP.py` を引数なしで起動するとGUI、`.venv/bin/python Ortho4XP.py <lat> <lon>` では既存タイル設定、`.venv/bin/python Ortho4XP.py <lat> <lon> <imagery> <zl>` では指定値でCLI処理を行う。繰り返し起動する場合は `source .venv/bin/activate` の後に `python Ortho4XP.py` としてもよい。
 
 `GDAL`等のネイティブ依存関係はHomebrew側のバージョンとの整合が必要である。OS別の利用者向け説明は `Install_Instructions.txt` に残すが、起動ファイルは実在する `Ortho4XP.py` を使う。
 
@@ -27,13 +26,13 @@ cmake --build Utils/build
 
 ```sh
 cd Utils
-python3 run/configure.py mac release
-python3 run/build.py mac release
+../.venv/bin/python run/configure.py mac release
+../.venv/bin/python run/build.py mac release
 ```
 
 `mac` は `lin` または `win` に置き換えられる。
 
-`python3 run/install.py release` は `build/release/{lin,mac,win}/` の成果物を各 `Utils/` 配下へコピーするため、必要な対象をすべてビルドしてから実行する。
+`../.venv/bin/python run/install.py release` は `build/release/{lin,mac,win}/` の成果物を各 `Utils/` 配下へコピーするため、必要な対象をすべてビルドしてから実行する。
 
 ## Swift補助ツール
 

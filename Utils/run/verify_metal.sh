@@ -24,21 +24,13 @@ xcrun swiftc \
     -framework CoreImage \
     -framework Metal
 
-python_bin="${ORTHO4XP_PYTHON:-}"
-if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
-    for candidate in \
-        "${repo_root}/.venv-test/bin/python" \
-        "${repo_root}/.venv/bin/python" \
-        "$(command -v python3 || true)"; do
-        if [[ -n "${candidate}" && -x "${candidate}" ]]; then
-            python_bin="${candidate}"
-            break
-        fi
-    done
-fi
-
-if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
-    echo "Python 3 with Pillow was not found. Set ORTHO4XP_PYTHON." >&2
+python_bin="${ORTHO4XP_PYTHON:-${repo_root}/.venv/bin/python}"
+if [[ ! -x "${python_bin}" ]]; then
+    if [[ -n "${ORTHO4XP_PYTHON:-}" ]]; then
+        echo "ORTHO4XP_PYTHON is not executable: ${python_bin}" >&2
+    else
+        echo "Python 3 with Pillow was not found at ${repo_root}/.venv/bin/python. Run ./install_mac.sh or set ORTHO4XP_PYTHON." >&2
+    fi
     exit 1
 fi
 
