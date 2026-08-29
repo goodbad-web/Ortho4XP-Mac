@@ -451,7 +451,7 @@ def main() -> int:
                 [str(args.helper), "--convert-batch-v3", "false", *cpu_tasks],
                 batch_cpu_outputs,
                 False,
-                True,
+                False,
             ),
             (
                 "batch-v3 GPU",
