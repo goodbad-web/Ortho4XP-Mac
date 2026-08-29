@@ -23,7 +23,7 @@ def fail(message: str) -> None:
     raise SystemExit(f"FAIL: {message}")
 
 
-def parse_probe(probe: Path) -> tuple[bool, str]:
+def parse_probe(probe: Path) -> tuple[bool, str, bool]:
     result = subprocess.run(
         [str(probe)],
         check=False,
@@ -36,10 +36,24 @@ def parse_probe(probe: Path) -> tuple[bool, str]:
     if result.returncode != 0:
         fail(f"Metal probe failed with exit {result.returncode}")
     available = "metal_available=true" in result.stdout.splitlines()
-    return available, result.stdout
+    host_metal_supported = False
+    if not available and sys.platform == "darwin":
+        host_result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        host_metal_supported = "Metal: Supported" in host_result.stdout
+        if host_metal_supported:
+            print("metal_host_supported=true")
+            print("metal_process_access=unavailable")
+            print("hint=run this script outside the host sandbox to exercise Metal")
+    return available, result.stdout, host_metal_supported
 
 
-def make_fixtures(directory: Path) -> tuple[Path, Path]:
+def make_fixtures(directory: Path) -> tuple[Path, Path, Path]:
     try:
         from PIL import Image, ImageDraw
     except ImportError as error:
@@ -73,7 +87,18 @@ def make_fixtures(directory: Path) -> tuple[Path, Path]:
     mask_draw.line((0, 0, 127, 127), fill=64, width=3)
     mask_path = directory / "low_resolution_mask.png"
     mask.save(mask_path, format="PNG")
-    return source, mask_path
+
+    # Keep an alpha-channel version to distinguish a low-resolution scaling
+    # problem from CIBlendWithAlphaMask's channel semantics. The production
+    # mask files are L-mode grayscale images, so this is a control case.
+    alpha_mask = Image.new("RGBA", (128, 128), (255, 255, 255, 0))
+    alpha_mask_draw = ImageDraw.Draw(alpha_mask)
+    alpha_mask_draw.rectangle((64, 0, 127, 127), fill=(255, 255, 255, 255))
+    alpha_mask_draw.rectangle((24, 24, 40, 104), fill=(255, 255, 255, 128))
+    alpha_mask_draw.line((0, 0, 127, 127), fill=(255, 255, 255, 64), width=3)
+    alpha_mask_path = directory / "low_resolution_alpha_mask.png"
+    alpha_mask.save(alpha_mask_path, format="PNG")
+    return source, mask_path, alpha_mask_path
 
 
 def dds_info(path: Path) -> dict[str, Any]:
@@ -208,6 +233,16 @@ def alpha_profile(info: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def rgb_mean(info: dict[str, Any]) -> tuple[float, float, float]:
+    rgba = decode_bc3_base(info)
+    pixel_count = len(rgba) * len(rgba[0])
+    return tuple(
+        sum(pixel[channel] for row in rgba for pixel in row)
+        / pixel_count
+        for channel in range(3)
+    )
+
+
 def run_command(label: str, command: list[str]) -> subprocess.CompletedProcess[str]:
     print(f"--- {label} ---")
     rendered_command = shlex.join(command)
@@ -302,20 +337,21 @@ def main() -> int:
     except ImportError as error:
         fail(f"Pillow is required; use .venv-test or set ORTHO4XP_PYTHON: {error}")
 
-    metal_available, probe_output = parse_probe(args.probe)
+    metal_available, probe_output, host_metal_supported = parse_probe(args.probe)
     artifact_dir = Path(tempfile.mkdtemp(prefix="ortho4xp-metal-"))
     print(f"artifacts={artifact_dir}")
     overall_ok = True
     report: dict[str, Any] = {
         "helper": str(args.helper),
         "metal_available": metal_available,
+        "host_metal_supported": host_metal_supported,
         "probe": probe_output,
         "batch_count": args.batch_count,
         "cases": [],
     }
 
     try:
-        source, mask = make_fixtures(artifact_dir)
+        source, mask, alpha_mask = make_fixtures(artifact_dir)
         upscale_path = artifact_dir / "source_upscaled.png"
         upscale_result = run_command(
             "upscale fixture",
@@ -438,12 +474,92 @@ def main() -> int:
             report["cases"].append({"label": label, "status": status, "outputs": infos})
             overall_ok = overall_ok and status.startswith(("PASS", "SKIP"))
 
+        # A filtered task and the unfiltered direct GPU task use the same
+        # source and dimensions. Their decoded base-level means should differ
+        # when CIColorControls/CIColorMatrix were actually applied.
+        if len(batch_gpu_outputs) > 1 and direct_gpu.is_file() and batch_gpu_outputs[1].is_file():
+            raw_mean = rgb_mean(dds_info(direct_gpu))
+            filtered_mean = rgb_mean(dds_info(batch_gpu_outputs[1]))
+            color_delta = max(
+                abs(raw_mean[channel] - filtered_mean[channel]) for channel in range(3)
+            )
+            color_status = "PASS" if color_delta >= 2.0 else "FAIL(no color effect detected)"
+            print(
+                "GPU color effect="
+                f"{color_status} raw={json.dumps(raw_mean)} "
+                f"filtered={json.dumps(filtered_mean)} delta={color_delta:.3f}"
+            )
+            report["gpu_color_effect"] = {
+                "status": color_status,
+                "raw_mean": raw_mean,
+                "filtered_mean": filtered_mean,
+                "max_channel_delta": color_delta,
+            }
+            if color_status != "PASS" and metal_available:
+                overall_ok = False
+
+        alpha_mask_output = artifact_dir / "batch_gpu_alpha_mask.dds"
+        alpha_mask_result = run_command(
+            "batch-v3 GPU alpha-channel control",
+            [
+                str(args.helper),
+                "--convert-batch-v3",
+                "true",
+                str(high_res_source),
+                str(alpha_mask),
+                "1.0",
+                "1.0",
+                "1.0",
+                "1.0",
+                "0.0",
+                "1.0",
+                str(alpha_mask_output),
+                "BC3",
+            ],
+        )
+        alpha_status, alpha_infos = check_outputs(
+            [alpha_mask_output],
+            metal_available=metal_available,
+            require_mipmaps=metal_available,
+            allow_skip_without_metal=True,
+            result=alpha_mask_result,
+        )
+        alpha_profile_result: dict[str, Any] | None = None
+        if alpha_mask_output.is_file():
+            try:
+                alpha_profile_result = alpha_profile(dds_info(alpha_mask_output))
+                if not (
+                    alpha_profile_result["left_mean"] <= 96
+                    and alpha_profile_result["right_mean"] >= 192
+                ):
+                    alpha_status = "FAIL(alpha channel control profile)"
+                    if metal_available:
+                        overall_ok = False
+            except (ValueError, IndexError) as error:
+                alpha_status = f"FAIL({error})"
+                if metal_available:
+                    overall_ok = False
+        print(
+            "alpha-channel control="
+            f"{alpha_status} profile={json.dumps(alpha_profile_result, sort_keys=True)}"
+        )
+        report["cases"].append(
+            {
+                "label": "batch-v3 GPU alpha-channel control",
+                "status": alpha_status,
+                "outputs": alpha_infos,
+                "alpha_profile": alpha_profile_result,
+            }
+        )
+        overall_ok = overall_ok and alpha_status.startswith(("PASS", "SKIP"))
+
         # The first task deliberately uses a low-resolution mask against the
         # upscaled source. Inspect the decoded BC3 alpha away from the edge.
         for label, output in (
             ("batch CPU preprocessing", batch_cpu_outputs[0]),
             ("batch-v3 GPU", batch_gpu_outputs[0]),
         ):
+            mask_status = "FAIL"
             if not output.is_file():
                 continue
             try:
@@ -451,13 +567,19 @@ def main() -> int:
             except (ValueError, IndexError) as error:
                 profile = {"error": str(error)}
             else:
-                if not (
+                mask_passed = (
                     profile["left_mean"] <= 64
                     and profile["right_mean"] >= 192
-                ):
-                    overall_ok = False if metal_available else overall_ok
+                )
+                mask_status = "PASS" if mask_passed else "FAIL(grayscale mask profile)"
+                if not mask_passed and metal_available:
+                    overall_ok = False
             print(f"{label} mask alpha={json.dumps(profile, sort_keys=True)}")
             report.setdefault("mask_alpha", {})[label] = profile
+            report.setdefault("mask_alpha_checks", {})[label] = {
+                "status": mask_status,
+                "profile": profile,
+            }
 
         if upscale_path.is_file():
             for label, output in (

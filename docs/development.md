@@ -60,6 +60,6 @@ Metalを使えるApple Silicon MacでGPU経路を確認する場合は、決定�
 ./Utils/run/verify_metal.sh --keep-artifacts
 ```
 
-この検証はMetalデバイス、Core ImageのMetalコンテキスト、ASHelperの直接変換、`--convert-batch-v3` の64件並列変換、DDSのヘッダ・Mip数・マスク透明度、DDS書き込み失敗時の終了コードを確認する。`--keep-artifacts` を省略すると、成功時の生成物は終了時に削除される。失敗時は調査用に生成物を残し、出力された `kept_artifacts` を確認できる。MetalデバイスがないMacではCPU/fallbackの確認だけを行い、GPU固有の判定はスキップする。実データのタイル生成・GUI操作は既存の手動確認範囲であり、このランナーには含めない。
+この検証はMetalデバイス、Core ImageのMetalコンテキスト、ASHelperの直接変換、`--convert-batch-v3` の64件並列変換、DDSのヘッダ・Mip数・マスク透明度、色補正の作用、DDS書き込み失敗時の終了コードを確認する。`--keep-artifacts` を省略すると、成功時の生成物は終了時に削除される。失敗時は調査用に生成物を残し、出力された `kept_artifacts` を確認できる。Metal対応ホストでも実行プロセスのサンドボックスからデバイスが見えない場合があり、その場合は `metal_host_supported=true` と表示されるため、ホストのターミナルなど隔離されていないCLIから再実行する。MetalデバイスがないMacではCPU/fallbackの確認だけを行い、GPU固有の判定はスキップする。実データのタイル生成・GUI操作は既存の手動確認範囲であり、このランナーには含めない。
 
 構文確認、ビルド、限定的なスクリプト実行だけでは、実際のProvider応答、長時間のタイル生成、GUI操作、利用者データへの影響まで保証しない。未実行の範囲を最終報告に明記する。
