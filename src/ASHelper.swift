@@ -22,11 +22,36 @@ struct DDSHeaderDX10 {
     func toData() -> Data { var d = Data(); var t = self; withUnsafeBytes(of: &t) { d.append(contentsOf: $0) }; return d }
 }
 
-func fail(_ message: String) -> Never {
+let stderrLock = NSLock()
+
+func reportError(_ message: String) {
+    stderrLock.lock()
+    defer { stderrLock.unlock() }
     if let data = (message + "\n").data(using: .utf8) {
         FileHandle.standardError.write(data)
     }
+}
+
+func fail(_ message: String) -> Never {
+    reportError(message)
     exit(1)
+}
+
+final class BatchFailureState {
+    private let lock = NSLock()
+    private var failed = false
+
+    func recordFailure() {
+        lock.lock()
+        failed = true
+        lock.unlock()
+    }
+
+    func hasFailure() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
 }
 
 let metalSource = """
@@ -111,9 +136,47 @@ class MetalCompressor {
     }
 }
 
+struct CachedMask {
+    let image: CIImage
+    let hasExplicitAlpha: Bool
+}
+
 // Memory Cache for mask images to eliminate repetitive disk I/O
 let maskCacheLock = NSLock()
-var maskCache: [String: CIImage] = [:]
+var maskCache: [String: CachedMask] = [:]
+
+func imageHasExplicitAlpha(at url: URL) -> Bool? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        return nil
+    }
+
+    switch image.alphaInfo {
+    case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly:
+        return true
+    case .none, .noneSkipFirst, .noneSkipLast:
+        return false
+    @unknown default:
+        return nil
+    }
+}
+
+@discardableResult
+func writeDDS(_ data: Data, to outputPath: String) -> Bool {
+    do {
+        try data.write(
+            to: URL(fileURLWithPath: outputPath),
+            options: .atomic
+        )
+        return true
+    } catch {
+        reportError(
+            "ASHelper: Failed to write DDS '\(outputPath)': "
+            + error.localizedDescription
+        )
+        return false
+    }
+}
 
 func getRawRGBA(cgImage: CGImage) -> [UInt8] {
     let w = cgImage.width; let h = cgImage.height
@@ -319,55 +382,99 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     return outData
 }
 
-func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Double, b: Double, contrast: Double, brightness: Double, saturation: Double, outputPath: String, format: String, useGPU: Bool) {
+func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Double, b: Double, contrast: Double, brightness: Double, saturation: Double, outputPath: String, format: String, useGPU: Bool) -> Bool {
     guard format != "BC7" else {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
     }
     let jpegURL = URL(fileURLWithPath: jpegPath)
-    guard let srcCI = CIImage(contentsOf: jpegURL) else { exit(1) }
+    guard let srcCI = CIImage(contentsOf: jpegURL) else {
+        reportError("ASHelper: Failed to load source image '\(jpegPath)'.")
+        return false
+    }
     var finalCI = srcCI
     
     // 1. Blend mask if present (via in-memory Mask Cache)
     if maskPath != "none" && maskPath != "" {
-        var maskCI: CIImage? = nil
+        let maskURL = URL(fileURLWithPath: maskPath)
+        var cachedMask: CachedMask? = nil
         maskCacheLock.lock()
         if let cached = maskCache[maskPath] {
-            maskCI = cached
+            cachedMask = cached
             maskCacheLock.unlock()
         } else {
             maskCacheLock.unlock()
-            if FileManager.default.fileExists(atPath: maskPath), let loaded = CIImage(contentsOf: URL(fileURLWithPath: maskPath)) {
+            if FileManager.default.fileExists(atPath: maskPath),
+               let loaded = CIImage(contentsOf: maskURL),
+               let hasExplicitAlpha = imageHasExplicitAlpha(at: maskURL) {
+                let entry = CachedMask(image: loaded, hasExplicitAlpha: hasExplicitAlpha)
                 maskCacheLock.lock()
-                maskCache[maskPath] = loaded
-                maskCI = loaded
+                maskCache[maskPath] = entry
+                cachedMask = entry
                 maskCacheLock.unlock()
             }
         }
-        
-        if let mCI = maskCI {
-            // [Fix] Scale the mask to match the high-resolution source image (srcCI) extent,
-            // preventing CIBlendWithAlphaMask from downscaling finalCI to the mask's low resolution.
-            let scaleX = srcCI.extent.width / mCI.extent.width
-            let scaleY = srcCI.extent.height / mCI.extent.height
-            var resizedMask = mCI
-            if scaleX != 1.0 || scaleY != 1.0 {
-                let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
-                scaleFilter.setValue(mCI, forKey: kCIInputImageKey)
-                scaleFilter.setValue(scaleX, forKey: kCIInputScaleKey)
-                scaleFilter.setValue(scaleY / scaleX, forKey: "inputAspectRatio")
-                if let scaled = scaleFilter.outputImage {
-                    let originReset = scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.origin.x, y: -scaled.extent.origin.y))
-                    resizedMask = originReset.cropped(to: srcCI.extent)
-                }
-            }
-            
-            let blendFilter = CIFilter(name: "CIBlendWithAlphaMask")!
-            blendFilter.setValue(srcCI, forKey: kCIInputImageKey)
-            blendFilter.setValue(resizedMask, forKey: kCIInputMaskImageKey)
-            if let blended = blendFilter.outputImage {
-                finalCI = blended
-            }
+
+        guard let cachedMask else {
+            reportError("ASHelper: Failed to load mask image '\(maskPath)'.")
+            return false
         }
+
+        let mCI = cachedMask.image
+        guard mCI.extent.width > 0, mCI.extent.height > 0 else {
+            reportError("ASHelper: Mask image '\(maskPath)' has an invalid extent.")
+            return false
+        }
+
+        // Scale the mask to match the high-resolution source image extent,
+        // preventing CIBlendWithAlphaMask from downscaling finalCI to the mask's low resolution.
+        let scaleX = srcCI.extent.width / mCI.extent.width
+        let scaleY = srcCI.extent.height / mCI.extent.height
+        var resizedMask = mCI
+        if scaleX != 1.0 || scaleY != 1.0 {
+            guard let scaleFilter = CIFilter(name: "CILanczosScaleTransform") else {
+                reportError("ASHelper: Failed to create the mask scaling filter.")
+                return false
+            }
+            scaleFilter.setValue(mCI, forKey: kCIInputImageKey)
+            scaleFilter.setValue(scaleX, forKey: kCIInputScaleKey)
+            scaleFilter.setValue(scaleY / scaleX, forKey: "inputAspectRatio")
+            guard let scaled = scaleFilter.outputImage else {
+                reportError("ASHelper: Failed to scale mask image '\(maskPath)'.")
+                return false
+            }
+            let originReset = scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.origin.x, y: -scaled.extent.origin.y))
+            resizedMask = originReset.cropped(to: srcCI.extent)
+        }
+
+        let maskForBlend: CIImage
+        if cachedMask.hasExplicitAlpha {
+            // RGBA (and alpha-only) masks already carry the control alpha.
+            maskForBlend = resizedMask
+        } else {
+            // L/grayscale masks carry their control value as luminance, not alpha.
+            guard let maskToAlpha = CIFilter(name: "CIMaskToAlpha") else {
+                reportError("ASHelper: Failed to create the grayscale mask conversion filter.")
+                return false
+            }
+            maskToAlpha.setValue(resizedMask, forKey: kCIInputImageKey)
+            guard let convertedMask = maskToAlpha.outputImage else {
+                reportError("ASHelper: Failed to convert grayscale mask '\(maskPath)' to alpha.")
+                return false
+            }
+            maskForBlend = convertedMask
+        }
+
+        guard let blendFilter = CIFilter(name: "CIBlendWithAlphaMask") else {
+            reportError("ASHelper: Failed to create the alpha mask blend filter.")
+            return false
+        }
+        blendFilter.setValue(srcCI, forKey: kCIInputImageKey)
+        blendFilter.setValue(maskForBlend, forKey: kCIInputMaskImageKey)
+        guard let blended = blendFilter.outputImage else {
+            reportError("ASHelper: Failed to apply mask image '\(maskPath)'.")
+            return false
+        }
+        finalCI = blended
     }
     
     // 2. Color Balance (RGB Multiply)
@@ -418,11 +525,12 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
         out = hdr.toData()
         if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
         if !appendCPUCompressedDDS(finalCI: finalCI, bounds: bounds, mode: formatCode, out: &out) {
-            exit(1)
+            reportError("ASHelper: Failed to compress image '\(jpegPath)'.")
+            return false
         }
     }
-    
-    try? out.write(to: URL(fileURLWithPath: outputPath))
+
+    return writeDDS(out, to: outputPath)
 }
 
 func upscale(inputPath: String, outputPath: String) {
@@ -433,11 +541,16 @@ func upscale(inputPath: String, outputPath: String) {
     CGImageDestinationAddImage(dest, cg, nil); CGImageDestinationFinalize(dest)
 }
 
-func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) {
+func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) -> Bool {
     guard format != "BC7" else {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
     }
-    let url = URL(fileURLWithPath: inputPath); guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { exit(1) }
+    let url = URL(fileURLWithPath: inputPath)
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        reportError("ASHelper: Failed to load source image '\(inputPath)'.")
+        return false
+    }
     let w = img.width; let h = img.height; let isBC7 = (format == "BC7"); let isBC3 = (format == "BC3")
     let formatCode: UInt32 = isBC7 ? 2 : (isBC3 ? 1 : 0)
     let mipCount = UInt32(floor(log2(Double(max(w, h)))) + 1)
@@ -510,7 +623,7 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
         }}
         out.append(dds)
     }
-    try? out.write(to: URL(fileURLWithPath: outputPath))
+    return writeDDS(out, to: outputPath)
 }
 
 let args = ProcessInfo.processInfo.arguments
@@ -521,7 +634,9 @@ if args[1] == "--upscale" {
 }
 else if args[1] == "--convert" {
     guard args.count >= 4 else { fail("ASHelper: --convert expects input and output paths.") }
-    convert(inputPath: args[2], outputPath: args[3], format: args.count > 4 ? args[4] : "BC3", useGPU: args.contains("--gpu"))
+    if !convert(inputPath: args[2], outputPath: args[3], format: args.count > 4 ? args[4] : "BC3", useGPU: args.contains("--gpu")) {
+        exit(1)
+    }
 }
 else if args[1] == "--convert-batch" {
     guard args.count >= 6 else { fail("ASHelper: --convert-batch expects a format, GPU flag, and at least one pair.") }
@@ -533,7 +648,9 @@ else if args[1] == "--convert-batch" {
     let useGPU = args[3] == "true"
     var idx = 4
     while idx + 1 < args.count {
-        convert(inputPath: args[idx], outputPath: args[idx+1], format: format, useGPU: useGPU)
+        if !convert(inputPath: args[idx], outputPath: args[idx+1], format: format, useGPU: useGPU) {
+            exit(1)
+        }
         idx += 2
     }
 }
@@ -543,7 +660,9 @@ else if args[1] == "--convert-batch-v2" {
     let useGPU = args[2] == "true"
     var idx = 3
     while idx + 2 < args.count {
-        convert(inputPath: args[idx], outputPath: args[idx+1], format: args[idx+2], useGPU: useGPU)
+        if !convert(inputPath: args[idx], outputPath: args[idx+1], format: args[idx+2], useGPU: useGPU) {
+            exit(1)
+        }
         idx += 3
     }
 }
@@ -587,8 +706,14 @@ else if args[1] == "--convert-batch-v3" {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
     }
     
+    let failureState = BatchFailureState()
     DispatchQueue.concurrentPerform(iterations: tasks.count) { i in
         let t = tasks[i]
-        convertWithPreprocess(jpegPath: t.jpeg, maskPath: t.mask, r: t.r, g: t.g, b: t.b, contrast: t.contrast, brightness: t.brightness, saturation: t.saturation, outputPath: t.output, format: t.format, useGPU: useGPU)
+        if !convertWithPreprocess(jpegPath: t.jpeg, maskPath: t.mask, r: t.r, g: t.g, b: t.b, contrast: t.contrast, brightness: t.brightness, saturation: t.saturation, outputPath: t.output, format: t.format, useGPU: useGPU) {
+            failureState.recordFailure()
+        }
+    }
+    if failureState.hasFailure() {
+        exit(1)
     }
 }
