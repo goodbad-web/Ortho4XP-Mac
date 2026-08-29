@@ -37,7 +37,13 @@ python3 run/build.py mac release
 
 ## Swift補助ツール
 
-`src/ASHelper.swift` と配置済みの `Utils/mac/ASHelper` は別の成果物である。本リポジトリにはASHelper専用のビルドスクリプトやXcodeプロジェクトがないため、Swiftソースを変更した場合は実行バイナリの再生成方法を別途確認し、既知のCLIモードと画像変換結果を検証する。CユーティリティのCMakeビルドだけでは更新されない。
+`src/ASHelper.swift` と配置済みの `Utils/mac/ASHelper` は別の成果物である。Swiftソースを変更した場合は、リポジトリルートから専用スクリプトで実行バイナリを再生成する。CユーティリティのCMakeビルドだけでは更新されない。
+
+```sh
+./Utils/run/build_ashelper.sh
+```
+
+このスクリプトは書き込み可能な一時Module Cacheで現在のmacOS向けバイナリをビルドし、成功後に実行時配置先の `Utils/mac/ASHelper` を更新する。`src/ASHelper` と `src/ASHelper_test` は実行時の配置先ではない。
 
 ## 検証の選び方
 

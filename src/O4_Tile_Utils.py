@@ -14,11 +14,39 @@ import O4_Mask_Utils as MASK
 import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
 from O4_Parallel_Utils import parallel_launch, parallel_join, multiprocessing_pool
+from PIL import Image
 
 max_convert_slots = 8
 max_download_slots = 8
 skip_downloads = False
 skip_converts = False
+
+
+def _resolve_gpu_batch_mask(tile, til_x_left, til_y_top, zoomlevel, provider_code, png_file_name):
+    """Return an exact or materialized mask path for an ASHelper batch task."""
+    possible_mask_path = os.path.join(
+        tile.build_dir,
+        "textures",
+        FNAMES.mask_file(til_x_left, til_y_top, zoomlevel, provider_code),
+    )
+    if os.path.exists(possible_mask_path):
+        return possible_mask_path, None
+
+    fallback_mask = MASK.needs_mask(
+        tile, til_x_left, til_y_top, zoomlevel, provider_code
+    )
+    if not fallback_mask:
+        return "none", None
+
+    fallback_mask_path = os.path.join(
+        UI.Ortho4XP_dir,
+        "tmp",
+        os.path.splitext(png_file_name)[0] + "_mask.png",
+    )
+    fallback_mask.convert("L").resize((4096, 4096), Image.BICUBIC).save(
+        fallback_mask_path
+    )
+    return fallback_mask_path, fallback_mask_path
 
 ################################################################################
 def download_textures(tile, download_queue, convert_queue):
@@ -202,12 +230,20 @@ def _build_tile(tile):
             # GPU Batch DDS Conversion integration for macOS
             use_gpu = getattr(UI, 'use_gpu_acceleration', True)
             if conversion_success and use_gpu and dds_converter == "TextureConverter" and "dar" in sys.platform:
-                from PIL import Image
                 import O4_RAMDisk_Utils
                 UI.vprint(1, "-> Executing ultra-fast GPU Batch DDS Conversion via ASHelper...")
                 as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
                 batch_args = []
                 temp_files_to_delete = []
+                batch_generated_mask_files = []
+                batch_attempted = False
+
+                def cleanup_generated_batch_masks():
+                    for temp_file in batch_generated_mask_files:
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
                 
                 for item in convert_list:
                     tile, til_x_left, til_y_top, zoomlevel, provider_code = item
@@ -235,30 +271,58 @@ def _build_tile(tile):
                     else:
                         UI.vprint(1, f"ERROR: Input source image not found for {out_file_name}")
                         conversion_success = False
+                        batch_attempted = True
                         break
                     
                     mask_path = "none"
                     if input_path == jpeg_path and tile.imprint_masks_to_dds:
-                        possible_mask_path = os.path.join(tile.build_dir, "textures", FNAMES.mask_file(til_x_left, til_y_top, zoomlevel, provider_code))
-                        if os.path.exists(possible_mask_path):
-                            mask_path = possible_mask_path
-                            temp_files_to_delete.append(possible_mask_path)
+                        try:
+                            mask_path, generated_mask_path = _resolve_gpu_batch_mask(
+                                tile,
+                                til_x_left,
+                                til_y_top,
+                                zoomlevel,
+                                provider_code,
+                                png_file_name,
+                            )
+                        except Exception as e:
+                            UI.vprint(
+                                1,
+                                f"ERROR: Could not prepare fallback mask for {out_file_name}: {str(e)}",
+                            )
+                            conversion_success = False
+                            batch_attempted = True
+                            break
+                        if generated_mask_path:
+                            batch_generated_mask_files.append(generated_mask_path)
+                        elif mask_path != "none":
+                            temp_files_to_delete.append(mask_path)
                     
                     r, g, b = 1.0, 1.0, 1.0
                     contrast, brightness, saturation = 1.0, 0.0, 1.0
                     
+                    color_code = "none"
                     if input_path == jpeg_path and provider_code in IMG.providers_dict:
-                        color_code = IMG.providers_dict[provider_code]["color_filters"]
-                        if color_code != "none" and color_code in IMG.color_filters_dict:
-                            for color_filter in IMG.color_filters_dict[color_code]:
-                                filter_name = color_filter[0]
-                                if filter_name == "brightness-contrast":
-                                    b_val, c_val = color_filter[1:3]
-                                    brightness = b_val / 255.0
-                                    contrast = 1.0 + (c_val / 128.0)
-                                elif filter_name == "saturation":
-                                    s_val = color_filter[1]
-                                    saturation = 1.0 + (s_val / 100.0)
+                        color_code = IMG.providers_dict[provider_code].get(
+                            "color_filters", "none"
+                        )
+                        if not IMG.gpu_batch_color_filter_supported(color_code):
+                            UI.vprint(
+                                1,
+                                f"WARNING: Using normal color preprocessing for {out_file_name} ({color_code}).",
+                            )
+                            conversion_success = False
+                            batch_attempted = True
+                            break
+                        for color_filter in IMG.color_filters_dict.get(color_code, []):
+                            filter_name = color_filter[0]
+                            if filter_name == "brightness-contrast":
+                                b_val, c_val = color_filter[1:3]
+                                brightness = b_val / 255.0
+                                contrast = 1.0 + (c_val / 128.0)
+                            elif filter_name == "saturation":
+                                s_val = color_filter[1]
+                                saturation = 1.0 + (s_val / 100.0)
                     
                     has_alpha = (mask_path != "none")
                     if not has_alpha and input_path != jpeg_path:
@@ -279,7 +343,6 @@ def _build_tile(tile):
                         target_fmt
                     ])
                 
-                batch_attempted = False
                 if conversion_success and batch_args:
                     batch_attempted = True
                     chunk_size = 64
@@ -307,6 +370,7 @@ def _build_tile(tile):
                             cpu_success_count += IMG.convert_texture(*item)
                     finally:
                         UI.use_gpu_acceleration = original_gpu
+                        cleanup_generated_batch_masks()
                     success_count = cpu_success_count
                     conversion_success = (cpu_success_count == len(convert_list))
 
@@ -316,6 +380,8 @@ def _build_tile(tile):
                             os.remove(temp_file)
                         except:
                             pass
+
+                cleanup_generated_batch_masks()
 
             if not conversion_success:
                 UI.lvprint(0, f"WARNING: {len(convert_list) - success_count} textures failed to convert.")

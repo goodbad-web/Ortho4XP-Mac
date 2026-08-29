@@ -2255,6 +2255,21 @@ def color_transform(im, color_code):
 ################################################################################
 
 ################################################################################
+def gpu_batch_color_filter_supported(color_code):
+    """Return whether ASHelper batch arguments represent this filter completely."""
+    supported_filters = {"brightness-contrast", "saturation"}
+    filters = color_filters_dict.get(color_code)
+    if filters is None:
+        return False
+    return all(
+        color_filter and color_filter[0] in supported_filters
+        for color_filter in filters
+    )
+
+
+################################################################################
+
+################################################################################
 def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
     big_image = Image.new("RGBA", (4096, 4096))
     (y0, x0) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
@@ -2442,6 +2457,7 @@ def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
 ):
     upscaled_file_to_delete = None
+    tmp_tif_file_name = None
     if type == "dds":
         out_file_name = FNAMES.dds_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2473,6 +2489,24 @@ def convert_texture(
     erase_tmp_tif = False
     dxt5 = False
     masked_texture = False
+
+    def cleanup_conversion_temp_files():
+        if erase_tmp_png:
+            try:
+                os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
+            except:
+                pass
+        if erase_tmp_tif and tmp_tif_file_name:
+            try:
+                os.remove(tmp_tif_file_name)
+            except:
+                pass
+        if upscaled_file_to_delete:
+            try:
+                os.remove(upscaled_file_to_delete)
+            except:
+                pass
+
     if tile.imprint_masks_to_dds and type == "dds":
         mask_path = os.path.join(
             tile.build_dir,
@@ -2546,8 +2580,20 @@ def convert_texture(
     use_upscale = getattr(UI, 'use_neural_upscale', False)
     use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
     is_worker = globals().get('is_worker_process', False)
+    direct_color_filter_supported = True
+    if not is_combined and provider_code in providers_dict:
+        direct_color_filter_supported = gpu_batch_color_filter_supported(
+            providers_dict[provider_code].get("color_filters", "none")
+        )
     
-    if use_gpu_batch and is_worker and not is_combined and not use_upscale and type == "dds":
+    if (
+        use_gpu_batch
+        and is_worker
+        and not is_combined
+        and not use_upscale
+        and type == "dds"
+        and direct_color_filter_supported
+    ):
         return 1
         
     file_to_convert = jpeg_path if (provider_code in providers_dict and jpeg_ready) else None
@@ -2676,6 +2722,7 @@ def convert_texture(
                 retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             except Exception as e:
                 UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
+                cleanup_conversion_temp_files()
                 return 0
             if retcode == 0:
                 break
@@ -2683,6 +2730,7 @@ def convert_texture(
             tentative += 1
             if tentative == 10:
                 UI.vprint(1, f"      Error: DDS conversion failed with return code {retcode} ({dds_converter})")
+                cleanup_conversion_temp_files()
                 return 0
 
             if "--gpu" in conv_cmd:
@@ -2749,13 +2797,8 @@ def convert_texture(
                     "ERROR: Could not geotag texture (gdal not present ?) ",
                     os.path.join(tile.build_dir, "textures", out_file_name),
                 )
-                try:
-                    os.remove(
-                        os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
-                    )
-                except:
-                    pass
-                return
+                cleanup_conversion_temp_files()
+                return 0
             conv_cmd = [
                 gdalwarp_cmd,
                 "-of",
@@ -2806,21 +2849,7 @@ def convert_texture(
 
             # Add random jitter to avoid lockstep retry collisions among multiprocessing workers
             time.sleep(1 + random.uniform(-0.5, 0.5))
-    if erase_tmp_png:
-        try:
-            os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
-        except:
-            pass
-    if erase_tmp_tif:
-        try:
-            os.remove(tmp_tif_file_name)
-        except:
-            pass
-    if upscaled_file_to_delete:
-        try:
-            os.remove(upscaled_file_to_delete)
-        except:
-            pass
+    cleanup_conversion_temp_files()
     return 1
 
 
