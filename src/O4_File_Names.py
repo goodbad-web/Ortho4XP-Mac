@@ -340,7 +340,14 @@ def distance_mask(m_til_x_left, m_til_y_top):
 
 def mask_file(til_x_left, til_y_top, zoomlevel, provider_code):
     return (
-        str(til_y_top) + "_" + str(til_x_left) + "_ZL" + str(zoomlevel) + ".png"
+        str(til_y_top)
+        + "_"
+        + str(til_x_left)
+        + "_"
+        + provider_code
+        + "_ZL"
+        + str(zoomlevel)
+        + ".png"
     )
 
 

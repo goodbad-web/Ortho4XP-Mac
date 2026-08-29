@@ -1,8 +1,9 @@
 import os
+import sys
 from math import ceil
 import tkinter as tk
 import tkinter.ttk as ttk
-from tkinter import RIDGE, N, S, E, W, filedialog
+from tkinter import RIDGE, N, S, E, W, filedialog, messagebox
 import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 import O4_DEM_Utils as DEM
@@ -62,9 +63,16 @@ a particular server.",
     "max_convert_slots": {
         "module": "TILE",
         "type": int,
-        "default": 4,
-        "values": (1, 2, 3, 4, 5, 6, 7, 8),
+        "default": os.cpu_count() if os.cpu_count() else (8 if "dar" in sys.platform else 4),
+        "values": (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32),
         "hint": "Number of parallel threads for dds conversion. Should be mainly dictated by the number of cores in your CPU.",
+    },
+    "max_download_slots": {
+        "module": "TILE",
+        "type": int,
+        "default": 8 if "dar" in sys.platform else 4,
+        "values": (1, 2, 4, 8, 16, 32, 64, 128),
+        "hint": "Number of parallel threads for texture downloading. Should be dictated by your bandwidth and the server tolerance.",
     },
     "check_tms_response": {
         "module": "IMG",
@@ -89,6 +97,50 @@ a particular server.",
         "type": int,
         "default": 5,
         "hint": "How much times do we try again after an internal server error for an imagery request. Only used if check_tms_response is set to True.",
+    },
+    "dds_converter": {
+        "module": "UI",
+        "type": str,
+        "default": "nvcompress",
+        "values": ("nvcompress", "TextureConverter", "magick"),
+        "hint": "The tool used to convert orthophotos to DDS. nvcompress is standard and is the only tool that supports BC7 here; TextureConverter is for Apple Silicon Metal acceleration, and magick is a fallback.",
+    },
+    "dds_format": {
+        "module": "UI",
+        "type": str,
+        "default": "BC3",
+        "values": ("BC1", "BC3", "BC7"),
+        "hint": "The texture compression format. BC3 (DXT5) is standard with alpha, BC1 (DXT1) has no alpha, and BC7 is only supported when the DDS converter is nvcompress.",
+    },
+    "use_gpu_acceleration": {
+        "module": "UI",
+        "type": bool,
+        "default": True,
+        "hint": "Use Apple Silicon GPU (Metal) for DDS texture conversion. Dramatically reduces CPU load and increases speed on M1/M2/M3 Mac.",
+    },
+    "use_neural_upscale": {
+        "module": "IMG",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon Neural Engine (Vision/CoreML) for texture upscaling. Requires macOS 12.0+.",
+    },
+    "use_gpu_for_masks": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for drawing and blurring water masks. Dramatically speeds up the masking step on Apple Silicon Mac.",
+    },
+    "use_gpu_for_color_filters": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for texture color transformation. Speed up the color correction step in Step 3.",
+    },
+    "use_gpu_for_dem_smoothing": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Use Apple Silicon GPU (OpenCL / cv2.UMat) for smoothing DEM raster elevation data. Dramatically speeds up Step 2 mesh prep.",
     },
     "ovl_exclude_pol": {
         "module": "OVL",
@@ -296,6 +348,11 @@ too low to grab these details.",
             "values" : ("XP12", "XP11 + bathy"),
             "hint" : "Water tech type. XP12 uses a new (partly in construction) rendering tech, XP11 + bathy uses a more traditionnal blend. Both allows for 3D water."
     },
+    "clamp_land_elevation": {
+        "type": bool,
+        "default": False,
+        "hint": "When True, forces any mesh vertices with negative elevation (below sea level) to exactly 0m. This prevents X-Plane 12 from overriding dry land with seawater in regions like reclaimed land or polders."
+    },
     #"add_low_res_sea_ovl": {
     #    "type": bool,
     #    "default": False,
@@ -349,6 +406,37 @@ too low to grab these details.",
         "default": True,
         "hint": "When set, the no_data values in the raster will be filled by a nearest neighbour algorithm. If unset, they are turned into zero (can be useful for rasters with no_data over the whole oceanic part or partial LIDAR data).",
     },
+    "write_build_log": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "When set, a detailed build log (Ortho4XP_build.log) will be written directly inside the tile's build directory upon completion or failure of the build steps.",
+    },
+    "use_ram_disk": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Create a macOS RAM disk in memory for the tmp directory to speed up I/O and reduce SSD wear.",
+    },
+    "ram_disk_size_gb": {
+        "module": "UI",
+        "type": int,
+        "default": 4,
+        "values": (4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104),
+        "hint": "Size of the RAM disk in Gigabytes (GB).",
+    },
+    "use_ram_disk_for_orthophotos": {
+        "module": "UI",
+        "type": bool,
+        "default": False,
+        "hint": "Optionally handle downloaded imagery (Orthophotos) in the macOS RAM disk. Automatically backs up existing photos and restores them on exit.",
+    },
+    "build_overlays_in_all_in_one": {
+        "type": bool,
+        "default": False,
+        "hint": "When set, the 'All in one' process will automatically execute overlay extraction (Extract overlays) after building the DSF/Imagery.",
+        "short_name": "build_overlays_in_all",
+    },
 }
 
 list_app_vars = [
@@ -358,9 +446,13 @@ list_app_vars = [
     "skip_downloads",
     "skip_converts",
     "max_convert_slots",
+    "max_download_slots",
     "check_tms_response",
     "http_timeout",
     "max_connect_retries",
+    "use_ram_disk",
+    "ram_disk_size_gb",
+    "use_ram_disk_for_orthophotos",
     "max_baddata_retries",
     "ovl_exclude_pol",
     "ovl_exclude_net",
@@ -392,7 +484,9 @@ list_mesh_vars = [
     "min_angle",
     "sea_smoothing_mode",
     "water_smoothing",
+    "use_gpu_for_dem_smoothing",
     "iterate",
+    "clamp_land_elevation",
 ]
 list_mask_vars = [
     "mask_zl",
@@ -403,11 +497,17 @@ list_mask_vars = [
     "distance_masks_too",
     "masks_use_DEM_too",
     "masks_custom_extent",
+    "use_gpu_for_masks",
 ]
 list_dsf_vars = [
     "cover_airports_with_highres",
     "cover_extent",
     "cover_zl",
+    "use_neural_upscale",
+    "use_gpu_acceleration",
+    "use_gpu_for_color_filters",
+    "dds_converter",
+    "dds_format",
     "water_tech",
     "ratio_bathy",
     "ratio_water",
@@ -418,6 +518,8 @@ list_dsf_vars = [
     "normal_map_strength",
     "terrain_casts_shadows",
     "use_decal_on_terrain",
+    "write_build_log",
+    "build_overlays_in_all_in_one",
 ]
 list_other_vars = ["custom_dem", "fill_nodata"]
 list_tile_vars = (
@@ -435,17 +537,22 @@ list_global_cfg = (
     + list_mesh_vars
     + list_mask_vars
     + list_dsf_vars
+    + list_other_vars
 )
 
 ################################################################################
 # Initialization to default values
 for var in cfg_vars:
-    target = (
-        cfg_vars[var]["module"] + "." + var
-        if "module" in cfg_vars[var]
-        else var
-    )
-    exec(target + "=cfg_vars['" + var + "']['default']")
+    val = cfg_vars[var]["default"]
+    if "module" in cfg_vars[var]:
+        module_name = cfg_vars[var]["module"]
+        if module_name == "UI": setattr(UI, var, val)
+        elif module_name == "OSM": setattr(OSM, var, val)
+        elif module_name == "IMG": setattr(IMG, var, val)
+        elif module_name == "TILE": setattr(TILE, var, val)
+        elif module_name == "OVL": setattr(OVL, var, val)
+    else:
+        globals()[var] = val
 ################################################################################
 # Update from Global Ortho4XP.cfg
 try:
@@ -457,24 +564,40 @@ try:
         if line[0] == "#":
             continue
         try:
-            (var, value) = line.split("=")
+            (var, value) = line.split("=", 1)
+            var = var.strip()
+            value = value.strip()
             # compatibility with config files from version <= 1.20
             if value and value[0] in ('"', "'"):
                 value = value[1:]
             if value and value[-1] in ('"', "'"):
                 value = value[:-1]
-            target = (
-                cfg_vars[var]["module"] + "." + var
-                if "module" in cfg_vars[var]
-                else var
-            )
-            if cfg_vars[var]["type"] in (bool, list):
-                cmd = target + "=" + value
+            if var not in cfg_vars:
+                continue
+            if cfg_vars[var]["type"] == bool:
+                val = (value.lower() == "true")
+            elif cfg_vars[var]["type"] == list:
+                try:
+                    val = eval(value)
+                except:
+                    continue
             else:
-                cmd = target + "=cfg_vars['" + var + "']['type'](value)"
-            exec(cmd)
+                try:
+                    val = cfg_vars[var]["type"](value)
+                except:
+                    continue
+            
+            if "module" in cfg_vars[var]:
+                module_name = cfg_vars[var]["module"]
+                if module_name == "UI": setattr(UI, var, val)
+                elif module_name == "OSM": setattr(OSM, var, val)
+                elif module_name == "IMG": setattr(IMG, var, val)
+                elif module_name == "TILE": setattr(TILE, var, val)
+                elif module_name == "OVL": setattr(OVL, var, val)
+            else:
+                globals()[var] = val
+            UI.vprint(2, "   Config variable", var, "set to", val)
         except:
-            UI.lvprint(1, "Global config file contains an invalid line:", line)
             pass
     f.close()
 except:
@@ -496,7 +619,17 @@ class Tile:
         self.build_dir = FNAMES.build_dir(lat, lon, custom_build_dir)
         self.dem = None
         for var in list_tile_vars:
-            exec("self." + var + "=" + var)
+            if "module" in cfg_vars[var]:
+                module_name = cfg_vars[var]["module"]
+                if module_name == "UI": val = getattr(UI, var)
+                elif module_name == "OSM": val = getattr(OSM, var)
+                elif module_name == "IMG": val = getattr(IMG, var)
+                elif module_name == "TILE": val = getattr(TILE, var)
+                elif module_name == "OVL": val = getattr(OVL, var)
+                else: val = globals().get(var, cfg_vars[var]["default"])
+            else:
+                val = globals().get(var, cfg_vars[var]["default"])
+            setattr(self, var, val)
 
     def make_dirs(self):
         if os.path.isdir(self.build_dir):
@@ -544,29 +677,32 @@ class Tile:
                 if line[0] == "#":
                     continue
                 try:
-                    (var, value) = line.split("=")
+                    (var, value) = line.split("=", 1)
                     # compatibility with config files from version <= 1.20
                     if value and value[0] in ('"', "'"):
                         value = value[1:]
                     if value and value[-1] in ('"', "'"):
                         value = value[:-1]
-                    if cfg_vars[var]["type"] in (bool, list):
-                        cmd = "self." + var + "=" + value
+                    if cfg_vars[var]["type"] == bool:
+                        val = (value.lower() == "true")
+                    elif cfg_vars[var]["type"] == list:
+                        try:
+                            val = eval(value)
+                        except:
+                            continue
                     else:
-                        cmd = (
-                            "self."
-                            + var
-                            + "=cfg_vars['"
-                            + var
-                            + "']['type'](value)"
-                        )
-                    exec(cmd)
+                        try:
+                            val = cfg_vars[var]["type"](value)
+                        except:
+                            continue
+                    setattr(self, var, val)
                 except Exception as e:
                     # compatibility with zone_list config files from 
                     # version <= 1.20
                     if "zone_list.append" in line:
                         try:
-                            exec("self." + line)
+                            item = eval(line.split(".append(")[1][:-1])
+                            self.zone_list.append(item)
                         except:
                             pass
                     else:
@@ -588,7 +724,7 @@ class Tile:
                 self.build_dir,
                 "Ortho4XP_" + FNAMES.short_latlon(self.lat, self.lon) + ".cfg",
             )
-            config_file_bak = config_file + ".bak"
+        config_file_bak = config_file + ".bak"
         try:
             os.replace(config_file, config_file_bak)
         except:
@@ -630,22 +766,22 @@ class Ortho4XP_Config(tk.Toplevel):
 
         # Frames
         self.main_frame = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_cfg = tk.Frame(
-            self.main_frame, border=0, padx=5, pady=self.pady, bg="light green"
+            self.main_frame, border=0, padx=5, pady=self.pady, bg=UI.BG_COLOR
         )
         self.frame_dem = tk.Frame(
-            self.frame_cfg, border=0, padx=0, pady=self.pady, bg="light green"
+            self.frame_cfg, border=0, padx=0, pady=self.pady, bg=UI.BG_COLOR
         )
         self.frame_lastbtn = tk.Frame(
-            self.main_frame, border=0, padx=5, pady=self.pady, bg="light green"
+            self.main_frame, border=0, padx=5, pady=self.pady, bg=UI.BG_COLOR
         )
         # Frames properties
         for j in range(8):
             self.frame_cfg.columnconfigure(j, weight=1)
         self.frame_cfg.rowconfigure(0, weight=1)
-        for j in range(6):
+        for j in range(7):
             self.frame_lastbtn.columnconfigure(j, weight=1)
         self.frame_lastbtn.rowconfigure(0, weight=1)
 
@@ -674,7 +810,8 @@ class Ortho4XP_Config(tk.Toplevel):
             tk.Label(
                 self.frame_cfg,
                 text=title,
-                bg="light green",
+                bg=UI.BG_COLOR,
+                fg=UI.FG_COLOR,
                 anchor=W,
                 font="TKFixedFont 14",
             ).grid(
@@ -743,10 +880,18 @@ class Ortho4XP_Config(tk.Toplevel):
         ).grid(row=0, column=0, padx=2, pady=2, sticky=E + W)
         # self.entry_[item]=tk.Entry(self.frame_dem,textvariable=self.v_[item],
         # bg='white',fg='blue',width=80)
-        values = DEM.available_sources[1::2]
+        # Collect subdirectories in Elevation_data for the pull-down
+        dem_values = list(DEM.available_sources[1::2])
+        try:
+            for entry in sorted(os.listdir(FNAMES.Elevation_dir)):
+                full_path = os.path.join(FNAMES.Elevation_dir, entry)
+                if os.path.isdir(full_path) and not entry.startswith("+"):
+                    dem_values.append(full_path)
+        except:
+            pass
         self.entry_[item] = ttk.Combobox(
             self.frame_dem,
-            values=values,
+            values=dem_values,
             textvariable=self.v_[item],
             width=80,
             style="O4.TCombobox",
@@ -762,6 +907,10 @@ class Ortho4XP_Config(tk.Toplevel):
         )
         dem_button.grid(row=0, column=2, padx=2, pady=0, sticky=W)
         dem_button.bind("<Shift-ButtonPress-1>", self.add_dem)
+        mod_key = "<Command-ButtonPress-1>" if "dar" in sys.platform else "<Control-ButtonPress-1>"
+        shift_mod_key = "<Shift-Command-ButtonPress-1>" if "dar" in sys.platform else "<Shift-Control-ButtonPress-1>"
+        dem_button.bind(mod_key, self.choose_dem_dir)
+        dem_button.bind(shift_mod_key, self.add_dem_dir)
         item = "fill_nodata"
         ttk.Button(
             self.frame_cfg,
@@ -788,7 +937,8 @@ class Ortho4XP_Config(tk.Toplevel):
         tk.Label(
             self.frame_cfg,
             text="Application ",
-            bg="light green",
+            bg=UI.BG_COLOR,
+            fg=UI.FG_COLOR,
             anchor=W,
             font="TKFixedFont 14",
         ).grid(row=row, column=0, columnspan=4, pady=10, sticky=N + S + E + W)
@@ -913,11 +1063,19 @@ class Ortho4XP_Config(tk.Toplevel):
         self.button5.grid(
             row=0, column=4, padx=5, pady=self.pady, sticky=N + S + E + W
         )
+        self.button_clean = ttk.Button(
+            self.frame_lastbtn,
+            text="Clean Tmp Data",
+            command=self.clean_tiles_tmp_files,
+        )
+        self.button_clean.grid(
+            row=0, column=5, padx=5, pady=self.pady, sticky=N + S + E + W
+        )
         self.button6 = ttk.Button(
             self.frame_lastbtn, text="     Exit     ", command=self.destroy
         )
         self.button6.grid(
-            row=0, column=5, padx=5, pady=self.pady, sticky=N + S + E + W
+            row=0, column=6, padx=5, pady=self.pady, sticky=N + S + E + W
         )
 
         # Initialize fields and variables
@@ -963,6 +1121,21 @@ class Ortho4XP_Config(tk.Toplevel):
                     self.v_["custom_dem"].get() + ";" + str(tmp)
                 )
 
+    def choose_dem_dir(self, event):
+        tmp = filedialog.askdirectory(parent=self, title="Choose DEM folder")
+        if tmp:
+            self.v_["custom_dem"].set(str(tmp))
+
+    def add_dem_dir(self, event):
+        tmp = filedialog.askdirectory(parent=self, title="Choose DEM folder")
+        if tmp:
+            if not self.v_["custom_dem"].get():
+                self.v_["custom_dem"].set(str(tmp))
+            else:
+                self.v_["custom_dem"].set(
+                    self.v_["custom_dem"].get() + ";" + str(tmp)
+                )
+
     def choose_dir(self, item):
         tmp = filedialog.askdirectory(parent=self)
         if tmp:
@@ -997,7 +1170,7 @@ class Ortho4XP_Config(tk.Toplevel):
             if line[0] == "#":
                 continue
             try:
-                (var, value) = line.split("=")
+                (var, value) = line.split("=", 1)
                 # compatibility with config files from version <= 1.20
                 if value and value[0] in ('"', "'"):
                     value = value[1:]
@@ -1039,7 +1212,6 @@ class Ortho4XP_Config(tk.Toplevel):
         except:
             self.popup("ERROR", "Cannot write into " + str(build_dir))
             return 0
-        self.v_["zone_list"].set(str(eval("zone_list")))
         for var in list_tile_vars:
             f.write(var + "=" + self.v_[var].get() + "\n")
         f.close()
@@ -1057,7 +1229,7 @@ class Ortho4XP_Config(tk.Toplevel):
             if line[0] == "#":
                 continue
             try:
-                (var, value) = line.split("=")
+                (var, value) = line.split("=", 1)
                 # compatibility with config files from version <= 1.20
                 if value and value[0] in ('"', "'"):
                     value = value[1:]
@@ -1085,40 +1257,60 @@ class Ortho4XP_Config(tk.Toplevel):
 
     def apply_changes(self):
         errors = []
+        restart_required_vars = [
+            "use_ram_disk",
+            "ram_disk_size_gb",
+            "use_ram_disk_for_orthophotos",
+            "custom_scenery_dir",
+            "custom_overlay_src"
+        ]
+        restart_needed = False
+        changed_vars = []
         for var in list_tile_vars + list_app_vars:
             try:
                 target = (
                     cfg_vars[var]["module"] + "." + var
                     if "module" in cfg_vars[var]
-                    else "globals()['" + var + "']"
+                    else var
                 )
-                if cfg_vars[var]["type"] in (bool, list):
-                    cmd = target + "=" + self.v_[var].get()
+                try:
+                    current_val = eval(target)
+                except:
+                    current_val = None
+
+                value_str = self.v_[var].get()
+                if cfg_vars[var]["type"] == bool:
+                    val = (value_str.lower() == "true")
+                elif cfg_vars[var]["type"] == list:
+                    val = eval(value_str)
                 else:
-                    cmd = (
-                        target
-                        + "=cfg_vars['"
-                        + var
-                        + "']['type'](self.v_['"
-                        + var
-                        + "'].get())"
-                    )
-                exec(cmd)
+                    val = cfg_vars[var]["type"](value_str)
+                
+                if var in restart_required_vars and current_val != val:
+                    restart_needed = True
+                    changed_vars.append(var)
+
+                if "module" in cfg_vars[var]:
+                    module_name = cfg_vars[var]["module"]
+                    if module_name == "UI": setattr(UI, var, val)
+                    elif module_name == "OSM": setattr(OSM, var, val)
+                    elif module_name == "IMG": setattr(IMG, var, val)
+                    elif module_name == "TILE": setattr(TILE, var, val)
+                    elif module_name == "OVL": setattr(OVL, var, val)
+                else:
+                    globals()[var] = val
             except:
-                target = (
-                    cfg_vars[var]["module"] + "." + var
-                    if "module" in cfg_vars[var]
-                    else "globals()['" + var + "']"
-                )
-                self.v_[var].set(str(cfg_vars[var]["default"]))
-                exec(
-                    target
-                    + "=cfg_vars['"
-                    + var
-                    + "']['type'](cfg_vars['"
-                    + var
-                    + "']['default'])"
-                )
+                default_val = cfg_vars[var]["default"]
+                if "module" in cfg_vars[var]:
+                    module_name = cfg_vars[var]["module"]
+                    if module_name == "UI": setattr(UI, var, default_val)
+                    elif module_name == "OSM": setattr(OSM, var, default_val)
+                    elif module_name == "IMG": setattr(IMG, var, default_val)
+                    elif module_name == "TILE": setattr(TILE, var, default_val)
+                    elif module_name == "OVL": setattr(OVL, var, default_val)
+                else:
+                    globals()[var] = default_val
+                self.v_[var].set(str(default_val))
                 errors.append(var)
         if errors:
             error_text = (
@@ -1127,6 +1319,81 @@ class Ortho4XP_Config(tk.Toplevel):
                 + "\n* ".join(errors)
             )
             self.popup("ERROR", error_text)
+            restart_needed = False
+
+        dds_error = IMG.dds_format_support_error(
+            getattr(UI, "dds_converter", cfg_vars["dds_converter"]["default"]),
+            getattr(UI, "dds_format", cfg_vars["dds_format"]["default"]),
+        )
+        if dds_error:
+            self.popup(
+                "ERROR",
+                dds_error + "\nDDS format has been reset to BC3.",
+            )
+            setattr(UI, "dds_format", "BC3")
+            self.v_["dds_format"].set("BC3")
+
+        if restart_needed:
+            msg = "The following settings have been changed and require a restart to take effect:\n\n"
+            msg += "\n".join([f"- {v}" for v in changed_vars])
+            msg += "\n\nWould you like to save the configuration and restart Ortho4XP now?"
+            if messagebox.askyesno("Restart Required", msg, parent=self):
+                self.write_global_cfg()
+                import sys
+                import os
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception as e:
+                    UI.lvprint(1, f"Failed to restart: {e}")
+
+    def clean_tiles_tmp_files(self):
+        import tkinter.messagebox as messagebox
+        import glob
+        
+        tiles_dir = os.path.join(UI.Ortho4XP_dir, "Tiles")
+        if not os.path.isdir(tiles_dir):
+            messagebox.showinfo("Clean Tiles", "Tiles directory does not exist.", parent=self)
+            return
+            
+        confirm = messagebox.askyesno(
+            "Clean Tiles",
+            "Are you sure you want to delete all temporary geometry files (Data+*) and leftover PNGs across all tiles?\n\nThis will free up several gigabytes of disk space and won't affect X-Plane gameplay.",
+            parent=self
+        )
+        if not confirm:
+            return
+            
+        deleted_count = 0
+        deleted_bytes = 0
+        
+        # 1. Delete Data+* files
+        for path in glob.glob(os.path.join(tiles_dir, "zOrtho4XP_*", "Data+*")):
+            try:
+                sz = os.path.getsize(path)
+                os.remove(path)
+                deleted_count += 1
+                deleted_bytes += sz
+            except Exception as e:
+                UI.vprint(2, f"Failed to delete {path}: {str(e)}")
+                
+        # 2. Delete leftover PNGs in textures
+        for path in glob.glob(os.path.join(tiles_dir, "zOrtho4XP_*", "textures", "*.png")):
+            if os.path.basename(path) == "water_transition.png":
+                continue
+            try:
+                sz = os.path.getsize(path)
+                os.remove(path)
+                deleted_count += 1
+                deleted_bytes += sz
+            except Exception as e:
+                UI.vprint(2, f"Failed to delete {path}: {str(e)}")
+                
+        mb_saved = deleted_bytes / (1024 * 1024)
+        messagebox.showinfo(
+            "Clean Tiles",
+            f"Successfully cleaned up temporary files!\n\nDeleted: {deleted_count} files\nDisk Space Saved: {mb_saved:.1f} MB",
+            parent=self
+        )
 
     def popup(self, header, input_text):
         self.popupwindow = tk.Toplevel()

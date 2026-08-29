@@ -3,11 +3,15 @@ Elevation_data/
 Geotiffs/
 Masks/
 Orthophotos/
+Orthophotos_backup/
 OSM_data/
 yOrtho4XP_Overlays
 Previews/
 Extents/Auto
+.tmp/
+
 tmp/
+tmp_backup/
 Tiles/
 **/Ortho4XP.log
 **/__pycache__
@@ -15,3 +19,4 @@ Tiles/
 **/*.bak
 **/*.swp
 .last_gui_params.txt
+**/.DS_Store

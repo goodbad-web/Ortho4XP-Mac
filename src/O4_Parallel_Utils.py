@@ -1,4 +1,6 @@
 import threading
+import multiprocessing
+import queue
 import O4_UI_Utils as UI
 
 ################################################################################
@@ -15,7 +17,11 @@ class parallel_worker(threading.Thread):
             args = self._queue.get()
             if isinstance(args, str) and args == "quit":
                 try:
-                    UI.progress_bar(self._progress["bar"], 100)
+                    UI.progress_bar(
+                        self._progress["bar"],
+                        100,
+                        self._progress.get("message"),
+                    )
                 except:
                     pass
                 return 1
@@ -29,25 +35,10 @@ class parallel_worker(threading.Thread):
                         * self._progress["done"]
                         / (self._progress["done"] + self._queue.qsize())
                     ),
+                    self._progress.get("message"),
                 )
             if UI.red_flag:
                 return 0
-
-################################################################################
-def parallel_execute(task, queue, nbr_workers, progress=None):
-    workers = []
-    success = [1]
-    for _ in range(nbr_workers):
-        queue.put("quit")
-        worker = parallel_worker(task, queue, progress, success)
-        worker.start()
-        workers.append(worker)
-    for worker in workers:
-        worker.join()
-    if UI.red_flag:
-        return 0
-    return success[0]
-
 
 ################################################################################
 def parallel_launch(task, queue, nbr_workers, progress=None):
@@ -62,3 +53,64 @@ def parallel_launch(task, queue, nbr_workers, progress=None):
 def parallel_join(workers):
     for worker in workers:
         worker.join()
+
+################################################################################
+def parallel_execute(task, execute_queue, nbr_workers, progress=None):
+    success = [1]
+    for _ in range(nbr_workers):
+        execute_queue.put("quit")
+    workers = []
+    for _ in range(nbr_workers):
+        worker = parallel_worker(task, execute_queue, progress, success)
+        worker.start()
+        workers.append(worker)
+    for worker in workers:
+        worker.join()
+    return success[0]
+
+################################################################################
+# Multiprocessing support
+################################################################################
+def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=None, init_args=None):
+    # This is a synchronous call but it uses a Pool to run in parallel.
+    # It updates the progress bar.
+    if not arg_list:
+        return 0
+    
+    # Use spawn context explicitly for macOS stability
+    ctx = multiprocessing.get_context("spawn")
+    
+    with ctx.Pool(processes=nbr_workers, initializer=init_func, initargs=(init_args,) if init_args else ()) as pool:
+        done = 0
+        success = 0
+        total = len(arg_list)
+        log_step = max(1, total // 10)
+        try:
+            for res in pool.imap_unordered(task_wrapper, [(task, args) for args in arg_list]):
+                done += 1
+                if res:
+                    success += 1
+                if progress:
+                    progress["done"] += 1
+                    UI.progress_bar(
+                        progress["bar"],
+                        int(100 * done / total),
+                        progress.get("message"),
+                    )
+                if done % log_step == 0 or done == total:
+                    UI.vprint(1, f"   ... {done}/{total} ({int(100 * done / total)}%)")
+                if UI.red_flag:
+                    pool.terminate()
+                    break
+        except Exception as e:
+            UI.vprint(1, f"Pool execution error: {e}")
+            pool.terminate()
+        return success
+
+def task_wrapper(args):
+    task, task_args = args
+    try:
+        return task(*task_args)
+    except Exception as e:
+        print(f"Multiprocessing error: {e}")
+        return 0

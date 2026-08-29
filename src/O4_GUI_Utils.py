@@ -50,37 +50,59 @@ class Ortho4XP_GUI(tk.Tk):
         O4.theme_use("alt")
         O4.configure(
             "Flat.TButton",
-            background="light green",
-            highlightbackground="light green",
-            selectbackground="light green",
-            highlightcolor="light green",
+            background=UI.BTN_BG,
+            foreground=UI.FG_COLOR,
+            highlightbackground=UI.BTN_BG,
+            selectbackground=UI.BTN_BG,
+            highlightcolor=UI.BTN_BG,
             highlightthickness=0,
             relief="flat",
         )
         O4.map(
             "Flat.TButton",
             background=[
-                ("disabled", "pressed", "!focus", "active", "light green")
+                ("disabled", "pressed", "!focus", "active", UI.BTN_BG)
+            ],
+            foreground=[
+                ("disabled", "pressed", "!focus", "active", UI.FG_COLOR)
             ],
         )
         O4.configure(
             "O4.TCombobox",
-            selectbackground="white",
-            selectforeground="blue",
-            fieldbackground="white",
-            foreground="blue",
-            background="white",
+            selectbackground=UI.ENTRY_BG,
+            selectforeground=UI.ENTRY_FG,
+            fieldbackground=UI.ENTRY_BG,
+            foreground=UI.ENTRY_FG,
+            background=UI.ENTRY_BG,
         )
         O4.map(
             "O4.TCombobox",
             fieldbackground=[
-                ("disabled", "!focus", "focus", "active", "white")
+                ("disabled", "!focus", "focus", "active", UI.ENTRY_BG)
             ],
+        )
+        O4.configure(
+            "TEntry",
+            fieldbackground=UI.ENTRY_BG,
+            foreground=UI.ENTRY_FG,
+            insertcolor=UI.FG_COLOR,
+        )
+        O4.configure(
+            "Compact.TButton",
+            padding=(4, 1),
+            background=UI.BTN_BG,
+            foreground=UI.FG_COLOR,
+            highlightbackground=UI.BTN_BG,
+            selectbackground=UI.BTN_BG,
+            highlightcolor=UI.BTN_BG,
+            highlightthickness=0,
+            relief="flat",
         )
         self.option_add("*Font", "TkFixedFont")
 
         # Let UI know ourself
         UI.gui = self
+        self.status_queue = queue.Queue()
         # Initialize providers combobox entries
         self.map_list = sorted(
             [
@@ -127,69 +149,86 @@ class Ortho4XP_GUI(tk.Tk):
         # Frame instances and placement
         # Level 0
         self.frame_top = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_top.grid(row=0, column=0, sticky=N + S + W + E)
+        self.frame_top.columnconfigure(0, weight=1)
         self.frame_console = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_console.grid(row=1, column=0, sticky=N + S + W + E)
         # Level 1
         self.frame_tile = tk.Frame(
-            self.frame_top, border=0, padx=5, pady=5, bg="light green"
+            self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
         )
         self.frame_tile.grid(row=0, column=0, sticky=N + S + W + E)
         self.frame_steps = tk.Frame(
-            self.frame_top, border=0, padx=5, pady=5, bg="light green"
+            self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
         )
-        self.frame_steps.grid(row=2, column=0, sticky=N + S + W + E)
+        self.frame_steps.grid(row=1, column=0, sticky=N + S + W + E)
+        self.frame_aux = tk.Frame(
+            self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
+        )
+        self.frame_aux.grid(row=2, column=0, sticky=N + S + W + E)
         self.frame_bars = tk.Frame(
-            self.frame_top, border=0, padx=5, pady=5, bg="light green"
+            self.frame_top, border=0, padx=5, pady=5, bg=UI.BG_COLOR
         )
         self.frame_bars.grid(row=3, column=0, sticky=N + S + W + E)
+        for i in range(3):
+            self.frame_bars.columnconfigure(i, weight=1)
         # Level 2
         self.frame_folder = tk.Frame(
-            self.frame_tile, border=0, padx=0, pady=0, bg="light green"
+            self.frame_tile, border=0, padx=0, pady=0, bg=UI.BG_COLOR
         )
         self.frame_folder.grid(
-            row=1, column=0, columnspan=8, sticky=N + S + W + E
+            row=2, column=0, columnspan=8, sticky=N + S + W + E
         )
 
         # Widgets instances and placement
         # First row (Tile data)
+        tk.Label(
+            self.frame_tile,
+            text="Input",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, columnspan=8, sticky=W + E)
+
         self.lat = tk.StringVar()
         self.lat.trace("w", self.tile_change)
-        tk.Label(self.frame_tile, text="Latitude:", bg="light green").grid(
-            row=0, column=0, padx=5, pady=5, sticky=E + W
+        tk.Label(self.frame_tile, text="Latitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR).grid(
+            row=1, column=0, padx=5, pady=5, sticky=E + W
         )
         self.lat_entry = tk.Entry(
             self.frame_tile,
             width=4,
-            bg="white",
-            fg="blue",
+            bg=UI.ENTRY_BG,
+            fg=UI.ENTRY_FG,
             textvariable=self.lat,
+            insertbackground=UI.FG_COLOR,
         )
-        self.lat_entry.grid(row=0, column=1, padx=5, pady=5, sticky=W)
+        self.lat_entry.grid(row=1, column=1, padx=5, pady=5, sticky=W)
 
         self.lon = tk.StringVar()
         self.lon.trace("w", self.tile_change)
         tk.Label(
-            self.frame_tile, anchor=W, text="Longitude:", bg="light green"
-        ).grid(row=0, column=2, padx=5, pady=5, sticky=E + W)
+            self.frame_tile, anchor=W, text="Longitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
+        ).grid(row=1, column=2, padx=5, pady=5, sticky=E + W)
         self.lon_entry = tk.Entry(
             self.frame_tile,
             width=4,
-            bg="white",
-            fg="blue",
+            bg=UI.ENTRY_BG,
+            fg=UI.ENTRY_FG,
             textvariable=self.lon,
+            insertbackground=UI.FG_COLOR,
         )
-        self.lon_entry.grid(row=0, column=3, padx=5, pady=5, sticky=W)
+        self.lon_entry.grid(row=1, column=3, padx=5, pady=5, sticky=W)
 
         self.default_website = tk.StringVar()
         self.default_website.trace("w", self.update_cfg)
         tk.Label(
-            self.frame_tile, anchor=W, text="Imagery:", bg="light green"
-        ).grid(row=0, column=4, padx=5, pady=5, sticky=E + W)
+            self.frame_tile, anchor=W, text="Imagery:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
+        ).grid(row=1, column=4, padx=5, pady=5, sticky=E + W)
         self.img_combo = ttk.Combobox(
             self.frame_tile,
             values=self.map_list,
@@ -198,13 +237,13 @@ class Ortho4XP_GUI(tk.Tk):
             width=14,
             style="O4.TCombobox",
         )
-        self.img_combo.grid(row=0, column=5, padx=5, pady=5, sticky=W)
+        self.img_combo.grid(row=1, column=5, padx=5, pady=5, sticky=W)
 
         self.default_zl = tk.StringVar()
         self.default_zl.trace("w", self.update_cfg)
         tk.Label(
-            self.frame_tile, anchor=W, text="Zoomlevel:", bg="light green"
-        ).grid(row=0, column=6, padx=5, pady=5, sticky=E + W)
+            self.frame_tile, anchor=W, text="Zoomlevel:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
+        ).grid(row=1, column=6, padx=5, pady=5, sticky=E + W)
         self.zl_combo = ttk.Combobox(
             self.frame_tile,
             values=self.zl_list,
@@ -213,19 +252,20 @@ class Ortho4XP_GUI(tk.Tk):
             width=3,
             style="O4.TCombobox",
         )
-        self.zl_combo.grid(row=0, column=7, padx=5, pady=5, sticky=W)
+        self.zl_combo.grid(row=1, column=7, padx=5, pady=5, sticky=W)
 
         # Second row (Base Folder)
         self.frame_folder.columnconfigure(1, weight=1)
         tk.Label(
-            self.frame_folder, anchor=W, text="Base Folder:", bg="light green"
+            self.frame_folder, anchor=W, text="Base Folder:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=0, column=0, padx=5, pady=5, sticky=E + W)
         self.custom_build_dir = tk.StringVar()
         self.custom_build_dir_entry = tk.Entry(
             self.frame_folder,
-            bg="white",
-            fg="blue",
+            bg=UI.ENTRY_BG,
+            fg=UI.ENTRY_FG,
             textvariable=self.custom_build_dir,
+            insertbackground=UI.FG_COLOR,
         )
         self.custom_build_dir_entry.grid(
             row=0, column=1, padx=0, pady=0, sticky=E + W
@@ -238,65 +278,36 @@ class Ortho4XP_GUI(tk.Tk):
             style="Flat.TButton",
         ).grid(row=0, column=2, padx=0, pady=0, sticky=N + S + E + W)
 
-        # Button Icons on top right
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.config_icon,
-            command=self.open_config_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=9, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.loupe_icon,
-            command=self.open_custom_zl_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=10, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.earth_icon,
-            command=self.open_earth_window,
-            style="Flat.TButton",
-        ).grid(row=0, column=11, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.stop_icon,
-            command=self.set_red_flag,
-            style="Flat.TButton",
-        ).grid(row=0, column=12, rowspan=2, padx=5, pady=0)
-        ttk.Button(
-            self.frame_tile,
-            takefocus=False,
-            image=self.exit_icon,
-            command=self.exit_prg,
-            style="Flat.TButton",
-        ).grid(row=0, column=13, rowspan=2, padx=5, pady=0)
-
         # Third row (Steps)
         for i in range(5):
             self.frame_steps.columnconfigure(i, weight=1)
+        tk.Label(
+            self.frame_steps,
+            text="Run",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, columnspan=5, sticky=W + E)
         ttk.Button(
             self.frame_steps,
             text="Assemble Vector data",
             command=self.build_poly_file,
-        ).grid(row=0, column=0, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=0, padx=5, pady=0, sticky=N + S + E + W)
         build_mesh_button = ttk.Button(
             self.frame_steps, text="Triangulate 3D Mesh"
         )  # ,command=self.build_mesh)
         build_mesh_button.grid(
-            row=0, column=1, padx=5, pady=0, sticky=N + S + E + W
+            row=1, column=1, padx=5, pady=0, sticky=N + S + E + W
         )
         build_mesh_button.bind("<ButtonPress-1>", self.build_mesh)
         build_mesh_button.bind("<Shift-ButtonPress-1>", self.sort_mesh)
-        build_mesh_button.bind("<Control-ButtonPress-1>", self.community_mesh)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        build_mesh_button.bind(mod_key, self.community_mesh)
         build_masks_button = ttk.Button(
             self.frame_steps, text=" Draw Water Masks  "
         )  # ,command=self.build_masks)
         build_masks_button.grid(
-            row=0, column=2, padx=5, pady=0, sticky=N + S + E + W
+            row=1, column=2, padx=5, pady=0, sticky=N + S + E + W
         )
         build_masks_button.bind("<ButtonPress-1>", self.build_masks)
         build_masks_button.bind("<Shift-ButtonPress-1>", self.build_masks)
@@ -304,51 +315,191 @@ class Ortho4XP_GUI(tk.Tk):
             self.frame_steps,
             text=" Build Imagery/DSF ",
             command=self.build_tile,
-        ).grid(row=0, column=3, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=3, padx=5, pady=0, sticky=N + S + E + W)
         ttk.Button(
             self.frame_steps, text="    All in one     ", command=self.build_all
-        ).grid(row=0, column=4, padx=5, pady=0, sticky=N + S + E + W)
+        ).grid(row=1, column=4, padx=5, pady=0, sticky=N + S + E + W)
+
+        # Support section
+        self.frame_aux.columnconfigure(0, weight=1)
+        tk.Label(
+            self.frame_aux,
+            text="Support",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
+            font="Helvetica 16 bold italic",
+        ).grid(row=0, column=0, sticky=W + E)
+        self.frame_aux_main = tk.Frame(
+            self.frame_aux, border=0, padx=0, pady=0, bg=UI.BG_COLOR
+        )
+        self.frame_aux_main.grid(row=1, column=0, sticky=N + S + W + E)
+        for i in range(6):
+            self.frame_aux_main.columnconfigure(i, weight=1)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Verify",
+            command=self.check_dependencies,
+            style="Compact.TButton",
+        ).grid(row=0, column=0, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Config",
+            command=self.open_config_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=1, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Preview",
+            command=self.open_earth_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=2, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Custom ZL",
+            command=self.open_custom_zl_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=3, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Stop",
+            command=self.set_red_flag,
+            style="Compact.TButton",
+        ).grid(row=0, column=4, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
+            text="Exit",
+            command=self.exit_prg,
+            style="Compact.TButton",
+        ).grid(row=0, column=5, padx=3, pady=0, sticky=N + S + E + W)
 
         # Fourth row (Progress bars and controls)
         # Label(self.frame_left,anchor=W,text="DSF/Masks progress",
         # bg="light green")
+        self.progress_titles = {
+            1: "Vector / mesh / masks",
+            2: "Downloads",
+            3: "DDS conversion",
+        }
         self.pgrb1v = tk.IntVar()
         self.pgrb2v = tk.IntVar()
         self.pgrb3v = tk.IntVar()
         self.pgrbv = {1: self.pgrb1v, 2: self.pgrb2v, 3: self.pgrb3v}
+        self.pgrb_detail = {
+            1: tk.StringVar(value="Idle"),
+            2: tk.StringVar(value="Idle"),
+            3: tk.StringVar(value="Idle"),
+        }
+        self.pgrb_pct = {
+            1: tk.StringVar(value="0%"),
+            2: tk.StringVar(value="0%"),
+            3: tk.StringVar(value="0%"),
+        }
+        for i in range(3):
+            tk.Label(
+                self.frame_bars,
+                text=self.progress_titles[i + 1],
+                fg=UI.FG_COLOR,
+                bg=UI.BG_COLOR,
+            ).grid(row=0, column=i, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb1 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb1v,
         )
-        self.pgrb1.grid(row=0, column=0, padx=5, pady=0)
+        self.pgrb1.grid(row=1, column=0, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[1],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=0, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[1],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=0, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb2 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb2v,
         )
-        self.pgrb2.grid(row=0, column=1, padx=5, pady=0)
+        self.pgrb2.grid(row=1, column=1, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[2],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=1, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[2],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=1, padx=5, pady=(0, 2), sticky=W + E)
         self.pgrb3 = ttk.Progressbar(
             self.frame_bars,
             mode="determinate",
             orient=HORIZONTAL,
             variable=self.pgrb3v,
         )
-        self.pgrb3.grid(row=0, column=2, padx=5, pady=0)
+        self.pgrb3.grid(row=1, column=2, padx=5, pady=0, sticky=W + E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_pct[3],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+        ).grid(row=2, column=2, padx=5, pady=(0, 2), sticky=E)
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.pgrb_detail[3],
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+        ).grid(row=3, column=2, padx=5, pady=(0, 2), sticky=W + E)
+        self.status_var = tk.StringVar(value="Idle")
+        tk.Label(
+            self.frame_bars,
+            textvariable=self.status_var,
+            fg=UI.FG_COLOR,
+            bg=UI.BG_COLOR,
+            anchor=W,
+            justify=LEFT,
+        ).grid(row=4, column=0, columnspan=3, padx=5, pady=(4, 0), sticky=W + E)
 
         # Console
-        self.console = tk.Text(self.frame_console, bd=0)
-        self.console.grid(row=0, column=0, sticky=N + S + E + W)
-        self.frame_console.rowconfigure(0, weight=1)
+        self.frame_console.rowconfigure(0, weight=0)
+        self.frame_console.rowconfigure(1, weight=1)
         self.frame_console.columnconfigure(0, weight=1)
+
+        self.btn_clear = ttk.Button(
+            self.frame_console,
+            text="Clear",
+            command=self.clear_console,
+            style="Flat.TButton",
+            takefocus=False,
+        )
+        self.btn_clear.grid(row=0, column=0, padx=5, pady=2, sticky=E)
+
+        self.console = tk.Text(self.frame_console, bd=0, bg=UI.ENTRY_BG, fg=UI.FG_COLOR, insertbackground=UI.FG_COLOR)
+        self.console.grid(row=1, column=0, sticky=N + S + E + W)
 
         # Update
         self.console_queue = queue.Queue()
         self.console_update()
         self.pgrb_queue = queue.Queue()
         self.pgrb_update()
+        self.status_update()
 
         # Redirection
         self.stdout_orig = sys.stdout
@@ -375,6 +526,9 @@ class Ortho4XP_GUI(tk.Tk):
             self.custom_build_dir.set("")
 
     # GUI methods
+    def clear_console(self):
+        self.console_queue.put(None)
+
     def write(self, line):
         self.console_queue.put(line)
 
@@ -385,11 +539,13 @@ class Ortho4XP_GUI(tk.Tk):
         try:
             while 1:
                 line = self.console_queue.get_nowait()
+                at_bottom = self.console.yview()[1] >= 0.99
                 if line is None:
                     self.console.delete(1.0, END)
                 else:
                     self.console.insert(END, str(line))
-                self.console.see(END)
+                if at_bottom:
+                    self.console.see(END)
                 self.console.update_idletasks()
         except queue.Empty:
             pass
@@ -398,11 +554,27 @@ class Ortho4XP_GUI(tk.Tk):
     def pgrb_update(self):
         try:
             while 1:
-                (nbr, value) = self.pgrb_queue.get_nowait()
+                item = self.pgrb_queue.get_nowait()
+                if len(item) == 3:
+                    (nbr, value, message) = item
+                else:
+                    (nbr, value) = item
+                    message = None
                 self.pgrbv[nbr].set(value)
+                self.pgrb_pct[nbr].set(f"{value}%")
+                if message:
+                    self.pgrb_detail[nbr].set(str(message))
         except queue.Empty:
             pass
         self.callback_pgrb = self.after(100, self.pgrb_update)
+
+    def status_update(self):
+        try:
+            while 1:
+                self.status_var.set(self.status_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.callback_status = self.after(100, self.status_update)
 
     def tile_change(self, *args):
         # HACK : user preference is to not trash custom_dem and zone_list on 
@@ -581,6 +753,37 @@ class Ortho4XP_GUI(tk.Tk):
 
     def set_red_flag(self):
         UI.red_flag = True
+        self.status_var.set("Stop requested. Waiting for the current step to stop...")
+
+    def check_dependencies(self):
+        UI.vprint(0, "\nChecking dependencies...")
+        all_found = True
+        
+        # Tools to check
+        tools = {
+            "gdal_translate": "GDAL (for geotagging/conversion)",
+            "gdalwarp": "GDAL (for reprojecting)",
+        }
+        
+        if OsX:
+            tools["magick"] = "ImageMagick (for Apple Silicon DDS conversion)"
+        else:
+            tools["nvcompress"] = "NVIDIA Texture Tools (for DDS conversion)"
+
+        for tool, desc in tools.items():
+            path = shutil.which(tool)
+            if path:
+                UI.vprint(0, f"  [OK] {tool} found: {path}")
+            else:
+                UI.vprint(0, f"  [!!] {tool} NOT FOUND ({desc})")
+                all_found = False
+        
+        if all_found:
+            UI.vprint(0, "All essential dependencies are satisfied!\n")
+        else:
+            UI.vprint(0, "Some dependencies are missing. Please install them via Homebrew.\n")
+            if OsX:
+                UI.vprint(0, "Try: brew install gdal imagemagick\n")
 
     def exit_prg(self):
         try:
@@ -602,6 +805,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             pass
         self.after_cancel(self.callback_pgrb)
+        self.after_cancel(self.callback_status)
         self.after_cancel(self.callback_console)
         sys.stdout = self.stdout_orig
         self.destroy()
@@ -677,12 +881,12 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
 
         # Frames
         self.frame_left = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_left.grid(row=0, column=0, sticky=N + S + W + E)
 
         self.frame_right = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_right.grid(row=0, column=1, sticky=N + S + W + E)
         self.frame_right.rowconfigure(0, weight=1)
@@ -694,14 +898,14 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Preview params ",
-            fg="light green",
-            bg="dark green",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
             font="Helvetica 16 bold italic",
         ).grid(row=row, column=0, sticky=W + E)
         row += 1
 
         tk.Label(
-            self.frame_left, anchor=W, text="Source : ", bg="light green"
+            self.frame_left, anchor=W, text="Source : ", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=row, column=0, padx=5, pady=3, sticky=W)
         self.map_combo = ttk.Combobox(
             self.frame_left,
@@ -715,7 +919,7 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         row += 1
 
         tk.Label(
-            self.frame_left, anchor=W, text="Zoomlevel : ", bg="light green"
+            self.frame_left, anchor=W, text="Zoomlevel : ", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=row, column=0, padx=5, pady=3, sticky=W)
         self.zl_combo = ttk.Combobox(
             self.frame_left,
@@ -738,14 +942,14 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Zone params ",
-            fg="light green",
-            bg="dark green",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
             font="Helvetica 16 bold italic",
         ).grid(row=row, column=0, pady=10, sticky=W + E)
         row += 1
 
         tk.Label(
-            self.frame_left, anchor=W, text="Source : ", bg="light green"
+            self.frame_left, anchor=W, text="Source : ", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=row, column=0, sticky=W, padx=5, pady=10)
         self.zmap_combo = ttk.Combobox(
             self.frame_left,
@@ -758,7 +962,7 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         self.zmap_combo.grid(row=row, column=0, padx=5, pady=10, sticky=E)
         row += 1
 
-        self.frame_zlbtn = tk.Frame(self.frame_left, border=0, bg="light green")
+        self.frame_zlbtn = tk.Frame(self.frame_left, border=0, bg=UI.BG_COLOR)
         for i in range(5):
             self.frame_zlbtn.columnconfigure(i, weight=1)
         self.frame_zlbtn.grid(
@@ -785,15 +989,17 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Approx. Add. Size : ",
-            bg="light green",
+            bg=UI.BG_COLOR,
+            fg=UI.FG_COLOR,
         ).grid(row=row, column=0, padx=5, pady=10, sticky=W)
         tk.Entry(
             self.frame_left,
             width=7,
             justify=RIGHT,
-            bg="white",
-            fg="blue",
+            bg=UI.ENTRY_BG,
+            fg=UI.ENTRY_FG,
             textvariable=self.gb,
+            insertbackground=UI.FG_COLOR,
         ).grid(row=row, column=0, padx=5, pady=10, sticky=E)
         row += 1
 
@@ -815,11 +1021,13 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             self.frame_left, text="Extract Mesh ", command=self.extract_mesh_ifc
         ).grid(row=row, column=0, padx=5, pady=3, sticky=N + S + E + W)
         row += 1
+        shortcut_text = "Cmd+B1 : add texture\nShift+B1: add zone point\nCmd+B2 : delete zone" if OsX else \
+                       "Ctrl+B1 : add texture\nShift+B1: add zone point\nCtrl+B2 : delete zone"
         tk.Label(
             self.frame_left,
-            text="Ctrl+B1 : add texture\nShift+B1: add zone point\n" + \
-                 "Ctrl+B2 : delete zone",
-            bg="light green",
+            text=shortcut_text,
+            bg=UI.BG_COLOR,
+            fg=UI.FG_COLOR,
             justify=LEFT,
         ).grid(row=row, column=0, padx=5, pady=20, sticky=N + S + E + W)
         row += 1
@@ -839,6 +1047,10 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         self.canvas.grid(row=0, column=0, sticky=N + S + E + W)
 
     def preview_tile(self, lat, lon):
+        self._tile_preview_request_id = getattr(
+            self, "_tile_preview_request_id", 0
+        ) + 1
+        request_id = self._tile_preview_request_id
         self.zoomlevel = int(self.zl_combo.get())
         zoomlevel = self.zoomlevel
         provider_code = self.map_combo.get()
@@ -863,16 +1075,35 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
                 target=IMG.create_tile_preview, args=fargs_ctp
             )
             self.ctp_thread.start()
-            fargs_dispp = [filepreview, lat, lon]
-            dispp_thread = threading.Thread(
-                target=self.show_tile_preview, args=fargs_dispp
+            self.after(
+                50,
+                lambda: self._wait_for_tile_preview(
+                    request_id, filepreview, lat, lon
+                ),
             )
-            dispp_thread.start()
         else:
-            self.show_tile_preview(filepreview, lat, lon)
+            self.show_tile_preview(request_id, filepreview, lat, lon)
         return
 
-    def show_tile_preview(self, filepreview, lat, lon):
+    def _wait_for_tile_preview(self, request_id, filepreview, lat, lon):
+        if request_id != getattr(self, "_tile_preview_request_id", 0):
+            return
+        try:
+            if self.ctp_thread.is_alive():
+                self.after(
+                    50,
+                    lambda: self._wait_for_tile_preview(
+                        request_id, filepreview, lat, lon
+                    ),
+                )
+                return
+        except:
+            pass
+        self.show_tile_preview(request_id, filepreview, lat, lon)
+
+    def show_tile_preview(self, request_id, filepreview, lat, lon):
+        if request_id != getattr(self, "_tile_preview_request_id", 0):
+            return
         for item in self.polyobj_list:
             try:
                 self.canvas.delete(item)
@@ -894,24 +1125,38 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         self.photo = ImageTk.PhotoImage(self.image)
         self.map_x_res = self.photo.width()
         self.map_y_res = self.photo.height()
-        self.img_map = self.canvas.create_image(
-            0, 0, anchor=NW, image=self.photo
-        )
-        self.canvas.config(scrollregion=self.canvas.bbox(ALL))
-        if "dar" in sys.platform:
+        try:
+            self.img_map = self.canvas.create_image(
+                0, 0, anchor=NW, image=self.photo
+            )
+            self.canvas.config(scrollregion=self.canvas.bbox(ALL))
+        except:
+            return
+        if OsX:
+            self.canvas.bind("<ButtonPress-1>", self.scroll_start)
+            self.canvas.bind("<B1-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-1>", self.scroll_stop)
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
-            self.canvas.bind("<Control-ButtonPress-2>", self.delPol)
+            self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
+            self.canvas.bind("<Command-ButtonPress-2>", self.delPol)
+            # Mac Trackpad panning & zooming
+            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+            self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
+            self.canvas.bind("<Command-MouseWheel>", self._on_zoom_wheel)
         else:
             self.canvas.bind("<ButtonPress-3>", self.scroll_start)
             self.canvas.bind("<B3-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-3>", self.scroll_stop)
             self.canvas.bind("<Control-ButtonPress-3>", self.delPol)
         self.canvas.bind(
             "<ButtonPress-1>", lambda event: self.canvas.focus_set()
-        )
+        ) if not OsX else None
         self.canvas.bind("<Shift-ButtonPress-1>", self.newPoint)
-        self.canvas.bind("<Control-Shift-ButtonPress-1>", self.newPointGrid)
-        self.canvas.bind("<Control-ButtonPress-1>", self.newPol)
+        mod_shift_key = "<Shift-Command-ButtonPress-1>" if OsX else "<Control-Shift-ButtonPress-1>"
+        self.canvas.bind(mod_shift_key, self.newPointGrid)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        self.canvas.bind(mod_key, self.newPol)
         self.canvas.focus_set()
         self.canvas.bind("p", self.newPoint)
         self.canvas.bind("d", self.delete_zone_cmd)
@@ -947,12 +1192,41 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         return
 
     def scroll_start(self, event):
+        self.canvas.config(cursor="closedhand")
+        self.canvas.focus_set()
         self.canvas.scan_mark(event.x, event.y)
         return
 
     def scroll_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
         return
+
+    def scroll_stop(self, event):
+        self.canvas.config(cursor="")
+        return
+
+    def _on_mousewheel(self, event):
+        delta = -1 * event.delta
+        # Mac scroll delta is small, needs a multiplier for natural speed
+        self.canvas.yview_scroll(int(delta), "units")
+
+    def _on_shift_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.xview_scroll(int(delta), "units")
+
+    def _on_zoom_wheel(self, event):
+        current_zl = int(self.zl_choice.get())
+        if event.delta > 0:
+            new_zl = min(current_zl + 1, 13)
+        else:
+            new_zl = max(current_zl - 1, 10)
+        if new_zl != current_zl:
+            # Calculate current view center to maintain position after zoom
+            x_center = self.canvas.canvasx(self.canvas.winfo_width() / 2)
+            y_center = self.canvas.canvasy(self.canvas.winfo_height() / 2)
+            lat_c, lon_c = GEO.pix_to_wgs84(x_center, y_center, current_zl)
+            self.zl_choice.set(str(new_zl))
+            self.preview_tile(lat_c, lon_c)
 
     def redraw_poly(self):
         try:
@@ -1249,11 +1523,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
 
         # Frames
         self.frame_left = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_left.grid(row=0, column=0, sticky=N + S + W + E)
         self.frame_right = tk.Frame(
-            self, border=4, relief=RIDGE, bg="light green"
+            self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
         self.frame_right.grid(row=0, rowspan=60, column=1, sticky=N + S + W + E)
         self.frame_right.rowconfigure(0, weight=1, minsize=self.canvas_min_y)
@@ -1265,17 +1539,18 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Active tile",
-            fg="light green",
-            bg="dark green",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
             font="Helvetica 16 bold italic",
         ).grid(row=row, column=0, sticky=W + E)
         row += 1
         self.latlon_entry = tk.Entry(
             self.frame_left,
             width=8,
-            bg="white",
-            fg="blue",
+            bg=UI.ENTRY_BG,
+            fg=UI.ENTRY_FG,
             textvariable=self.latlon,
+            insertbackground=UI.FG_COLOR,
         )
         self.latlon_entry.grid(row=row, column=0, padx=5, pady=5, sticky=N + S)
         row += 1
@@ -1284,8 +1559,8 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Erase cached data",
-            fg="light green",
-            bg="dark green",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
             font="Helvetica 16 bold italic",
         ).grid(row=row, column=0, sticky=W + E)
         row += 1
@@ -1295,8 +1570,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 text=item,
                 anchor=W,
                 variable=self.v_[item],
-                bg="light green",
-                activebackground="light green",
+                bg=UI.BG_COLOR,
+                fg=UI.FG_COLOR,
+                activebackground=UI.BG_COLOR,
+                activeforeground=UI.FG_COLOR,
+                selectcolor=UI.ENTRY_BG,
                 highlightthickness=0,
             ).grid(row=row, column=0, padx=5, pady=5, sticky=N + S + E + W)
             row += 1
@@ -1309,8 +1587,8 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.frame_left,
             anchor=W,
             text="Batch build tiles",
-            fg="light green",
-            bg="dark green",
+            fg=UI.BG_COLOR,
+            bg=UI.ACCENT_BG,
             font="Helvetica 16 bold italic",
         ).grid(row=row, column=0, sticky=W + E)
         row += 1
@@ -1320,8 +1598,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 text=item,
                 anchor=W,
                 variable=self.v_[item],
-                bg="light green",
-                activebackground="light green",
+                bg=UI.BG_COLOR,
+                fg=UI.FG_COLOR,
+                activebackground=UI.BG_COLOR,
+                activeforeground=UI.FG_COLOR,
+                selectcolor=UI.ENTRY_BG,
                 highlightthickness=0,
             ).grid(row=row, column=0, padx=5, pady=5, sticky=N + S + E + W)
             row += 1
@@ -1339,12 +1620,17 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.frame_left, text="      Exit      ", command=self.exit
         ).grid(row=row, column=0, padx=5, pady=5, sticky=N + S + E + W)
         row += 1
+        shortcut_text = "Shortcuts :\n-----------------\nScroll/B2-hold=move map\n" + \
+                        "B1-double-click=select active\n" + \
+                        "Shift+B1=add to batch build\nCmd+B1=link in Custom Scenery" if OsX else \
+                        "Shortcuts :\n-----------------\nB2-press+hold=move map\n" + \
+                        "B1-double-click=select active\n" + \
+                        "Shift+B1=add to batch build\nCtrl+B1=link in Custom Scenery"
         tk.Label(
             self.frame_left,
-            text="Shortcuts :\n-----------------\nB2-press+hold=move map\n" + \
-                 "B1-double-click=select active\n" + \
-                 "Shift+B1=add to batch build\nCtrl+B1=link in Custom Scenery",
-            bg="light green",
+            text=shortcut_text,
+            bg=UI.BG_COLOR,
+            fg=UI.FG_COLOR,
         ).grid(row=row, column=0, padx=0, pady=5, sticky=N + S + E + W)
         row += 1
 
@@ -1366,15 +1652,25 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         self.canvas.yview_moveto(y0 / self.resolution)
         self.nx0 = int((8 * x0) // self.resolution)
         self.ny0 = int((8 * y0) // self.resolution)
-        if "dar" in sys.platform:
+        self._redraw_id = None
+        if OsX:
+            self.canvas.bind("<ButtonPress-1>", self.scroll_start)
+            self.canvas.bind("<B1-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-1>", self.scroll_stop)
             self.canvas.bind("<ButtonPress-2>", self.scroll_start)
             self.canvas.bind("<B2-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-2>", self.scroll_stop)
+            # Mac Trackpad panning
+            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+            self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
         else:
             self.canvas.bind("<ButtonPress-3>", self.scroll_start)
             self.canvas.bind("<B3-Motion>", self.scroll_move)
+            self.canvas.bind("<ButtonRelease-3>", self.scroll_stop)
         self.canvas.bind("<Double-Button-1>", self.select_tile)
         self.canvas.bind("<Shift-ButtonPress-1>", self.add_tile)
-        self.canvas.bind("<Control-ButtonPress-1>", self.toggle_to_custom)
+        mod_key = "<Command-ButtonPress-1>" if OsX else "<Control-ButtonPress-1>"
+        self.canvas.bind(mod_key, self.toggle_to_custom)
         self.canvas.focus_set()
         self.draw_canvas(self.nx0, self.ny0)
         self.active_lat = lat
@@ -1407,9 +1703,22 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         return
 
     def threaded_preview(self):
-        threading.Thread(target=self.preview_existing_tiles).start()
+        self._preview_request_id = getattr(self, "_preview_request_id", 0) + 1
+        request_id = self._preview_request_id
+        self._preview_result = None
+        tiles_todo = list(self.dico_tiles_todo.keys())
+        working_dir = self.working_dir
+        grouped = self.grouped
+        self._preview_thread = threading.Thread(
+            target=self.preview_existing_tiles,
+            args=(request_id, working_dir, grouped, tiles_todo),
+        )
+        self._preview_thread.start()
+        self.after(50, lambda: self._poll_preview_existing_tiles(request_id))
 
-    def preview_existing_tiles(self):
+    def preview_existing_tiles(
+        self, request_id, working_dir, grouped, tiles_todo
+    ):
         dico_color = {
             11: "blue",
             12: "blue",
@@ -1421,13 +1730,12 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             18: "orange",
             19: "red",
         }
-        if self.dico_tiles_done:
-            for tile in self.dico_tiles_done:
-                for objid in self.dico_tiles_done[tile][:2]:
-                    self.canvas.delete(objid)
-            self.dico_tiles_done = {}
-        if not self.grouped:
-            for dir_name in os.listdir(self.working_dir):
+        tiles_done = {}
+        if not os.path.isdir(working_dir):
+            self._preview_result = (request_id, tiles_done, tiles_todo)
+            return
+        if not grouped:
+            for dir_name in os.listdir(working_dir):
                 if "XP_" in dir_name:
                     try:
                         lat = int(dir_name.split("XP_")[1][:3])
@@ -1437,13 +1745,11 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                     # With the enlarged accepetance rule for directory name 
                     # there might be more than one tile for the same (lat,lon),
                     # we skip all but the first encountered.
-                    if (lat, lon) in self.dico_tiles_done:
+                    if (lat, lon) in tiles_done:
                         continue
-                    [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
-                    [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
                     if os.path.isfile(
                         os.path.join(
-                            self.working_dir,
+                            working_dir,
                             dir_name,
                             "Earth nav data",
                             FNAMES.long_latlon(lat, lon) + ".dsf",
@@ -1454,7 +1760,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         try:
                             tmpf = open(
                                 os.path.join(
-                                    self.working_dir,
+                                    working_dir,
                                     dir_name,
                                     "Ortho4XP_"
                                     + FNAMES.short_latlon(lat, lon)
@@ -1467,7 +1773,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                             try:
                                 tmpf = open(
                                     os.path.join(
-                                        self.working_dir,
+                                        working_dir,
                                         dir_name,
                                         "Ortho4XP.cfg",
                                     ),
@@ -1494,24 +1800,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                             content = prov + "\n" + str(zl)
                         else:
                             content = "?"
-                        self.dico_tiles_done[(lat, lon)] = (
-                            self.canvas.create_rectangle(
-                                x0, y0, x1, y1, fill=color, stipple="gray12"
-                            )
-                            if not OsX
-                            else self.canvas.create_rectangle(
-                                x0, y0, x1, y1, outline="black"
-                            ),
-                            self.canvas.create_text(
-                                (x0 + x1) // 2,
-                                (y0 + y1) // 2,
-                                justify=CENTER,
-                                text=content,
-                                fill="black",
-                                font=("Helvetica", "12", "normal"),
-                            ),
-                            dir_name,
-                        )
+                        linked = False
                         link = os.path.join(
                             CFG.custom_scenery_dir,
                             "zOrtho4XP_" + FNAMES.short_latlon(lat, lon),
@@ -1519,46 +1808,30 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         if os.path.isdir(link):
                             if os.path.samefile(
                                 os.path.realpath(link),
-                                os.path.realpath(
-                                    os.path.join(self.working_dir, dir_name)
-                                ),
+                                os.path.realpath(os.path.join(working_dir, dir_name)),
                             ):
-                                if not OsX:
-                                    self.canvas.itemconfig(
-                                        self.dico_tiles_done[(lat, lon)][0],
-                                        stipple="gray50",
-                                    )
-                                else:
-                                    self.canvas.itemconfig(
-                                        self.dico_tiles_done[(lat, lon)][1],
-                                        font=(
-                                            "Helvetica",
-                                            "12",
-                                            "bold underline",
-                                        ),
-                                    )
-        elif self.grouped and os.path.isdir(
-            os.path.join(self.working_dir, "Earth nav data")
+                                linked = True
+                        tiles_done[(lat, lon)] = (color, content, dir_name, linked)
+        elif grouped and os.path.isdir(
+            os.path.join(working_dir, "Earth nav data")
         ):
-            for dir_name in os.listdir(
-                os.path.join(self.working_dir, "Earth nav data")
-            ):
+            for dir_name in os.listdir(os.path.join(working_dir, "Earth nav data")):
                 for file_name in os.listdir(
-                    os.path.join(self.working_dir, "Earth nav data", dir_name)
+                    os.path.join(working_dir, "Earth nav data", dir_name)
                 ):
                     try:
                         lat = int(file_name[0:3])
                         lon = int(file_name[3:7])
                     except:
                         continue
-                    [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
-                    [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
+                    if (lat, lon) in tiles_done:
+                        continue
                     color = "blue"
                     content = ""
                     try:
                         tmpf = open(
                             os.path.join(
-                                self.working_dir,
+                                working_dir,
                                 "Ortho4XP_"
                                 + FNAMES.short_latlon(lat, lon)
                                 + ".cfg",
@@ -1586,47 +1859,79 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         content = prov + "\n" + str(zl)
                     else:
                         content = "?"
-                    self.dico_tiles_done[(lat, lon)] = (
-                        self.canvas.create_rectangle(
-                            x0, y0, x1, y1, fill=color, stipple="gray12"
-                        )
-                        if not OsX
-                        else self.canvas.create_rectangle(
-                            x0, y0, x1, y1, outline="black"
-                        ),
-                        self.canvas.create_text(
-                            (x0 + x1) // 2,
-                            (y0 + y1) // 2,
-                            justify=CENTER,
-                            text=content,
-                            fill="black",
-                            font=("Helvetica", "12", "normal"),
-                        ),
-                        dir_name,
+                    linked = False
+                    link = os.path.join(
+                        CFG.custom_scenery_dir,
+                        "zOrtho4XP_" + os.path.basename(working_dir),
                     )
-            link = os.path.join(
-                CFG.custom_scenery_dir,
-                "zOrtho4XP_" + os.path.basename(self.working_dir),
-            )
-            if os.path.isdir(link):
-                if os.path.samefile(
-                    os.path.realpath(link), os.path.realpath(self.working_dir)
-                ):
-                    for (lat0, lon0) in self.dico_tiles_done:
-                        if "dar" not in sys.platform:
-                            self.canvas.itemconfig(
-                                self.dico_tiles_done[(lat, lon)][0],
-                                stipple="gray50",
-                            )
-                        else:
-                            self.canvas.itemconfig(
-                                self.dico_tiles_done[(lat, lon)][1],
-                                font=("Helvetica", "12", "bold underline"),
-                            )
-        for (lat, lon) in self.dico_tiles_todo:
+                    if os.path.isdir(link) and os.path.samefile(
+                        os.path.realpath(link), os.path.realpath(working_dir)
+                    ):
+                        linked = True
+                    tiles_done[(lat, lon)] = (color, content, dir_name, linked)
+        self._preview_result = (request_id, tiles_done, tiles_todo)
+        return
+
+    def _poll_preview_existing_tiles(self, request_id):
+        if request_id != getattr(self, "_preview_request_id", 0):
+            return
+        try:
+            if self._preview_thread.is_alive():
+                self.after(
+                    50, lambda: self._poll_preview_existing_tiles(request_id)
+                )
+                return
+        except:
+            return
+        if self._preview_result is None:
+            return
+        result_request_id, tiles_done, tiles_todo = self._preview_result
+        if result_request_id != request_id:
+            return
+        self._preview_result = None
+        self.apply_preview_existing_tiles(tiles_done, tiles_todo)
+
+    def apply_preview_existing_tiles(self, tiles_done, tiles_todo):
+        if self.dico_tiles_done:
+            for tile in self.dico_tiles_done:
+                for objid in self.dico_tiles_done[tile][:2]:
+                    self.canvas.delete(objid)
+        self.dico_tiles_done = {}
+        for (lat, lon), item in tiles_done.items():
+            color, content, dir_name, link = item
             [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
             [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
-            self.canvas.delete(self.dico_tiles_todo[(lat, lon)])
+            rect = (
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=color, stipple="gray12"
+                )
+                if not OsX
+                else self.canvas.create_rectangle(
+                    x0, y0, x1, y1, outline="black"
+                )
+            )
+            text = self.canvas.create_text(
+                (x0 + x1) // 2,
+                (y0 + y1) // 2,
+                justify=CENTER,
+                text=content,
+                fill="black",
+                font=("Helvetica", "12", "normal"),
+            )
+            self.dico_tiles_done[(lat, lon)] = (rect, text, dir_name)
+            if link:
+                if not OsX:
+                    self.canvas.itemconfig(rect, stipple="gray50")
+                else:
+                    self.canvas.itemconfig(
+                        text, font=("Helvetica", "12", "bold underline")
+                    )
+        for (lat, lon) in tiles_todo:
+            [x0, y0] = GEO.wgs84_to_pix(lat + 1, lon, self.earthzl)
+            [x1, y1] = GEO.wgs84_to_pix(lat, lon + 1, self.earthzl)
+            objid = self.dico_tiles_todo.get((lat, lon))
+            if objid:
+                self.canvas.delete(objid)
             self.dico_tiles_todo[(lat, lon)] = (
                 self.canvas.create_rectangle(
                     x0, y0, x1, y1, fill="red", stipple="gray12"
@@ -1755,12 +2060,12 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 for (lat0, lon0) in self.dico_tiles_done:
                     if not OsX:
                         self.canvas.itemconfig(
-                            self.dico_tiles_done[(lat, lon)][0],
+                            self.dico_tiles_done[(lat0, lon0)][0],
                             stipple="gray12",
                         )
                     else:
                         self.canvas.itemconfig(
-                            self.dico_tiles_done[(lat, lon)][1],
+                            self.dico_tiles_done[(lat0, lon0)][1],
                             font=("Helvetica", "12", "normal"),
                         )
                 return
@@ -1793,7 +2098,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                     )
                 else:
                     self.canvas.itemconfig(
-                        self.dico_tiles_done[(lat, lon)][1],
+                        self.dico_tiles_done[(lat0, lon0)][1],
                         font=("Helvetica", "12", "bold underline"),
                     )
         return
@@ -1841,13 +2146,34 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         return
 
     def scroll_start(self, event):
+        self.canvas.config(cursor="closedhand")
+        self.canvas.focus_set()
         self.canvas.scan_mark(event.x, event.y)
         return
 
     def scroll_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
-        self.redraw_canvas()
+        self.queue_redraw()
         return
+
+    def scroll_stop(self, event):
+        self.canvas.config(cursor="")
+        return
+
+    def queue_redraw(self):
+        if self._redraw_id:
+            self.after_cancel(self._redraw_id)
+        self._redraw_id = self.after(100, self.redraw_canvas)
+
+    def _on_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.yview_scroll(int(delta), "units")
+        self.queue_redraw()
+
+    def _on_shift_mousewheel(self, event):
+        delta = -1 * event.delta
+        self.canvas.xview_scroll(int(delta), "units")
+        self.queue_redraw()
 
     def redraw_canvas(self):
         x0 = self.canvas.canvasx(0)

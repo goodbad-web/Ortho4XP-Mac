@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 import sys
 import os
+os.environ["OPENCV_OPENCL_CACHE_ENABLE"] = "0"
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, hard), hard))
+except:
+    pass
 Ortho4XP_dir='..' if getattr(sys,'frozen',False) else '.'
 sys.path.append(os.path.join(Ortho4XP_dir,'src'))
 
@@ -21,55 +28,83 @@ if __name__ == '__main__':
     if not os.path.isdir(FNAMES.Utils_dir):
         print("Missing ",FNAMES.Utils_dir,"directory, check your install. Exiting.")
         sys.exit()   
-    for directory in (FNAMES.Preview_dir, FNAMES.Provider_dir, FNAMES.Extent_dir, FNAMES.Filter_dir, FNAMES.OSM_dir,
-                      FNAMES.Mask_dir,FNAMES.Imagery_dir,FNAMES.Elevation_dir,FNAMES.Geotiff_dir,FNAMES.Patch_dir,
-                      FNAMES.Tile_dir,FNAMES.Tmp_dir):
-        if not os.path.isdir(directory):
-            try: 
-                os.makedirs(directory)
-                print("Creating missing directory",directory)
-            except: 
-                print("Could not create required directory",directory,". Exit.")
-                sys.exit()
-    IMG.initialize_extents_dict()
-    IMG.initialize_color_filters_dict()
-    IMG.initialize_providers_dict()
-    IMG.initialize_combined_providers_dict()
-    if len(sys.argv)==1: # switch to the graphical interface
-        Ortho4XP = GUI.Ortho4XP_GUI()
-
-        Ortho4XP.mainloop()	    
-        print("Bon vol!")
-    else: # sequel is only concerned with command line 
-        if len(sys.argv)<3:
-            print(cmd_line); sys.exit()
-        try:
-            lat=int(sys.argv[1])
-            lon=int(sys.argv[2])
-        except:
-            print(cmd_line); sys.exit()
-        if len(sys.argv)==3:
+    import signal
+    def sig_handler(signum, frame):
+        print(f"\n[Ortho4XP] Caught termination signal ({signum}). Exiting cleanly...")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+        
+    import O4_RAMDisk_Utils
+    # 1. Recover any orphaned symbolic links from a previous crash/abrupt termination
+    O4_RAMDisk_Utils.recover_orphaned_symlinks()
+    
+    use_ram_disk = getattr(CFG.UI, 'use_ram_disk', False)
+    use_ram_disk_for_orthophotos = getattr(CFG.UI, 'use_ram_disk_for_orthophotos', False)
+    if use_ram_disk:
+        use_ram_disk = O4_RAMDisk_Utils.mount_ram_disk(
+            size_gb=getattr(CFG.UI, 'ram_disk_size_gb', 4),
+            use_orthophotos=use_ram_disk_for_orthophotos
+        )
+        if not use_ram_disk:
+            print("[Ortho4XP] RAM disk setup failed. Continuing without RAM disk.")
+        
+    try:
+        for directory in (FNAMES.Preview_dir, FNAMES.Provider_dir, FNAMES.Extent_dir, FNAMES.Filter_dir, FNAMES.OSM_dir,
+                          FNAMES.Mask_dir,FNAMES.Imagery_dir,FNAMES.Elevation_dir,FNAMES.Geotiff_dir,FNAMES.Patch_dir,
+                          FNAMES.Tile_dir,FNAMES.Tmp_dir):
+            if not os.path.isdir(directory):
+                try: 
+                    os.makedirs(directory)
+                    print("Creating missing directory",directory)
+                except: 
+                    print("Could not create required directory",directory,". Exit.")
+                    sys.exit()
+        IMG.initialize_extents_dict()
+        IMG.initialize_color_filters_dict()
+        IMG.initialize_providers_dict()
+        IMG.initialize_combined_providers_dict()
+        if len(sys.argv)==1: # switch to the graphical interface
+            Ortho4XP = GUI.Ortho4XP_GUI()
+    
+            Ortho4XP.mainloop()	    
+            print("Bon vol!")
+        else: # sequel is only concerned with command line 
+            if len(sys.argv)<3:
+                print(cmd_line); sys.exit()
             try:
-                tile=CFG.Tile(lat,lon,'')
-            except Exception as e:
-                print(e)
-                print("ERROR: could not read tile config file."); sys.exit()
-        else:
-            try:
-                provider_code=sys.argv[3]
-                zoomlevel=int(sys.argv[4])
-                tile=CFG.Tile(lat,lon,'')
-                tile.default_website=provider_code
-                tile.default_zl=zoomlevel
+                lat=int(sys.argv[1])
+                lon=int(sys.argv[2])
             except:
                 print(cmd_line); sys.exit()
-        try:
-            VMAP.build_poly_file(tile)
-            MESH.build_mesh(tile)
-            MASK.build_masks(tile)
-            TILE.build_tile(tile)
-            print("Bon vol!")
-        except:
-            print("Crash!")
+            if len(sys.argv)==3:
+                try:
+                    tile=CFG.Tile(lat,lon,'')
+                    tile.read_from_config()
+                except Exception as e:
+                    print(e)
+                    print("ERROR: could not initialize tile config."); sys.exit()
+            else:
+                try:
+                    provider_code=sys.argv[3]
+                    zoomlevel=int(sys.argv[4])
+                    tile=CFG.Tile(lat,lon,'')
+                    tile.default_website=provider_code
+                    tile.default_zl=zoomlevel
+                except:
+                    print(cmd_line); sys.exit()
+            try:
+                VMAP.build_poly_file(tile)
+                MESH.build_mesh(tile)
+                MASK.build_masks(tile)
+                TILE.build_tile(tile)
+                print("Bon vol!")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Crash! Error: {e}")
+    finally:
+        if use_ram_disk:
+            O4_RAMDisk_Utils.unmount_ram_disk(use_orthophotos=use_ram_disk_for_orthophotos)
  
         

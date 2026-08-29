@@ -1,0 +1,3 @@
+/Users/hiroshi/Developer/Ortho4XP-Mac/Utils/build/CMakeFiles/Triangle4XP.dir
+/Users/hiroshi/Developer/Ortho4XP-Mac/Utils/build/CMakeFiles/edit_cache.dir
+/Users/hiroshi/Developer/Ortho4XP-Mac/Utils/build/CMakeFiles/rebuild_cache.dir

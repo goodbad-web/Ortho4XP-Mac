@@ -17,6 +17,14 @@ good_imagery_list = ()
 
 ################################################################################
 def build_poly_file(tile):
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    try:
+        return _build_poly_file(tile)
+    finally:
+        UI.flush_build_log(tile.build_dir)
+
+def _build_poly_file(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
@@ -29,6 +37,7 @@ def build_poly_file(tile):
     UI.logprint(
         "Step 1 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
     )
+    UI.progress_bar(1, 0, "Building vector data")
     UI.vprint(
         0,
         "\nStep 1 : Building vector data for tile "
@@ -98,20 +107,19 @@ def build_poly_file(tile):
     UI.vprint(0, "-> Inserting edges related to the orthophotos grid")
     xgrid = set()  # x coordinates of vertical grid lines
     ygrid = set()  # y coordinates of horizontal grid lines
+    grid_zl = max([tile.mesh_zl, tile.cover_zl] + [zone[1] for zone in tile.zone_list])
     (til_xul, til_yul) = GEO.wgs84_to_orthogrid(
-        tile.lat + 1, tile.lon, tile.mesh_zl
+        tile.lat + 1, tile.lon, grid_zl
     )
     (til_xlr, til_ylr) = GEO.wgs84_to_orthogrid(
-        tile.lat, tile.lon + 1, tile.mesh_zl
+        tile.lat, tile.lon + 1, grid_zl
     )
     for til_x in range(til_xul + 16, til_xlr + 1, 16):
-        pos_x = til_x / (2 ** (tile.mesh_zl - 1)) - 1
+        pos_x = til_x / (2 ** (grid_zl - 1)) - 1
         xgrid.add(pos_x * 180 - tile.lon)
-        #print("x", pos_x * 180 - tile.lon)
     for til_y in range(til_yul + 16, til_ylr + 1, 16):
-        pos_y = 1 - (til_y) / (2 ** (tile.mesh_zl - 1))
+        pos_y = 1 - (til_y) / (2 ** (grid_zl - 1))
         ygrid.add(360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat)
-        #print("y", (360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat))
 
     xgrid.add(0)
     xgrid.add(1)
@@ -325,10 +333,9 @@ def include_roads(vector_map, tile, apt_array, apt_area):
     if not road_network_banked.is_empty:
         UI.vprint(1, "    * Buffering banked road network as multipolygon.")
         timer = time.time()
+        apt_buffer = VECT.improved_buffer(apt_area, tile.lane_width + 2, 0, 0)
         road_area = VECT.improved_buffer(
-            road_network_banked.difference(
-                VECT.improved_buffer(apt_area, tile.lane_width + 2, 0, 0)
-            ),
+            road_network_banked.difference(apt_buffer),
             tile.lane_width,
             2,
             0.5,
@@ -378,6 +385,7 @@ def include_sea(vector_map, tile):
             "    * User defined custom coastline data detected ",
             "(multiple files).",
         )
+        has_custom_files = False
         for osm_file in os.listdir(custom_coastline_dir):
             UI.vprint(2, "      ", osm_file)
             sea_layer.update_dicosm(
@@ -385,6 +393,8 @@ def include_sea(vector_map, tile):
                 input_tags=None,
                 target_tags=None,
             )
+            has_custom_files = True
+        if has_custom_files:
             sea_layer.write_to_file(custom_coastline)
         custom_source = True
     else:
@@ -513,6 +523,7 @@ def include_water(vector_map, tile):
         UI.vprint(
             1, "    * User defined custom water data detected (multiple files)."
         )
+        has_custom_files = False
         for osm_file in os.listdir(custom_water_dir):
             UI.vprint(2, "      ", osm_file)
             water_layer.update_dicosm(
@@ -520,6 +531,8 @@ def include_water(vector_map, tile):
                 input_tags=None,
                 target_tags=None,
             )
+            has_custom_files = True
+        if has_custom_files:
             water_layer.write_to_file(custom_water)
     else:
         queries = [
@@ -647,10 +660,10 @@ def include_patches(vector_map, tile):
         return x
 
     patches_list = []
-    patches_area = geometry.Polygon()
+    patches_geoms = []
     patch_dir = FNAMES.patch_dir(tile.lat, tile.lon)
     if not os.path.exists(patch_dir):
-        return (patches_area, patches_list)
+        return (geometry.MultiPolygon(), patches_list)
     for pfile_name in os.listdir(patch_dir):
         if pfile_name[-10:] != ".patch.osm":
             continue
@@ -802,7 +815,7 @@ def include_patches(vector_map, tile):
                 try:
                     pol = geometry.Polygon(way)
                     if pol.is_valid and pol.area:
-                        patches_area = patches_area.union(pol)
+                        patches_geoms.append(pol)
                         vector_map.insert_way(
                             numpy.hstack([way, alti_way]),
                             "INTERP_ALT",
@@ -871,17 +884,21 @@ def include_patches(vector_map, tile):
                         " skipping that one.",
                     )
                     continue
-            patches_area = patches_area.union(
-                keep_obj8(
-                    lat_anchor,
-                    lon_anchor,
-                    alt_anchor,
-                    heading_anchor,
-                    pfile_namelong,
-                    vector_map,
-                    tile,
-                )
+            obj8_area = keep_obj8(
+                lat_anchor,
+                lon_anchor,
+                alt_anchor,
+                heading_anchor,
+                pfile_namelong,
+                vector_map,
+                tile,
             )
+            if not obj8_area.is_empty:
+                patches_geoms.append(obj8_area)
+    if not patches_geoms:
+        patches_area = geometry.MultiPolygon()
+    else:
+        patches_area = VECT.ensure_MultiPolygon(ops.unary_union(patches_geoms))
     return (patches_area, patches_list)
 
 
@@ -901,68 +918,68 @@ def keep_obj8(
     index = 0
     latscale = GEO.m_to_lat
     lonscale = latscale / cos(lat_anchor * pi / 180)
-    f = open(objfile_name, "r")
-    for line in f.readlines():
-        if line[0:2] == "VT":
-            (xo, yo, zo) = [float(s) for s in line.split()[1:4]]
-            Xo = xo * cos(heading_anchor * pi / 180) - zo * sin(
-                heading_anchor * pi / 180
-            )
-            Zo = xo * sin(heading_anchor * pi / 180) + zo * cos(
-                heading_anchor * pi / 180
-            )
-            y = numpy.round(lat_anchor - latscale * float(Zo) - tile.lat, 7)
-            x = numpy.round(lon_anchor + lonscale * float(Xo) - tile.lon, 7)
-            z = yo + alt_anchor
-            dico_idx_nodes[idx_node] = vector_map.insert_node(x, y, z)
-            idx_node += 1
-        elif line[0:3] == "IDX":
-            dico_index[index] = [int(x) for x in line.split()[1:]]
-            index += 1
-        elif line[0:4] == "TRIS":
-            (offset, count) = [int(x) for x in line.split()[1:3]]
-            list = []
-            count_tmp = 0
-            try:
-                polist = []
-                while count_tmp < count:
-                    list += dico_index[offset]
-                    count_tmp += len(dico_index[offset])
-                    offset += 1
-                for j in range(count // 3):
-                    (a, b, c) = [
-                        dico_idx_nodes[x] for x in list[3 * j : 3 * j + 3]
-                    ]
-                    if a == b or a == c or b == c:
-                        continue
-                    for (initp, endp) in ((a, b), (b, c), (c, a)):
-                        vector_map.insert_edge(
-                            initp,
-                            endp,
-                            vector_map.dico_attributes["INTERP_ALT"],
-                            check=True,
+    multipol = geometry.MultiPolygon()
+    with open(objfile_name, "r") as f:
+        for line in f:
+            if line[0:2] == "VT":
+                (xo, yo, zo) = [float(s) for s in line.split()[1:4]]
+                Xo = xo * cos(heading_anchor * pi / 180) - zo * sin(
+                    heading_anchor * pi / 180
+                )
+                Zo = xo * sin(heading_anchor * pi / 180) + zo * cos(
+                    heading_anchor * pi / 180
+                )
+                y = numpy.round(lat_anchor - latscale * float(Zo) - tile.lat, 7)
+                x = numpy.round(lon_anchor + lonscale * float(Xo) - tile.lon, 7)
+                z = yo + alt_anchor
+                dico_idx_nodes[idx_node] = vector_map.insert_node(x, y, z)
+                idx_node += 1
+            elif line[0:3] == "IDX":
+                dico_index[index] = [int(x) for x in line.split()[1:]]
+                index += 1
+            elif line[0:4] == "TRIS":
+                (offset, count) = [int(x) for x in line.split()[1:3]]
+                list = []
+                count_tmp = 0
+                try:
+                    polist = []
+                    while count_tmp < count:
+                        list += dico_index[offset]
+                        count_tmp += len(dico_index[offset])
+                        offset += 1
+                    for j in range(count // 3):
+                        (a, b, c) = [
+                            dico_idx_nodes[x] for x in list[3 * j : 3 * j + 3]
+                        ]
+                        if a == b or a == c or b == c:
+                            continue
+                        for (initp, endp) in ((a, b), (b, c), (c, a)):
+                            vector_map.insert_edge(
+                                initp,
+                                endp,
+                                vector_map.dico_attributes["INTERP_ALT"],
+                                check=True,
+                            )
+                        seed = (
+                            numpy.array(vector_map.nodes_dico[a])
+                            + numpy.array(vector_map.nodes_dico[b])
+                            + numpy.array(vector_map.nodes_dico[c])
+                        ) / 3
+                        if "INTERP_ALT" in vector_map.seeds:
+                            vector_map.seeds["INTERP_ALT"].append(seed)
+                        else:
+                            vector_map.seeds["INTERP_ALT"] = [seed]
+                        polist.append(
+                            geometry.Polygon(
+                                [
+                                    vector_map.nodes_dico[a],
+                                    vector_map.nodes_dico[b],
+                                    vector_map.nodes_dico[c],
+                                    vector_map.nodes_dico[a],
+                                ]
+                            )
                         )
-                    seed = (
-                        numpy.array(vector_map.nodes_dico[a])
-                        + numpy.array(vector_map.nodes_dico[b])
-                        + numpy.array(vector_map.nodes_dico[c])
-                    ) / 3
-                    if "INTERP_ALT" in vector_map.seeds:
-                        vector_map.seeds["INTERP_ALT"].append(seed)
-                    else:
-                        vector_map.seeds["INTERP_ALT"] = [seed]
-                    polist.append(
-                        geometry.Polygon(
-                            [
-                                vector_map.nodes_dico[a],
-                                vector_map.nodes_dico[b],
-                                vector_map.nodes_dico[c],
-                                vector_map.nodes_dico[a],
-                            ]
-                        )
-                    )
-                multipol = VECT.ensure_MultiPolygon(ops.unary_union(polist))
-            except:
-                pass
-    f.close()
+                    multipol = VECT.ensure_MultiPolygon(ops.unary_union(polist))
+                except:
+                    pass
     return multipol

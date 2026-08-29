@@ -229,109 +229,126 @@ def build_curv_tol_weight_map(tile, weight_array):
 ################################################################################
 def post_process_nodes_altitudes(tile):
     dico_attributes = VECT.Vector_Map.dico_attributes
-    f_node = open(FNAMES.output_node_file(tile), "r")
-    init_line_f_node = f_node.readline()
-    nbr_pt = int(init_line_f_node.split()[0])
-    vertices = numpy.zeros(6 * nbr_pt)
     UI.vprint(1, "-> Loading of the mesh computed by Triangle4XP.")
-    for i in range(0, nbr_pt):
-        vertices[6 * i : 6 * i + 6] = [
-            float(x) for x in f_node.readline().split()[1:7]
-        ]
-    end_line_f_node = f_node.readline()
-    f_node.close()
+    
+    node_path = FNAMES.output_node_file(tile)
+    with open(node_path, "r") as f_node:
+        init_line_f_node = f_node.readline()
+        nbr_pt = int(init_line_f_node.split()[0])
+        # Fast loading using numpy
+        data = numpy.loadtxt(f_node, skiprows=0, usecols=range(1, 7))
+        vertices = data.flatten()
+        # Read the last line if it exists (usually just a newline or empty)
+        end_line_f_node = "" # Triangle usually doesn't have an 'end line' in .node, just nodes
+    
     UI.vprint(1, "-> Post processing of altitudes according to vector data")
     f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_tri = int(f_ele.readline().split()[0])
+    tri_rows = []
     water_tris = set()
     sea_tris = set()
     interp_alt_tris = set()
     for i in range(nbr_tri):
         line = f_ele.readline()
+        if not line: break
+        parts = line.split()
+        tri_rows.append(" ".join(parts[1:]))
         # triangle attributes are powers of 2, except for the dummy attributed
-        # which doesn't require post-treatment
         if line[-2] == "0":
             continue
-        (v1, v2, v3, attr) = [int(x) - 1 for x in line.split()[1:5]]
+        if len(parts) < 5: continue
+        (v1, v2, v3, attr) = [int(x) - 1 for x in parts[1:5]]
         attr += 1
-        if attr >= dico_attributes["INTERP_ALT"]:
+        if attr >= dico_attributes.get("INTERP_ALT", 1000000):
             interp_alt_tris.add((v1, v2, v3))
-        elif attr & dico_attributes["SEA"]:
+        elif attr & dico_attributes.get("SEA", 0):
             sea_tris.add((v1, v2, v3))
         elif (
-            attr & dico_attributes["WATER"]
-            or attr & dico_attributes["SEA_EQUIV"]
+            attr & dico_attributes.get("WATER", 0)
+            or attr & dico_attributes.get("SEA_EQUIV", 0)
         ):
             water_tris.add((v1, v2, v3))
+    f_ele.close()
+
     if tile.water_smoothing:
         UI.vprint(1, "   Smoothing inland water.")
-        for j in range(tile.water_smoothing):
-            for v1, v2, v3 in water_tris:
-                zmean = (
-                    vertices[6 * v1 + 2]
-                    + vertices[6 * v2 + 2]
-                    + vertices[6 * v3 + 2]
-                ) / 3
+        v_indices = numpy.array(list(water_tris))
+        if v_indices.size > 0:
+            for j in range(tile.water_smoothing):
+                v1, v2, v3 = v_indices[:, 0], v_indices[:, 1], v_indices[:, 2]
+                zmean = (vertices[6 * v1 + 2] + vertices[6 * v2 + 2] + vertices[6 * v3 + 2]) / 3.0
                 vertices[6 * v1 + 2] = zmean
                 vertices[6 * v2 + 2] = zmean
                 vertices[6 * v3 + 2] = zmean
+
     UI.vprint(1, "   Smoothing of sea water.")
-    for v1, v2, v3 in sea_tris:
+    s_indices = numpy.array(list(sea_tris))
+    if s_indices.size > 0:
+        v1, v2, v3 = s_indices[:, 0], s_indices[:, 1], s_indices[:, 2]
         if tile.sea_smoothing_mode == "zero":
             vertices[6 * v1 + 2] = 0
             vertices[6 * v2 + 2] = 0
             vertices[6 * v3 + 2] = 0
         elif tile.sea_smoothing_mode == "mean":
-            zmean = (
-                vertices[6 * v1 + 2]
-                + vertices[6 * v2 + 2]
-                + vertices[6 * v3 + 2]
-            ) / 3
+            zmean = (vertices[6 * v1 + 2] + vertices[6 * v2 + 2] + vertices[6 * v3 + 2]) / 3.0
             vertices[6 * v1 + 2] = zmean
             vertices[6 * v2 + 2] = zmean
             vertices[6 * v3 + 2] = zmean
         else:
-            vertices[6 * v1 + 2] = max(vertices[6 * v1 + 2], 0)
-            vertices[6 * v2 + 2] = max(vertices[6 * v2 + 2], 0)
-            vertices[6 * v3 + 2] = max(vertices[6 * v3 + 2], 0)
+            vertices[6 * v1 + 2] = numpy.maximum(vertices[6 * v1 + 2], 0)
+            vertices[6 * v2 + 2] = numpy.maximum(vertices[6 * v2 + 2], 0)
+            vertices[6 * v3 + 2] = numpy.maximum(vertices[6 * v3 + 2], 0)
+    
     UI.vprint(1, "   Treatment of airports, roads and patches.")
-    for v1, v2, v3 in interp_alt_tris:
-        vertices[6 * v1 + 2] = vertices[6 * v1 + 5]
-        vertices[6 * v2 + 2] = vertices[6 * v2 + 5]
-        vertices[6 * v3 + 2] = vertices[6 * v3 + 5]
-        vertices[6 * v1 + 3] = 0
-        vertices[6 * v2 + 3] = 0
-        vertices[6 * v3 + 3] = 0
-        vertices[6 * v1 + 4] = 0
-        vertices[6 * v2 + 4] = 0
-        vertices[6 * v3 + 4] = 0
+    i_indices = numpy.array(list(interp_alt_tris))
+    if i_indices.size > 0:
+        v1, v2, v3 = i_indices[:, 0], i_indices[:, 1], i_indices[:, 2]
+        for v in [v1, v2, v3]:
+            vertices[6 * v + 2] = vertices[6 * v + 5]
+            vertices[6 * v + 3] = 0
+            vertices[6 * v + 4] = 0
+            
+    if getattr(tile, "clamp_land_elevation", False):
+        UI.vprint(1, "   Clamping land elevations below 0m to 0m.")
+        vertices[2::6] = numpy.maximum(vertices[2::6], 0.0)
+            
     UI.vprint(1, "-> Writing output nodes file.")
-    f_node = open(FNAMES.output_node_file(tile), "w")
-    f_node.write(init_line_f_node)
-    for i in range(0, nbr_pt):
-        f_node.write(
-            str(i + 1)
-            + " "
-            + " ".join(
-                ("{:.15f}".format(x) for x in vertices[6 * i : 6 * i + 6])
-            )
-            + "\n"
-        )
-    f_node.write(end_line_f_node)
-    f_node.close()
-    return vertices
+    with open(FNAMES.output_node_file(tile), "w") as f_node:
+        f_node.write(init_line_f_node)
+        v_matrix = vertices.reshape((-1, 6))
+        indices = numpy.arange(1, len(v_matrix) + 1).reshape((-1, 1))
+        out_data = numpy.hstack([indices, v_matrix])
+        numpy.savetxt(f_node, out_data, fmt='%d %.15f %.15f %.15f %.15f %.15f %.15f')
+    return vertices, tri_rows
 
 
 ################################################################################
-def write_mesh_file(tile, vertices):
+def write_mesh_file(tile, vertices, tri_rows=None):
     UI.vprint(
         1,
         "-> Writing final mesh to the file "
         + FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon),
     )
-    f_ele = open(FNAMES.output_ele_file(tile), "r")
     nbr_vert = len(vertices) // 6
-    nbr_tri = int(f_ele.readline().split()[0])
+    if nbr_vert > 900000:
+        UI.vprint(
+            0,
+            "\nWARNING: Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
+        )
+        UI.vprint(
+            0,
+            "         The final DSF node count might exceed the 1,000,000 Metal absolute limit and crash X-Plane 12.\n"
+        )
+    if tri_rows is None:
+        f_ele = open(FNAMES.output_ele_file(tile), "r")
+        nbr_tri = int(f_ele.readline().split()[0])
+        tri_rows = []
+        for _ in range(nbr_tri):
+            line = f_ele.readline()
+            tri_rows.append(" ".join(line.split()[1:]))
+        f_ele.close()
+    else:
+        nbr_tri = len(tri_rows)
     f = open(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon), "w")
     f.write("MeshVersionFormatted 2\n")
     f.write("Dimension 3\n\n")
@@ -359,9 +376,8 @@ def write_mesh_file(tile, vertices):
     f.write("\n")
     f.write("Triangles\n")
     f.write(str(nbr_tri) + "\n")
-    for i in range(0, nbr_tri):
-        f.write(" ".join(f_ele.readline().split()[1:]) + "\n")
-    f_ele.close()
+    for row in tri_rows:
+        f.write(row + "\n")
     f.close()
     return
 
@@ -538,6 +554,18 @@ def extract_mesh_to_obj(
 
 ################################################################################
 def build_mesh(tile):
+    if not UI.is_building_all:
+        UI.initialize_build_log(tile.build_dir)
+    tile.mesh_retry_count = 0
+    tile.original_curvature_tol = tile.curvature_tol
+    try:
+        return _build_mesh(tile)
+    finally:
+        if hasattr(tile, "original_curvature_tol"):
+            tile.curvature_tol = tile.original_curvature_tol
+        UI.flush_build_log(tile.build_dir)
+
+def _build_mesh(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
@@ -552,7 +580,7 @@ def build_mesh(tile):
         + FNAMES.short_latlon(tile.lat, tile.lon)
         + " : \n--------\n",
     )
-    UI.progress_bar(1, 0)
+    UI.progress_bar(1, 0, "Building mesh")
     poly_file = FNAMES.input_poly_file(tile)
     node_file = FNAMES.input_node_file(tile)
     alt_file = FNAMES.alt_file(tile)
@@ -573,9 +601,7 @@ def build_mesh(tile):
             return 0
         try:
             fill_nodata = tile.fill_nodata or "to zero"
-            source = (
-                (";" in tile.custom_dem) and tile.custom_dem.split(";")[0]
-            ) or tile.custom_dem
+            source = tile.custom_dem.split(";", 1)[0] if tile.custom_dem else ""
             tile.dem = DEM.DEM(
                 tile.lat, tile.lon, source, fill_nodata, info_only=True
             )
@@ -598,10 +624,14 @@ def build_mesh(tile):
             return 0
     else:
         try:
-            source = (
-                (";" in tile.custom_dem)
-                and tile.custom_dem.split(";")[tile.iterate]
-            ) or tile.custom_dem
+            sources = tile.custom_dem.split(";") if tile.custom_dem else [""]
+            if len(sources) > 1 and tile.iterate >= len(sources):
+                UI.exit_message_and_bottom_line(
+                    "\nERROR: custom_dem has fewer sources than iterate index.",
+                    " Please check your custom_dem entry.",
+                )
+                return 0
+            source = sources[tile.iterate] if len(sources) > 1 else sources[0]
             tile.dem = DEM.DEM(
                 tile.lat, tile.lon, source, fill_nodata=False, info_only=True
             )
@@ -645,7 +675,7 @@ def build_mesh(tile):
     if max_tris <= 0 or max_tris >= 5e7:
         max_tris = 5e6
     max_steiner = max_tris / 1.9 - input_nodes
-    max_steiner = max(max_steiner, 5e5)
+    max_steiner = max(max_steiner, 2e4)
 
     limit_tris = "S" + str(max_steiner)
     Tri_option = (
@@ -739,13 +769,31 @@ def build_mesh(tile):
         UI.exit_message_and_bottom_line()
         return 0
 
-    vertices = post_process_nodes_altitudes(tile)
+    vertices, tri_rows = post_process_nodes_altitudes(tile)
 
     if UI.red_flag:
         UI.exit_message_and_bottom_line()
         return 0
 
-    write_mesh_file(tile, vertices)
+    nbr_vert = len(vertices) // 6
+    if nbr_vert > 900000 and getattr(tile, "mesh_retry_count", 0) < 3:
+        tile.mesh_retry_count += 1
+        new_tol = tile.curvature_tol * 1.5
+        UI.vprint(
+            0,
+            "\n[Auto-Retry] Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
+        )
+        UI.vprint(
+            0,
+            "             Increasing curvature_tol from {:.4f} to {:.4f} (Attempt {}/3)...".format(
+                tile.curvature_tol, new_tol, tile.mesh_retry_count
+            )
+        )
+        tile.curvature_tol = new_tol
+        UI.is_working = 0  # Re-enable execution for the retry
+        return _build_mesh(tile)
+
+    write_mesh_file(tile, vertices, tri_rows)
     #
     if UI.cleaning_level:
         try:
@@ -791,25 +839,72 @@ def sort_mesh(tile):
     if not os.path.isfile(mesh_file):
         UI.exit_message_and_bottom_line("\nERROR: Could not find ", mesh_file)
         return 0
-    sort_mesh_cmd_list = [
-        sort_mesh_cmd.strip(),
-        str(tile.default_zl),
-        mesh_file,
-    ]
-    UI.vprint(1, "-> Reorganizing mesh triangles.")
+    
+    UI.vprint(1, "-> Reorganizing mesh triangles (Native Python/NumPy).")
     timer = time.time()
-    moulinette = subprocess.Popen(
-        sort_mesh_cmd_list, stdout=subprocess.PIPE, bufsize=0
-    )
-    while True:
-        line = moulinette.stdout.readline()
-        if not line:
-            break
-        else:
-            print(line.decode("utf-8")[:-1])
+    
+    try:
+        with open(mesh_file, "r") as f:
+            lines = f.readlines()
+        
+        header = lines[:4]
+        ptr = 4
+        
+        # Nodes
+        # Nodes
+        nbr_nodes = int(float(lines[ptr].split()[0]))
+        ptr += 1
+        nodes_data = [l.strip() for l in lines[ptr : ptr + nbr_nodes]]
+        ptr += nbr_nodes
+
+        # Skip to Normals
+        while ptr < len(lines) and "Normals" not in lines[ptr]:
+            ptr += 1
+        ptr += 1
+        nbr_norms = int(float(lines[ptr].split()[0]))
+        ptr += 1
+        norms_data = [l.strip() for l in lines[ptr : ptr + nbr_norms]]
+        ptr += nbr_norms
+
+        # Skip to Triangles
+        while ptr < len(lines) and "Triangles" not in lines[ptr]:
+            ptr += 1
+        ptr += 1
+        nbr_tris = int(float(lines[ptr].split()[0]))
+        ptr += 1
+        # tris_data: v1, v2, v3, attr (4 columns)
+        tris_list = [l.split()[:4] for l in lines[ptr : ptr + nbr_tris]]
+        tris_data = numpy.array(tris_list, dtype=float).astype(int)
+
+        # Sort triangles by attribute (column index 3)
+        sorted_indices = numpy.argsort(tris_data[:, 3])
+        sorted_tris = tris_data[sorted_indices]
+
+        # Write back (MeshVersionFormatted 2)
+        with open(mesh_file, "w") as f:
+            f.write("MeshVersionFormatted 2\n")
+            f.write("Dimension 3\n\n")
+            f.write("Vertices\n")
+            f.write(f"{nbr_nodes}\n")
+            for line in nodes_data:
+                f.write(line + "\n")
+            f.write("\nNormals\n")
+            f.write(f"{nbr_norms}\n")
+            for line in norms_data:
+                f.write(line + "\n")
+            f.write("\nTriangles\n")
+            f.write(f"{nbr_tris}\n")
+            for i in range(nbr_tris):
+                # Triangles format: v1 v2 v3 attr
+                f.write(f"{sorted_tris[i,0]} {sorted_tris[i,1]} {sorted_tris[i,2]} {sorted_tris[i,3]}\n")
+            
+    except Exception as e:
+        UI.vprint(1, f"   WARNING: Native sorting failed ({e}), skipping. Scenery might be slightly larger.")
+        return 0
+
     UI.timings_and_bottom_line(timer)
     UI.logprint(
-        "Moulinette applied for tile lat=",
+        "Native Python Moulinette applied for tile lat=",
         tile.lat,
         ", lon=",
         tile.lon,
@@ -853,7 +948,7 @@ def read_mesh_file(mesh_file):
     for i in range(3):
         f.readline()
     
-    nbr_nodes = int(f.readline())
+    nbr_nodes = int(float(f.readline()))
     node_coords = numpy.zeros(5 * nbr_nodes)
     
     # read positions
@@ -877,15 +972,15 @@ def read_mesh_file(mesh_file):
     # skip 2 lines
     for i in range(0, 2): 
         f.readline()
-
+ 
     # read nbr of tris
-    nbr_tris = int(f.readline())      
+    nbr_tris = int(float(f.readline()))      
 
     tri_idx  = numpy.zeros(3 * nbr_tris, dtype = numpy.uint32)
     tri_types = numpy.zeros(nbr_tris, dtype = numpy.uint32)
     for i in range(nbr_tris):
         (n1, n2, n3, t) = [
-            int(x) - 1 for x in f.readline().split()[:4]
+            int(float(x)) - 1 for x in f.readline().split()[:4]
         ]
         tri_idx[3 * i: 3 * i + 3] = (n1, n2, n3)
         tri_types[i] = t + 1
@@ -893,4 +988,3 @@ def read_mesh_file(mesh_file):
 
     return (mesh_version, nbr_nodes, node_coords, nbr_tris, tri_idx, tri_types)
 ##############################################################################
-

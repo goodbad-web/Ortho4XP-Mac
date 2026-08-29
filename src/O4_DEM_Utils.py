@@ -140,20 +140,68 @@ class DEM:
                         numpy.zeros((3601, 3601), dtype=numpy.float32),
                     )
         else:
-            file_name = source
-            (
-                self.epsg,
-                self.x0,
-                self.y0,
-                self.x1,
-                self.y1,
-                self.nodata,
-                self.nxdem,
-                self.nydem,
-                self.alt_dem,
-            ) = read_elevation_from_file(
-                file_name, self.lat, self.lon, info_only
-            )
+            if os.path.isdir(source):
+                file_name = source
+                target_hgt = (FNAMES.hem_latlon(self.lat, self.lon) + ".hgt").lower()
+                target_tif = (FNAMES.hem_latlon(self.lat, self.lon) + ".tif").lower()
+                for root, dirs, files in os.walk(source):
+                    for f in files:
+                        if f.lower() == target_hgt or f.lower() == target_tif:
+                            file_name = os.path.join(root, f)
+                            break
+                    if file_name != source:
+                        UI.vprint(1, "   INFO: Found matching custom DEM in directory:", file_name)
+                        break
+                if file_name == source:
+                    UI.vprint(1, "   INFO: No matching DEM found in", source, ", falling back to default.")
+                    if os.path.exists(FNAMES.generic_tif(self.lat, self.lon)):
+                        file_name = FNAMES.generic_tif(self.lat, self.lon)
+                    else:
+                        short_source = available_sources[0]
+                        if ensure_elevation(short_source, self.lat, self.lon):
+                            file_name = FNAMES.elevation_data(short_source, self.lat, self.lon)
+                        else:
+                            # If even fallback fails, don't pass the directory to read_elevation_from_file
+                            # instead, set to empty so it gets zero altitude in read_elevation_from_file or here
+                            file_name = "" 
+            else:
+                file_name = source
+            if not file_name:
+                (
+                    self.epsg,
+                    self.x0,
+                    self.y0,
+                    self.x1,
+                    self.y1,
+                    self.nodata,
+                    self.nxdem,
+                    self.nydem,
+                    self.alt_dem,
+                ) = (
+                    4326,
+                    0,
+                    0,
+                    1,
+                    1,
+                    -32768,
+                    3601,
+                    3601,
+                    numpy.zeros((3601, 3601), dtype=numpy.float32),
+                )
+            else:
+                (
+                    self.epsg,
+                    self.x0,
+                    self.y0,
+                    self.x1,
+                    self.y1,
+                    self.nodata,
+                    self.nxdem,
+                    self.nydem,
+                    self.alt_dem,
+                ) = read_elevation_from_file(
+                    file_name, self.lat, self.lon, info_only
+                )
         if not local_sources:
             return
         self.subdems = tuple()
@@ -448,6 +496,8 @@ def read_elevation_from_file(
         epsg = 4326
         nodata = -32768
         try:
+            if not os.path.isfile(file_name):
+                raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
             if not info_only:
                 alt_dem = (
@@ -476,6 +526,8 @@ def read_elevation_from_file(
 
     elif file_name[-4:].lower() == ".raw":
         try:
+            if not os.path.isfile(file_name):
+                raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
             f = open(file_name, "rb")
             alt = array.array("h")
@@ -730,6 +782,7 @@ def ensure_elevation(source, lat, lon, verbose=True):
                     with open(out_filename, "wb") as out:
                         UI.vprint(2, "      Extracting", out_filename)
                         out.write(zip_ref.open(f, "r").read())
+        return 1 if os.path.exists(FNAMES.viewfinderpanorama(lat, lon)) else 0
     elif source in ("SRTM", "ALOS"):
         if os.path.exists(FNAMES.elevation_data(source, lat, lon)):
             UI.vprint(
@@ -867,7 +920,7 @@ def fill_nodata_values_with_nearest_neighbor(alt_dem, nodata):
     step = 0
     while (alt_dem == nodata).any():
         if not step:
-            if numpy.sum(alt_dem == nodata) >= 10000:
+            if numpy.sum(alt_dem == nodata) >= 100000:
                 return 0
             UI.vprint(
                 2,
@@ -965,16 +1018,32 @@ def smoothen(raster, pix_width, mask_im, preserve_boundary=True):
     kernel = kernel / (pix_width + 1) ** 2
     tmp = tmp * mask_array
     tmpw = numpy.array(mask_array)
-    for i in range(0, len(tmp)):
-        tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
-        tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
-    tmp = tmp.transpose()
-    tmpw = tmpw.transpose()
-    for i in range(0, len(tmp)):
-        tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
-        tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
-    tmp = tmp.transpose()
-    tmpw = tmpw.transpose()
+    use_gpu = getattr(UI, "use_gpu_for_dem_smoothing", False)
+    if use_gpu:
+        try:
+            import cv2
+            gpu_tmp = cv2.UMat(tmp)
+            gpu_tmpw = cv2.UMat(tmpw)
+            k_float = kernel.astype(numpy.float32)
+            gpu_tmp = cv2.sepFilter2D(gpu_tmp, -1, k_float, k_float, borderType=cv2.BORDER_CONSTANT)
+            gpu_tmpw = cv2.sepFilter2D(gpu_tmpw, -1, k_float, k_float, borderType=cv2.BORDER_CONSTANT)
+            tmp = gpu_tmp.get()
+            tmpw = gpu_tmpw.get()
+        except Exception as e:
+            UI.vprint(2, f"GPU DEM smoothing fallback due to error: {str(e)}")
+            use_gpu = False
+
+    if not use_gpu:
+        for i in range(0, len(tmp)):
+            tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
+            tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
+        tmp = tmp.transpose()
+        tmpw = tmpw.transpose()
+        for i in range(0, len(tmp)):
+            tmp[i] = numpy.convolve(tmp[i], kernel)[pix_width:-pix_width]
+            tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
+        tmp = tmp.transpose()
+        tmpw = tmpw.transpose()
     tmp[mask_array != 0] = (
         mask_array[mask_array != 0]
         * tmp[mask_array != 0]

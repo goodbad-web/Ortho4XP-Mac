@@ -31,6 +31,26 @@ def float2qquad(x):
     return numpy.binary_repr(int(16777216 * x)).zfill(24)  # 2**24 == 16777216
 
 
+def numpy_wgs84_to_orthogrid(lat, lon, zoomlevel):
+    ratio_x = lon / 180
+    ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
+    mult = 2 ** (zoomlevel - 1)
+    til_x = numpy.floor((ratio_x + 1) * mult).astype(numpy.int32)
+    til_y = numpy.floor((1 - ratio_y) * mult).astype(numpy.int32)
+    return til_x, til_y
+
+
+def numpy_st_coord(lat, lon, tex_x, tex_y, zoomlevel):
+    ratio_x = lon / 180
+    ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
+    mult = 2 ** (zoomlevel - 5)
+    s = (ratio_x + 1) * mult - (tex_x // 16)
+    t = 1 - ((1 - ratio_y) * mult - tex_y // 16)
+    s = numpy.clip(s, 0, 1)
+    t = numpy.clip(t, 0, 1)
+    return s, t
+
+
 ################################################################################
 
 ################################################################################
@@ -204,18 +224,30 @@ def zone_list_to_ortho_dico(tile):
         ]
         masks_draw.polygon(pol, fill=i)
         i += 1
-    for til_x in range(til_x_min, til_x_max + 1, 16):
-        for til_y in range(til_y_min, til_y_max + 1, 16):
+    # Resolution of the mesh_zl grid in terms of the 4096x4096nd airport_array
+    step_x = 4096 / (til_x_max - til_x_min + 1)
+    step_y = 4096 / (til_y_max - til_y_min + 1)
+
+    for til_x in range(til_x_min, til_x_max + 1):
+        for til_y in range(til_y_min, til_y_max + 1):
             (latp, lonp) = GEO.gtile_to_wgs84(
-                til_x + 8, til_y + 8, tile.mesh_zl
+                til_x + 0.5, til_y + 0.5, tile.mesh_zl
             )
             lonp = max(min(lonp, tile.lon + 1), tile.lon)
             latp = max(min(latp, tile.lat + 1), tile.lat)
             x = round((lonp - tile.lon) * 4095)
             y = round((tile.lat + 1 - latp) * 4095)
             (zoomlevel, provider_code) = dico_tmp[masks_im.getpixel((x, y))]
-            if airport_array[y, x]:
+            
+            # Check a block in airport_array instead of a single pixel
+            x0 = int(max(0, x - step_x / 2))
+            x1 = int(min(4095, x + step_x / 2))
+            y0 = int(max(0, y - step_y / 2))
+            y1 = int(min(4095, y + step_y / 2))
+            
+            if airport_array[y0 : y1 + 1, x0 : x1 + 1].any():
                 zoomlevel = max(zoomlevel, tile.cover_zl)
+                
             til_x_text = 16 * (
                 int(til_x / 2 ** (tile.mesh_zl - zoomlevel)) // 16
             )
@@ -254,6 +286,7 @@ def zone_list_to_ortho_dico(tile):
                             zoomlevel,
                             provider_code,
                         )
+
     return dico_customzl
 ################################################################################
 
@@ -268,6 +301,8 @@ def create_terrain_file(
     tri_type,
     is_overlay,
 ):
+    # Force land for high-res airport tiles to avoid misidentification as water
+
 
     if not os.path.exists(os.path.join(tile.build_dir, "terrain")):
         os.makedirs(os.path.join(tile.build_dir, "terrain"))
@@ -301,6 +336,10 @@ def create_terrain_file(
         )
 
         f.write("BASE_TEX_NOWRAP ../textures/" + texture_file_name + "\n")
+
+        if int(zoomlevel) >= 18 and tri_type == 0:
+            f.write("NO_ALPHA\n")
+            return ter_file_name
 
         if tri_type in (1, 2) and (not is_overlay):  # XP12 water
             #pass
@@ -474,10 +513,10 @@ def build_dsf(tile, download_queue):
 
     # 2 Remap tri_types in (0,1,2)
     has_water = 7 if (mesh_version >= 1.3) else 3
-    for i in range(nbr_tris):
-        t = tri_types[i] & has_water
-        t = t and (2 * (t > 1 or tile.use_masks_for_inland) or 1)
-        tri_types[i] = t
+    tri_types &= has_water
+    tri_types[tri_types > 1] = 2
+    if tile.use_masks_for_inland:
+        tri_types[tri_types == 1] = 2
 
     # 3 Recut water tris for XP12
     UI.vprint(1, "-> Adapting water triangles to XP12 requirements")
@@ -491,17 +530,57 @@ def build_dsf(tile, download_queue):
     
     UI.vprint(1, "-> Computing point pools and texture requirements")
     
+    # 5.1 Vectorized triangle attributes
+    lons = node_coords[0::5]
+    lats = node_coords[1::5]
+    tri_idx_reshaped = tri_idx[:3*nbr_tris].reshape((nbr_tris, 3))
+    tri_lons = numpy.mean(lons[tri_idx_reshaped], axis=1)
+    tri_lats = numpy.mean(lats[tri_idx_reshaped], axis=1)
+    til_xs, til_ys = numpy_wgs84_to_orthogrid(tri_lats, tri_lons, tile.mesh_zl)
+    
+    # Boundary clipping for safety
+    til_x_min, til_y_min = GEO.wgs84_to_orthogrid(tile.lat + 1, tile.lon, tile.mesh_zl)
+    til_x_max, til_y_max = GEO.wgs84_to_orthogrid(tile.lat, tile.lon + 1, tile.mesh_zl)
+    til_xs = numpy.clip(til_xs, til_x_min, til_x_max)
+    til_ys = numpy.clip(til_ys, til_y_min, til_y_max)
+    
+    # Vectorized custom ZL lookup using 2D NumPy array for huge speedup
+    width = til_x_max - til_x_min + 1
+    height = til_y_max - til_y_min + 1
+    customzl_arr = numpy.empty((width, height), dtype=object)
+    
+    # Pre-fill with a safe default value to prevent any missing key errors
+    default_val = (16 * (til_x_min // 16), 16 * (til_y_min // 16), tile.default_zl, tile.default_website)
+    customzl_arr.fill(default_val)
+    
+    for (tx, ty), val in dico_customzl.items():
+        idx_x = tx - til_x_min
+        idx_y = ty - til_y_min
+        if 0 <= idx_x < width and 0 <= idx_y < height:
+            customzl_arr[idx_x, idx_y] = val
+            
+    idx_xs = numpy.clip(til_xs - til_x_min, 0, width - 1)
+    idx_ys = numpy.clip(til_ys - til_y_min, 0, height - 1)
+    tri_tex_attr = customzl_arr[idx_xs, idx_ys].tolist()
+    
     # 5 Compute quadtree
     if (tile.use_masks_for_inland):
         quad_capacity = quad_capacity_low
     else:
         quad_capacity = quad_capacity_high
     pool_quadtree = QuadTree(quad_init_level, quad_capacity)
+    
+    # 5.1 NumPy batch slice and vectorized float2qquad format for high speedup
+    xs = node_coords[0::5] - tile.lon
+    ys = node_coords[1::5] - tile.lat
+    bx_list = [f"{int(16777216 * x):024b}" if x < 1 else "111111111111111111111111" for x in xs]
+    by_list = [f"{int(16777216 * y):024b}" if y < 1 else "111111111111111111111111" for y in ys]
+    
+    # Cache insert method locally to bypass name lookup inside loop
+    insert_method = pool_quadtree.insert
     for i in range(nbr_nodes):
-        pool_quadtree.insert(
-                float2qquad(node_coords[5 * i + 0] - tile.lon),
-                float2qquad(node_coords[5 * i + 1] - tile.lat),
-                quad_init_level)
+        insert_method(bx_list[i], by_list[i], quad_init_level)
+        
     pool_quadtree.clean()
     pool_quadtree.statistics()
     
@@ -517,20 +596,24 @@ def build_dsf(tile, download_queue):
         idx_pool += 1
     pool_param = {}
     node_icoords = numpy.zeros(5 * nbr_nodes, dtype = numpy.uint16)
+    nodes = pool_quadtree.nodes
     for key in pool_quadtree:
         level = len(key[0])
         plist = sorted(list(pool_quadtree[key]["idx_nodes"]))
-        node_icoords[[5 * idx_node for idx_node in plist]] = [
-            int(pool_quadtree.nodes[idx_node][0][level : level + 16], 2)
+        plist_arr = numpy.array(plist, dtype=numpy.int32)
+        idx_0 = 5 * plist_arr
+        idx_1 = idx_0 + 1
+        idx_2 = idx_0 + 2
+        
+        node_icoords[idx_0] = [
+            int(nodes[idx_node][0][level : level + 16], 2)
             for idx_node in plist
         ]
-        node_icoords[[5 * idx_node + 1 for idx_node in plist]] = [
-            int(pool_quadtree.nodes[idx_node][1][level : level + 16], 2)
+        node_icoords[idx_1] = [
+            int(nodes[idx_node][1][level : level + 16], 2)
             for idx_node in plist
         ]
-        altitudes = numpy.array(
-            [node_coords[5 * idx_node + 2] for idx_node in plist]
-        )
+        altitudes = node_coords[idx_2]
         altmin = floor(altitudes.min())
         altmax = ceil(altitudes.max())
         if altmax - altmin < 770:
@@ -546,7 +629,7 @@ def build_dsf(tile, download_queue):
             scale_z = 13107  # 65535=13107*5
             inv_stp = 5
         scal_x = scal_y = 2 ** (-level)
-        node_icoords[[5 * idx_node + 2 for idx_node in plist]] = numpy.round(
+        node_icoords[idx_2] = numpy.round(
             (altitudes - altmin) * inv_stp
         )
         pool_param[key_to_idx_pool[key]] = (
@@ -631,12 +714,26 @@ def build_dsf(tile, download_queue):
     # Next, we build DSF mesh points (these take into accound texture 
     # as well), point pools, etc.
 
+    # Cache functions and variables locally to reduce dot resolution overhead
+    _dds_file_name_from_attributes = FNAMES.dds_file_name_from_attributes
+    _mask_file = FNAMES.mask_file
+    _needs_mask = MASK.needs_mask
+    _mask_name_for_texture = MASK.mask_name_for_texture
+    _set_depth_ratio = BATHY.set_depth_ratio
+    _numpy_st_coord = numpy_st_coord
+    _progress_bar = UI.progress_bar
+    _vprint = UI.vprint
+    _build_dir = tile.build_dir
+    _water_tech = tile.water_tech
+    _imprint_masks_to_dds = tile.imprint_masks_to_dds
+    _normal_map_strength = tile.normal_map_strength
+
     step = nbr_tris // 100 + 1
     
     # Tri counter for progress_bars
     done = 0
-    
 
+    
     # First potentially masked water tris
     for tri in range(nbr_tris):
         tri_type = tri_types[tri]
@@ -644,24 +741,12 @@ def build_dsf(tile, download_queue):
             continue
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         if done % step == 0:
-            UI.progress_bar(1, int(done / step * 0.9))
+            _progress_bar(1, int(done / step * 0.9))
             if UI.red_flag:
-                UI.vprint(1, "DSF construction interrupted.")
+                _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
-        bary_lon = (
-            node_coords[5 * n1 + 0]
-            + node_coords[5 * n2 + 0]
-            + node_coords[5 * n3 + 0]
-        ) / 3
-        bary_lat = (
-            node_coords[5 * n1 + 1]
-            + node_coords[5 * n2 + 1]
-            + node_coords[5 * n3 + 1]
-        ) / 3
-        texture_attributes = dico_customzl[
-            GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mesh_zl)
-        ]
+        texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
@@ -675,9 +760,9 @@ def build_dsf(tile, download_queue):
             needs_new_terrain = False
             # if not we need to check with masks values
             if terrain_attributes not in skipped_terrains_for_masking:
-                mask_im = MASK.needs_mask(tile, *texture_attributes)
+                mask_im = _needs_mask(tile, *texture_attributes)
                 if mask_im:
-                    UI.vprint(2, "      Use of an alpha mask.")
+                    _vprint(2, "      Use of an alpha mask.")
                     needs_new_terrain = True
                 else:
                     skipped_terrains_for_masking.add(terrain_attributes)
@@ -685,9 +770,9 @@ def build_dsf(tile, download_queue):
                     try:
                         os.remove(
                             os.path.join(
-                                tile.build_dir,
+                                _build_dir,
                                 "textures",
-                                FNAMES.mask_file(*texture_attributes),
+                                _mask_file(*texture_attributes),
                             )
                         )
                     except:
@@ -701,55 +786,59 @@ def build_dsf(tile, download_queue):
                 
                 # Is it an overlay terrain or the new XP 12 phys water type ?
                 # XP11 style => overlay
-                is_overlay = (tile.water_tech == "XP11 + bathy") 
+                is_overlay = (_water_tech == "XP11 + bathy") 
                 # No alpha channel in DDS => overlay
-                is_overlay |= not tile.imprint_masks_to_dds
+                is_overlay |= not _imprint_masks_to_dds
                 
                 if is_overlay:
                     overlay_terrains.add(terrain_idx)
                 
-                texture_file_name = FNAMES.dds_file_name_from_attributes(
+                texture_file_name = _dds_file_name_from_attributes(
                     *texture_attributes
                 )
                 # do we need to (re)build a texture ?
                 if texture_attributes not in treated_textures:
                     target_tex = os.path.join(
-                            tile.build_dir, "textures", texture_file_name
-                            )
-                    rebuild = False
-                    if (not os.path.isfile(target_tex)):
-                        rebuild = True
-                    elif (tile.imprint_masks_to_dds):
-                        # Maybe target_tex was a DXT1, we need DXT5
-                        if (os.path.getsize(target_tex) < 20000000):
-                            rebuild = True
-                        # Maybe masks were updated after target_tex was created
-                        target_mask = MASK.mask_name_for_texture(tile, 
-                                          *texture_attributes)
-                        if (os.path.isfile(target_mask)):
-                            mask_last_modified = os.path.getmtime(target_mask)
-                            tex_last_modified = os.path.getmtime(target_tex)
-                            if (tex_last_modified < mask_last_modified):
-                                rebuild = True
-                    else: 
-                        # maybe target_tex was a DXT5, it should ne a DXT1
-                        if (os.path.getsize(target_tex) > 20000000):
-                            rebuild = True
-                        else:
-                            print(os.path.getsize(target_tex))
-                    
-                    if (rebuild or not tile.imprint_masks_to_dds):
-                        mask_im.save(os.path.join(
-                            tile.build_dir,
-                            "textures",
-                            FNAMES.mask_file(*texture_attributes),
-                        )
+                        _build_dir, "textures", texture_file_name
                     )
-
-                    if (rebuild):
-                            download_queue.put(texture_attributes)
+                    rebuild = False
+                    if not os.path.isfile(target_tex):
+                        rebuild = True
                     else:
-                        UI.vprint(
+                        target_tex_size = os.path.getsize(target_tex)
+                        if _imprint_masks_to_dds:
+                            # Maybe target_tex was a DXT1, we need DXT5
+                            if target_tex_size < 20000000:
+                                rebuild = True
+                            # Maybe masks were updated after target_tex was created
+                            target_mask = _mask_name_for_texture(
+                                tile, *texture_attributes
+                            )
+                            if os.path.isfile(target_mask):
+                                mask_last_modified = os.path.getmtime(target_mask)
+                                tex_last_modified = os.path.getmtime(target_tex)
+                                if tex_last_modified < mask_last_modified:
+                                    rebuild = True
+                        else:
+                            # maybe target_tex was a DXT5, it should ne a DXT1
+                            if target_tex_size > 20000000:
+                                rebuild = True
+                            else:
+                                print(target_tex_size)
+
+                    if rebuild or not _imprint_masks_to_dds:
+                        mask_im.save(
+                            os.path.join(
+                                _build_dir,
+                                "textures",
+                                _mask_file(*texture_attributes),
+                            )
+                        )
+
+                    if rebuild:
+                        download_queue.put(texture_attributes)
+                    else:
+                        _vprint(
                             2,
                             "   Texture file "
                             + texture_file_name
@@ -781,10 +870,10 @@ def build_dsf(tile, download_queue):
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    (s, t) = GEO.st_coord(
+                    (s, t) = _numpy_st_coord(
                         node_coords[5 * n + 1],
                         node_coords[5 * n],
-                        *texture_attributes
+                        *texture_attributes[:3]
                     )
                     # BEWARE : normal coordinates are pointing (EAST,SOUTH)
                     # in X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
@@ -808,9 +897,12 @@ def build_dsf(tile, download_queue):
                             node_icoords[5 * n : 5 * n + 5]
                         )
                         # TODO (improve fetch values)
-                        ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                        ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                             node_bathy, tile)
                         ratio_fetch = 1
+                        if int(texture_attributes[2]) >= 18:
+                            ratio_bathy = 0
+                            ratio_fetch = 0
                         dsf_pools[idx_dsfpool].extend(
                             (int(65535 * ratio_fetch), int(65535 * ratio_bathy), 
                              int(round(s * 65535)), int(round(t * 65535)))
@@ -855,7 +947,7 @@ def build_dsf(tile, download_queue):
                         node_icoords[5 * n : 5 * n + 3]
                     )
                     dsf_pools[idx_dsfpool].extend((32768, 32768))
-                    ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                    ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                         node_bathy, tile)
                     # TODO improve bathy and fetch ratio variety
                     ratio_fetch = 1
@@ -879,22 +971,12 @@ def build_dsf(tile, download_queue):
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         
         if done % step == 0:
-            UI.progress_bar(1, int(done / step * 0.9))
+            _progress_bar(1, int(done / step * 0.9))
             if UI.red_flag:
-                UI.vprint(1, "DSF construction interrupted.")
+                _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
-        bary_lon = (
-            node_coords[5 * n1] + node_coords[5 * n2] + node_coords[5 * n3]
-        ) / 3
-        bary_lat = (
-            node_coords[5 * n1 + 1]
-            + node_coords[5 * n2 + 1]
-            + node_coords[5 * n3 + 1]
-        ) / 3
-        texture_attributes = dico_customzl[
-            GEO.wgs84_to_orthogrid(bary_lat, bary_lon, tile.mesh_zl)
-        ]
+        texture_attributes = tri_tex_attr[tri]
         # The entries for the terrain and texture main dictionnaries
         terrain_attributes = (texture_attributes, tri_type)
         is_overlay = False
@@ -910,21 +992,24 @@ def build_dsf(tile, download_queue):
             is_overlay = tri_type == 1
             if is_overlay:
                 overlay_terrains.add(terrain_idx)
-            texture_file_name = FNAMES.dds_file_name_from_attributes(
+            texture_file_name = _dds_file_name_from_attributes(
                 *texture_attributes
             )
             # do we need to download a new texture ?
             if texture_attributes not in treated_textures:
                 target_tex = os.path.join(
-                            tile.build_dir, "textures", texture_file_name
+                            _build_dir, "textures", texture_file_name
                             )
                 rebuild = False
                 if (not os.path.isfile(target_tex)):
                     rebuild = True
+                # Force rebuild for high-res tiles to apply recent logic changes
+                if int(texture_attributes[2]) >= 18:
+                    rebuild = True
                 if (rebuild):
                     download_queue.put(texture_attributes)
                 else:
-                    UI.vprint(
+                    _vprint(
                         2,
                         "   Texture file "
                         + texture_file_name
@@ -952,10 +1037,10 @@ def build_dsf(tile, download_queue):
             if node_hash in textured_nodes:
                 (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
             else:
-                (s, t) = GEO.st_coord(
+                (s, t) = _numpy_st_coord(
                     node_coords[5 * n + 1],
                     node_coords[5 * n],
-                    *texture_attributes
+                    *texture_attributes[:3]
                 )
                 # BEWARE : normal coordinates are pointing (EAST,SOUTH) in 
                 # X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
@@ -1024,7 +1109,7 @@ def build_dsf(tile, download_queue):
                         node_icoords[5 * n : 5 * n + 3]
                     )
                     dsf_pools[idx_dsfpool].extend((32768, 32768))
-                    ratio_bathy = BATHY.set_depth_ratio(n, node_is_coast,
+                    ratio_bathy = _set_depth_ratio(n, node_is_coast,
                                                         node_bathy, tile)
                     ratio_fetch = 1
                     dsf_pools[idx_dsfpool].extend((int(65535 * ratio_fetch),
@@ -1043,6 +1128,15 @@ def build_dsf(tile, download_queue):
 
     UI.vprint(1, "-> Encoding of the DSF file")
     UI.vprint(1, "     Final nbr of nodes: " + str(len_textured_nodes))
+    if len_textured_nodes > 1000000:
+        UI.vprint(
+            0,
+            "\nWARNING: Final DSF node count ({:,}) exceeds the Metal absolute limit of 1,000,000!".format(len_textured_nodes)
+        )
+        UI.vprint(
+            0,
+            "         This tile may fail to load or crash in X-Plane 12 with Metal API.\n"
+        )
     UI.vprint(2, "     Final nbr of cross pool tris: " + str(total_cross_pool))
 
     # Now is time to write our DSF to disk, the exact binary format is 
@@ -1149,11 +1243,8 @@ def build_dsf(tile, download_queue):
         f.write(struct.pack("<I", dsf_pool_length[k]))
         f.write(struct.pack("<B", dsf_pool_plane[k]))
         for l in range(dsf_pool_plane[k]):
-            f.write(struct.pack("<B", 0))
-            for m in range(dsf_pool_length[k]):
-                f.write(
-                    struct.pack("<H", dsf_pools[k][dsf_pool_plane[k] * m + l])
-                )
+            f.write(b"\x00")
+            f.write(dsf_pools[k][l :: dsf_pool_plane[k]].tobytes())
     for k in range(dsf_pool_nbr):
         if dsf_pool_length[k] == 0:
             continue
@@ -1178,6 +1269,7 @@ def build_dsf(tile, download_queue):
         if dsf_pool_length[k] != 0:
             dico_new_dsf_pool[k] = new_idx_dsfpool
             new_idx_dsfpool += 1
+    pool_lookup = dico_new_dsf_pool.__getitem__
 
     # Commands atom
     # we first compute its size :
@@ -1225,39 +1317,15 @@ def build_dsf(tile, download_queue):
                 f.write(struct.pack("<f", 0))  # NEAR LOD
                 f.write(struct.pack("<f", lod))  # FAR LOD
 
-                blocks = floor(
-                    len(textured_tris[terrain_idx][idx_dsfpool]) / 255
-                )
+                blocks = len(textured_tris[terrain_idx][idx_dsfpool]) // 255
+                data_array = textured_tris[terrain_idx][idx_dsfpool]
                 for j in range(blocks):
-                    f.write(struct.pack("<B", 23))  # PATCH TRIANGLE
-                    f.write(struct.pack("<B", 255))  # COORDINATE COUNT
-
-                    for k in range(255):
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                textured_tris[terrain_idx][idx_dsfpool][
-                                    255 * j + k
-                                ],
-                            )
-                        )  # COORDINATE IDX
-                remaining_tri_p = (
-                    len(textured_tris[terrain_idx][idx_dsfpool]) % 255
-                )
+                    f.write(struct.pack("<BB", 23, 255))
+                    f.write(data_array[255 * j : 255 * (j + 1)].tobytes())
+                remaining_tri_p = len(data_array) % 255
                 if remaining_tri_p != 0:
-                    f.write(struct.pack("<B", 23))  # PATCH TRIANGLE
-                    f.write(
-                        struct.pack("<B", remaining_tri_p)
-                    )  # COORDINATE COUNT
-                    for k in range(remaining_tri_p):
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                textured_tris[terrain_idx][idx_dsfpool][
-                                    255 * blocks + k
-                                ],
-                            )
-                        )  # COORDINATE IDX
+                    f.write(struct.pack("<BB", 23, remaining_tri_p))
+                    f.write(data_array[255 * blocks : ].tobytes())
             else:  # idx_dsfpool == 'cross-pool'
                 pool_idx_init = textured_tris[terrain_idx][idx_dsfpool][0]
                 f.write(struct.pack("<B", 1))  # POOL SELECT
@@ -1269,58 +1337,27 @@ def build_dsf(tile, download_queue):
                 f.write(struct.pack("<f", 0))  # NEAR LOD
                 f.write(struct.pack("<f", lod))  # FAR LOD
 
-                blocks = floor(
-                    len(textured_tris[terrain_idx][idx_dsfpool]) / 510
-                )
+                blocks = len(textured_tris[terrain_idx][idx_dsfpool]) // 510
+                data_array = textured_tris[terrain_idx][idx_dsfpool]
                 for j in range(blocks):
-                    f.write(struct.pack("<B", 24))  # PATCH TRIANGLE CROSS-POOL
-                    f.write(struct.pack("<B", 255))  # COORDINATE COUNT
-                    for k in range(255):
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                dico_new_dsf_pool[
-                                    textured_tris[terrain_idx][idx_dsfpool][
-                                        510 * j + 2 * k
-                                    ]
-                                ],
-                            )
-                        )  # POOL IDX
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                textured_tris[terrain_idx][idx_dsfpool][
-                                    510 * j + 2 * k + 1
-                                ],
-                            )
-                        )  # POS_IN_POOL IDX
-                remaining_tri_p = int(
-                    (len(textured_tris[terrain_idx][idx_dsfpool]) % 510) / 2
-                )
+                    f.write(struct.pack("<BB", 24, 255))  # PATCH TRIANGLE CROSS-POOL + COUNT
+                    chunk = data_array[510 * j : 510 * (j + 1)]
+                    remapped = array.array("H", chunk)
+                    remapped[0::2] = array.array(
+                        "H",
+                        (pool_lookup(pool_idx) for pool_idx in chunk[0::2]),
+                    )
+                    f.write(remapped.tobytes())
+                remaining_tri_p = (len(data_array) % 510) // 2
                 if remaining_tri_p != 0:
-                    f.write(struct.pack("<B", 24))  # PATCH TRIANGLE CROSS-POOL
-                    f.write(
-                        struct.pack("<B", remaining_tri_p)
-                    )  # COORDINATE COUNT
-                    for k in range(remaining_tri_p):
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                dico_new_dsf_pool[
-                                    textured_tris[terrain_idx][idx_dsfpool][
-                                        510 * blocks + 2 * k
-                                    ]
-                                ],
-                            )
-                        )  # POOL IDX
-                        f.write(
-                            struct.pack(
-                                "<H",
-                                textured_tris[terrain_idx][idx_dsfpool][
-                                    510 * blocks + 2 * k + 1
-                                ],
-                            )
-                        )  # POS_IN_PO0L IDX
+                    f.write(struct.pack("<BB", 24, remaining_tri_p))  # PATCH TRIANGLE CROSS-POOL + COUNT
+                    chunk = data_array[510 * blocks : ]
+                    remapped = array.array("H", chunk)
+                    remapped[0::2] = array.array(
+                        "H",
+                        (pool_lookup(pool_idx) for pool_idx in chunk[0::2]),
+                    )
+                    f.write(remapped.tobytes())
 
     # DEMS atom
     if bDEMS != b"":

@@ -6,15 +6,17 @@ import O4_Vector_Utils as VECT
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_UI_Utils as UI
+import O4_RAMDisk_Utils
 import time
 import os
 import sys
+import shutil
 import subprocess
 import io
 import requests
 import queue
 import random
-from math import ceil, log, tan, pi
+from math import ceil, log, tan, pi, floor
 import numpy
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 
@@ -53,10 +55,38 @@ request_headers_generic = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+use_magick = False
+use_texture_converter = False
+as_helper_cmd = None
+
+
+def dds_format_support_error(dds_converter, dds_format):
+    if dds_format == "BC7" and dds_converter != "nvcompress":
+        return (
+            "BC7 DDS output is only supported with nvcompress; "
+            f"{dds_converter} cannot be used."
+        )
+    return None
+
 if "dar" in sys.platform:
-    dds_convert_cmd = os.path.join(
-        UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
-    )
+    # 1. Try native 'magick' (Apple Silicon optimization)
+    # We prioritize magick over the bundled nvcompress fallback on macOS.
+    magick_cmd = shutil.which("magick")
+    if magick_cmd:
+        dds_convert_cmd = magick_cmd
+        use_magick = True
+    else:
+        use_magick = False
+        dds_convert_cmd = os.path.join(
+            UI.Ortho4XP_dir, "Utils", "mac", "nvcompress"
+        )
+        use_texture_converter = False
+    
+    # Apple Silicon Helper for Neural Engine / Media Engine
+    as_helper_cmd = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+    if not os.path.exists(as_helper_cmd):
+        as_helper_cmd = None
+
     gdal_transl_cmd = "gdal_translate"
     gdalwarp_cmd = "gdalwarp"
     devnull_rdir = " >/dev/null 2>&1"
@@ -677,8 +707,7 @@ def initialize_local_combined_providers_dict(tile):
                     continue
                 UI.vprint(1, "    Building layer mask for ", name)
                 # need to build the extent mask over that tile
-                if not os.path.isdir(os.path.join(FNAMES.Extent_dir, "Auto")):
-                    os.makedirs(os.path.join(FNAMES.Extent_dir, "Auto"))
+                os.makedirs(os.path.join(FNAMES.Extent_dir, "Auto"), exist_ok=True)
                 cached_file_name = os.path.join(
                     FNAMES.Extent_dir, "LowRes", name + ".osm.bz2"
                 )
@@ -1580,8 +1609,7 @@ def download_jpeg_ortho(
             "could not be obtained ",
             "(even at lower ZL), it was filled with white there.",
         )
-    if not os.path.exists(file_dir):
-        os.makedirs(file_dir)
+    os.makedirs(file_dir, exist_ok=True)
     try:
         if super_resol_factor == 1:
             big_image.save(os.path.join(file_dir, file_name))
@@ -1601,7 +1629,110 @@ def download_jpeg_ortho(
             e,
         )
         return 0
+    file_path = os.path.join(file_dir, file_name)
+    if zoomlevel > 16 and os.path.exists(file_path):
+        try:
+            if os.path.getsize(file_path) < 512000:
+                UI.vprint(
+                    1,
+                    f"   [Quality Check] {file_name} is small, trying ZL16 crop fallback.",
+                )
+                parent_zl = 16
+                diff = zoomlevel - parent_zl
+                factor = 2 ** diff
+                til_x_16 = til_x_left // factor
+                til_y_16 = til_y_top // factor
+                til_x_left_16 = (til_x_16 // 16) * 16
+                til_y_top_16 = (til_y_16 // 16) * 16
+                parent_file_name = FNAMES.jpeg_file_name_from_attributes(
+                    til_x_left_16,
+                    til_y_top_16,
+                    parent_zl,
+                    provider_code,
+                )
+                latmax, lonmin = GEO.gtile_to_wgs84(
+                    til_x_left, til_y_top, zoomlevel
+                )
+                parent_lat = int(floor(latmax))
+                parent_lon = int(floor(lonmin))
+                parent_file_dir = FNAMES.jpeg_file_dir_from_attributes(
+                    parent_lat,
+                    parent_lon,
+                    parent_zl,
+                    provider,
+                )
+                parent_file_path = os.path.join(
+                    parent_file_dir, parent_file_name
+                )
+                if not _jpeg_file_is_ready(parent_file_path):
+                    UI.vprint(
+                        1,
+                        f"   Downloading parent ZL16 orthophoto: {parent_file_name}",
+                    )
+                    download_jpeg_ortho(
+                        parent_file_dir,
+                        parent_file_name,
+                        til_x_left_16,
+                        til_y_top_16,
+                        parent_zl,
+                        provider_code,
+                    )
+                if _jpeg_file_is_ready(parent_file_path):
+                    with Image.open(parent_file_path) as parent_img:
+                        offset_x = (til_x_16 - til_x_left_16) * 256
+                        offset_y = (til_y_16 - til_y_top_16) * 256
+                        crop_size = factor * 256
+                        cropped = parent_img.crop(
+                            (
+                                offset_x,
+                                offset_y,
+                                offset_x + crop_size,
+                                offset_y + crop_size,
+                            )
+                        )
+                        high_quality_img = cropped.resize(
+                            (4096, 4096), Image.BICUBIC
+                        )
+                        high_quality_img.save(file_path, "JPEG", quality=90)
+                        UI.vprint(
+                            1,
+                            f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",
+                        )
+        except Exception as e:
+            UI.vprint(1, f"   [Quality Check] Failed to fallback: {e}")
     return 1
+
+
+################################################################################
+
+################################################################################
+def _jpeg_file_is_ready(jpeg_path):
+    if not jpeg_path:
+        return False
+    if not os.path.exists(jpeg_path):
+        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
+    if not os.path.isfile(jpeg_path):
+        return False
+    try:
+        with Image.open(jpeg_path) as im:
+            im.verify()
+        return True
+    except Exception:
+        try:
+            os.remove(jpeg_path)
+        except:
+            pass
+        if O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path):
+            try:
+                with Image.open(jpeg_path) as im:
+                    im.verify()
+                return True
+            except Exception:
+                try:
+                    os.remove(jpeg_path)
+                except:
+                    pass
+        return False
 
 
 ################################################################################
@@ -1662,9 +1793,8 @@ def build_jpeg_ortho(
                     true_zl,
                     providers_dict[rlayer["layer_code"]],
                 )
-                if not os.path.isfile(
-                    os.path.join(true_file_dir, true_file_name)
-                ):
+                true_jpeg_path = os.path.join(true_file_dir, true_file_name)
+                if not _jpeg_file_is_ready(true_jpeg_path):
                     UI.vprint(
                         1,
                         "   Downloading missing orthophoto "
@@ -1714,8 +1844,7 @@ def build_jpeg_ortho(
             big_img = combine_textures(
                 tile, til_x_left, til_y_top, zoomlevel, provider_code
             )
-            if not os.path.exists(file_dir):
-                os.makedirs(file_dir)
+            os.makedirs(file_dir, exist_ok=True)
             try:
                 big_img.convert("RGB").save(os.path.join(file_dir, file_name))
             except Exception as e:
@@ -1733,7 +1862,8 @@ def build_jpeg_ortho(
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
-        if not os.path.isfile(os.path.join(file_dir, file_name)):
+        jpeg_path = os.path.join(file_dir, file_name)
+        if not _jpeg_file_is_ready(jpeg_path):
             UI.vprint(1, "   Downloading missing orthophoto " + file_name)
             if not download_jpeg_ortho(
                 file_dir, file_name, *texture_attributes
@@ -1781,95 +1911,22 @@ def build_combined_ortho(
     (y1, x1) = GEO.gtile_to_wgs84(til_x_left + 16, til_y_top + 16, zoomlevel)
     mask_weight_below = numpy.zeros((4096, 4096), dtype=numpy.uint16)
     for rlayer in combined_providers_dict[provider_code][::-1]:
-        mask = has_data(
-            (x0, y0, x1, y1),
-            rlayer["extent_code"],
-            return_mask=True,
-            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
-            if rlayer["priority"] == "mask"
-            else False,
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=True,
+            clean_mask=False,
         )
-        if not mask:
+        if layer is None:
             continue
-        # we turn the image mask into an array
-        mask = numpy.array(mask, dtype=numpy.uint16)
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
-        )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        if not os.path.isfile(os.path.join(true_file_dir, true_file_name)):
-            UI.vprint(
-                1,
-                "   Downloading missing orthophoto "
-                + true_file_name
-                + " (for combining in "
-                + provider_code
-                + ")\n",
-            )
-            download_jpeg_ortho(
-                true_file_dir,
-                true_file_name,
-                true_til_x_left,
-                true_til_y_top,
-                true_zl,
-                rlayer["layer_code"],
-            )
-        else:
-            UI.vprint(
-                2,
-                "   The orthophoto "
-                + true_file_name
-                + " (for combining in "
-                + provider_code
-                + ") is already present.\n",
-            )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
-        # in case the smoothing of the extent mask was too strong we remove the
-        # the mask (where it is nor 0 nor 255) the pixels for which the true_im
-        # is all white
-        # true_arr=numpy.array(true_im).astype(numpy.uint16)
-        # mask[(numpy.sum(true_arr,axis=2)>=715)*(mask>=1)*(mask<=253)]=0
-        # mask[(numpy.sum(true_arr,axis=2)<=15)*(mask>=1)*(mask<=253)]=0
+        true_im, mask = layer
         if rlayer["priority"] == "low":
             # low priority layers, do not increase mask_weight_below
             wasnt_zero = (mask_weight_below + mask) != 0
@@ -1991,8 +2048,7 @@ def build_provider_texture(dest_dir, provider_code, zoomlevel):
 ################################################################################
 def create_tile_preview(lat, lon, zoomlevel, provider_code):
     UI.red_flag = False
-    if not os.path.exists(FNAMES.Preview_dir):
-        os.makedirs(FNAMES.Preview_dir)
+    os.makedirs(FNAMES.Preview_dir, exist_ok=True)
     filepreview = FNAMES.preview(lat, lon, zoomlevel, provider_code)
     if not os.path.isfile(filepreview):
         provider = providers_dict[provider_code]
@@ -2086,6 +2142,66 @@ def gdalwarp_alternative(s_bbox, s_epsg, s_im, t_bbox, t_epsg, t_size):
 ################################################################################
 def color_transform(im, color_code):
     try:
+        use_gpu = getattr(UI, "use_gpu_for_color_filters", False)
+        if use_gpu:
+            import cv2
+            img_array = numpy.array(im)
+            has_alpha = False
+            alpha_channel = None
+            if img_array.ndim == 3 and img_array.shape[2] == 4:
+                has_alpha = True
+                alpha_channel = img_array[:, :, 3]
+                img_array = img_array[:, :, :3]
+                
+            gpu_img = cv2.UMat(img_array)
+            for color_filter in color_filters_dict[color_code]:
+                if color_filter[0] == "brightness-contrast":
+                    (brightness, contrast) = color_filter[1:3]
+                    lut = numpy.arange(256, dtype=numpy.float32)
+                    if brightness >= 0:
+                        lut = 128 + tan(pi / 4 * (1 + contrast / 128)) * (brightness + (255 - brightness) / 255 * lut - 128)
+                    else:
+                        lut = 128 + tan(pi / 4 * (1 + contrast / 128)) * ((255 + brightness) / 255 * lut - 128)
+                    lut = numpy.clip(lut, 0, 255).astype(numpy.uint8)
+                    gpu_img = cv2.LUT(gpu_img, lut)
+                    
+                elif color_filter[0] == "saturation":
+                    saturation = color_filter[1]
+                    factor = 1 + saturation / 100
+                    gray = cv2.cvtColor(gpu_img, cv2.COLOR_RGB2GRAY)
+                    gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+                    gpu_img = cv2.addWeighted(gpu_img, factor, gray_rgb, 1 - factor, 0)
+                    
+                elif color_filter[0] == "sharpness":
+                    factor = color_filter[1]
+                    blurred = cv2.blur(gpu_img, (3, 3))
+                    gpu_img = cv2.addWeighted(gpu_img, factor, blurred, 1 - factor, 0)
+                    
+                elif color_filter[0] == "blur":
+                    radius = color_filter[1]
+                    gpu_img = cv2.GaussianBlur(gpu_img, (0, 0), sigmaX=radius, sigmaY=radius)
+                    
+                elif color_filter[0] == "levels":
+                    lut_channels = []
+                    for j in [0, 1, 2]:
+                        in_min, gamma, in_max, out_min, out_max = color_filter[5 * j + 1 : 5 * j + 6]
+                        lut = numpy.arange(256, dtype=numpy.float32)
+                        lut = numpy.clip(lut, in_min, in_max)
+                        lut = out_min + (out_max - out_min) * (((lut - in_min) / (in_max - in_min)) ** (1 / gamma))
+                        lut_channels.append(numpy.clip(lut, 0, 255).astype(numpy.uint8))
+                    lut_merged = numpy.stack(lut_channels, axis=-1)
+                    gpu_img = cv2.LUT(gpu_img, lut_merged)
+            
+            result_array = gpu_img.get()
+            if has_alpha:
+                result_array = numpy.dstack((result_array, alpha_channel))
+            return Image.fromarray(result_array, mode=im.mode)
+    except Exception as e:
+        UI.vprint(2, f"GPU color correction fallback due to error: {str(e)}")
+        pass
+
+    # CPU/PIL Fallback path
+    try:
         for color_filter in color_filters_dict[color_code]:
             # both range from -127 to 127,
             # http://gimp.sourcearchive.com/documentation/2.6.1/\
@@ -2147,122 +2263,47 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
     # we do not need to bother with masks then
     if len(local_combined_providers_dict[provider_code]) == 1:
         rlayer = local_combined_providers_dict[provider_code][0]
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=False,
         )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
+        true_im, _ = layer
         UI.vprint(2, "Finished imprinting", til_x_left, til_y_top)
         return true_im
     # the real situation now where there are more than one layer with data
     for rlayer in local_combined_providers_dict[provider_code][::-1]:
-        mask = has_data(
-            (x0, y0, x1, y1),
-            rlayer["extent_code"],
-            return_mask=True,
-            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
-            if rlayer["priority"] == "mask"
-            else False,
+        layer = _prepare_combined_layer(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            rlayer,
+            x0,
+            y0,
+            x1,
+            y1,
+            collect_mask=True,
+            clean_mask=False,
         )
-        if not mask:
+        if layer is None:
             continue
-        # we turn the image mask into an array
-        mask = numpy.array(mask, dtype=numpy.uint16)
-        true_til_x_left = til_x_left
-        true_til_y_top = til_y_top
-        true_zl = zoomlevel
-        crop = False
-        if "max_zl" in providers_dict[rlayer["layer_code"]]:
-            max_zl = int(providers_dict[rlayer["layer_code"]]["max_zl"])
-            if max_zl < zoomlevel:
-                (latmed, lonmed) = GEO.gtile_to_wgs84(
-                    til_x_left + 8, til_y_top + 8, zoomlevel
-                )
-                (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
-                    latmed, lonmed, max_zl
-                )
-                true_zl = max_zl
-                crop = True
-                pixx0 = round(
-                    256
-                    * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
-                )
-                pixy0 = round(
-                    256
-                    * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
-                )
-                pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
-                pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
-        true_file_name = FNAMES.jpeg_file_name_from_attributes(
-            true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
-        )
-        true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-            tile.lat, tile.lon, true_zl, providers_dict[rlayer["layer_code"]]
-        )
-        true_im = Image.open(os.path.join(true_file_dir, true_file_name))
-        UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
-        true_im = color_transform(true_im, rlayer["color_code"])
-        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
-            UI.vprint(2, "Blur of a mask !")
-            true_im = true_im.filter(
-                ImageFilter.GaussianBlur(
-                    tile.sea_texture_blur * 2 ** (true_zl - 17)
-                )
-            )
-        if crop:
-            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
-                (4096, 4096), Image.BICUBIC
-            )
+        true_im, mask = layer
         # in case the smoothing of the extent mask was too strong we remove the
         # the mask (where it is nor 0 nor 255) the pixels for which the true_im
         # is all white or all black
-        true_arr = numpy.array(true_im).astype(numpy.uint16)
-        mask[
-            (numpy.sum(true_arr, axis=2) >= 735) * (mask >= 1) * (mask <= 253)
-        ] = 0
-        mask[
-            (numpy.sum(true_arr, axis=2) <= 35) * (mask >= 1) * (mask <= 253)
-        ] = 0
+        true_arr = numpy.asarray(true_im, dtype=numpy.uint16)
+        true_sum = numpy.sum(true_arr, axis=2)
+        mask_valid = (mask >= 1) * (mask <= 253)
+        mask[(true_sum >= 735) * mask_valid] = 0
+        mask[(true_sum <= 35) * mask_valid] = 0
         if rlayer["priority"] == "low":
             # low priority layers, do not increase mask_weight_below
             wasnt_zero = (mask_weight_below + mask) != 0
@@ -2285,17 +2326,133 @@ def combine_textures(tile, til_x_left, til_y_top, zoomlevel, provider_code):
     return big_image
 
 
+def _prepare_combined_layer(
+    tile,
+    til_x_left,
+    til_y_top,
+    zoomlevel,
+    rlayer,
+    x0,
+    y0,
+    x1,
+    y1,
+    collect_mask=False,
+    clean_mask=False,
+):
+    provider = providers_dict[rlayer["layer_code"]]
+    if collect_mask:
+        mask = has_data(
+            (x0, y0, x1, y1),
+            rlayer["extent_code"],
+            return_mask=True,
+            is_mask_layer=(tile.lat, tile.lon, tile.mask_zl)
+            if rlayer["priority"] == "mask"
+            else False,
+        )
+        if not mask:
+            return None
+        mask = numpy.asarray(mask, dtype=numpy.uint16)
+    else:
+        mask = None
+
+    true_til_x_left = til_x_left
+    true_til_y_top = til_y_top
+    true_zl = zoomlevel
+    crop = False
+    if "max_zl" in provider:
+        max_zl = int(provider["max_zl"])
+        if max_zl < zoomlevel:
+            (latmed, lonmed) = GEO.gtile_to_wgs84(
+                til_x_left + 8, til_y_top + 8, zoomlevel
+            )
+            (true_til_x_left, true_til_y_top) = GEO.wgs84_to_orthogrid(
+                latmed, lonmed, max_zl
+            )
+            true_zl = max_zl
+            crop = True
+            pixx0 = round(
+                256 * (til_x_left * 2 ** (max_zl - zoomlevel) - true_til_x_left)
+            )
+            pixy0 = round(
+                256 * (til_y_top * 2 ** (max_zl - zoomlevel) - true_til_y_top)
+            )
+            pixx1 = round(pixx0 + 2 ** (12 - zoomlevel + max_zl))
+            pixy1 = round(pixy0 + 2 ** (12 - zoomlevel + max_zl))
+
+    true_file_name = FNAMES.jpeg_file_name_from_attributes(
+        true_til_x_left, true_til_y_top, true_zl, rlayer["layer_code"]
+    )
+    true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
+        tile.lat, tile.lon, true_zl, provider
+    )
+    true_file_path = os.path.join(true_file_dir, true_file_name)
+    UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
+    with Image.open(true_file_path) as source_im:
+        true_im = color_transform(source_im, rlayer["color_code"])
+        if rlayer["priority"] == "mask" and tile.sea_texture_blur:
+            UI.vprint(2, "Blur of a mask !")
+            true_im = true_im.filter(
+                ImageFilter.GaussianBlur(
+                    tile.sea_texture_blur * 2 ** (true_zl - 17)
+                )
+            )
+        if crop:
+            true_im = true_im.crop((pixx0, pixy0, pixx1, pixy1)).resize(
+                (4096, 4096), Image.BICUBIC
+            )
+        true_im = true_im.copy()
+
+    if collect_mask and clean_mask:
+        true_arr = numpy.asarray(true_im, dtype=numpy.uint16)
+        true_sum = numpy.sum(true_arr, axis=2)
+        mask_valid = (mask >= 1) * (mask <= 253)
+        mask[(true_sum >= 735) * mask_valid] = 0
+        mask[(true_sum <= 35) * mask_valid] = 0
+
+    return true_im, mask
+
+
 ################################################################################
 
 ################################################################################
+# Support for multiprocessing initialization
+def init_worker(config_data):
+    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd
+    global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
+    global is_worker_process
+    
+    # Restore globals from passed config
+    use_magick = config_data['use_magick']
+    use_texture_converter = config_data.get('use_texture_converter', False)
+    dds_convert_cmd = config_data['dds_convert_cmd']
+    gdal_transl_cmd = config_data['gdal_transl_cmd']
+    gdalwarp_cmd = config_data['gdalwarp_cmd']
+    as_helper_cmd = config_data.get('as_helper_cmd')
+    providers_dict = config_data['providers_dict']
+    local_combined_providers_dict = config_data['local_combined_providers_dict']
+    color_filters_dict = config_data['color_filters_dict']
+    extents_dict = config_data['extents_dict']
+    UI.Ortho4XP_dir = config_data['Ortho4XP_dir']
+    UI.verbosity = config_data['verbosity']
+    UI.cleaning_level = config_data['cleaning_level']
+    UI.use_neural_upscale = config_data.get('use_neural_upscale', False)
+    is_worker_process = True
+
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
 ):
+    upscaled_file_to_delete = None
     if type == "dds":
         out_file_name = FNAMES.dds_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
         )
         png_file_name = out_file_name.replace("dds", "png")
+        dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
+        dds_format = getattr(UI, 'dds_format', 'BC3')
+        dds_error = dds_format_support_error(dds_converter, dds_format)
+        if dds_error:
+            UI.vprint(1, f"   Error: {dds_error}")
+            return 0
     elif type == "tif":
         out_file_name = FNAMES.geotiff_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2310,32 +2467,44 @@ def convert_texture(
             UI.Ortho4XP_dir, "tmp", out_file_name.replace("4326", "3857")
         )
     UI.vprint(
-        1, "   Converting orthophoto(s) to build texture " + out_file_name + "."
+        2, "   Converting orthophoto(s) to build texture " + out_file_name + "."
     )
     erase_tmp_png = False
     erase_tmp_tif = False
     dxt5 = False
     masked_texture = False
     if tile.imprint_masks_to_dds and type == "dds":
-        masked_texture = os.path.exists(
-            os.path.join(
-                tile.build_dir,
-                "textures",
-                FNAMES.mask_file(
-                    til_x_left, til_y_top, zoomlevel, provider_code
-                ),
-            )
+        mask_path = os.path.join(
+            tile.build_dir,
+            "textures",
+            FNAMES.mask_file(
+                til_x_left, til_y_top, zoomlevel, provider_code
+            ),
         )
-        if masked_texture:
-            mask_im = Image.open(
-                os.path.join(
-                    tile.build_dir,
-                    "textures",
-                    FNAMES.mask_file(
-                        til_x_left, til_y_top, zoomlevel, provider_code
-                    ),
+        if os.path.exists(mask_path):
+            masked_texture = True
+            mask_im = Image.open(mask_path).convert("L")
+        elif int(zoomlevel) >= tile.mask_zl:
+            # Fallback to lower-resolution mask file (e.g. for high-res airport ZL18 tiles)
+            factor = 2 ** (zoomlevel - tile.mask_zl)
+            m_til_x = (int(til_x_left / factor) // 16) * 16
+            m_til_y = (int(til_y_top / factor) // 16) * 16
+            rx = int((til_x_left - factor * m_til_x) / 16)
+            ry = int((til_y_top - factor * m_til_y) / 16)
+            mask_file = os.path.join(
+                FNAMES.mask_dir(tile.lat, tile.lon),
+                FNAMES.legacy_mask(m_til_x, m_til_y),
+            )
+            if os.path.isfile(mask_file):
+                big_img = Image.open(mask_file)
+                x0 = int(rx * 4096 / factor)
+                y0 = int(ry * 4096 / factor)
+                mask_im = big_img.crop(
+                    (x0, y0, x0 + 4096 // factor, y0 + 4096 // factor)
                 )
-            ).convert("L")
+                small_array = numpy.array(mask_im, dtype=numpy.uint8)
+                if small_array.max() > 30:
+                    masked_texture = True
     elif tile.imprint_masks_to_dds:  # type = 'tif'
         if int(zoomlevel) >= tile.mask_zl:
             factor = 2 ** (zoomlevel - tile.mask_zl)
@@ -2358,6 +2527,9 @@ def convert_texture(
                 if small_array.max() > 30:
                     masked_texture = True
 
+
+
+    jpeg_path = None
     if provider_code in providers_dict:
         jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2365,9 +2537,23 @@ def convert_texture(
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
+        jpeg_path = os.path.join(file_dir, jpeg_file_name)
+    jpeg_ready = _jpeg_file_is_ready(jpeg_path)
+    is_combined = (provider_code in local_combined_providers_dict) and (
+        (provider_code not in providers_dict)
+        or not jpeg_ready
+    )
+    use_upscale = getattr(UI, 'use_neural_upscale', False)
+    use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
+    is_worker = globals().get('is_worker_process', False)
+    
+    if use_gpu_batch and is_worker and not is_combined and not use_upscale and type == "dds":
+        return 1
+        
+    file_to_convert = jpeg_path if (provider_code in providers_dict and jpeg_ready) else None
     if (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
-        or not os.path.exists(os.path.join(file_dir, jpeg_file_name))
+        or not jpeg_ready
     ):
         big_image = combine_textures(
             tile, til_x_left, til_y_top, zoomlevel, provider_code
@@ -2400,10 +2586,12 @@ def convert_texture(
     # color correction is required.
     elif (
         providers_dict[provider_code]["color_filters"] != "none"
-    ) or masked_texture:
-        big_image = Image.open(
-            os.path.join(file_dir, jpeg_file_name), "r"
-        ).convert("RGB")
+    ) or masked_texture or (int(zoomlevel) >= 18):
+        jpeg_full_path = os.path.join(file_dir, jpeg_file_name)
+        if not _jpeg_file_is_ready(jpeg_full_path):
+            UI.vprint(1, f"   ERROR: missing orthophoto {jpeg_file_name}")
+            return 0
+        big_image = Image.open(jpeg_full_path, "r").convert("RGB")
         if providers_dict[provider_code]["color_filters"] != "none":
             big_image = color_transform(
                 big_image, providers_dict[provider_code]["color_filters"]
@@ -2428,29 +2616,89 @@ def convert_texture(
         file_to_convert = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
         erase_tmp_png = True
         big_image.save(file_to_convert)
+
+    if file_to_convert is None:
+        UI.vprint(1, f"   ERROR: orthophoto source unavailable for {out_file_name}")
+        return 0
+
+    # Optional AI Upscale using Neural Engine
+    if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
+        # Add pid to avoid conflicts during multiprocessing
+        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
+        UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
+        if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
+            file_to_convert = upscaled_tmp
+            upscaled_file_to_delete = upscaled_tmp
+
     # finally if nothing needs to be done prior to the conversion
-    else:
-        file_to_convert = os.path.join(file_dir, jpeg_file_name)
     # eventually the dds conversion
     if type == "dds":
-        if not dxt5:
+        out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
+
+        if dds_converter == "TextureConverter" and "dar" in sys.platform:
+            # GPUバッチ一括変換時は、各ワーカーでは準備のみを行いメインプロセスで一括処理するため早期リターン
+            if is_worker and getattr(UI, 'use_gpu_acceleration', True):
+                return 1
+            
+            # Native Apple Silicon conversion via ASHelper
+            executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+            target_fmt = dds_format if (not dxt5 or dds_format == "BC7") else "BC3"
+            conv_cmd = [executable, "--convert", file_to_convert, out_file_path, target_fmt]
+            if getattr(UI, 'use_gpu_acceleration', True):
+                conv_cmd.append("--gpu")
+            UI.vprint(2, f"      ASHelper: Converting texture to DDS ({target_fmt})")
+        elif dds_converter == "magick":
+            # ImageMagick fallback
+            fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
             conv_cmd = [
-                dds_convert_cmd,
-                "-bc1",
-                "-fast",
+                "magick",
                 file_to_convert,
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                devnull_rdir,
+                "-define", f"dds:compression={fmt}",
+                "-define", "dds:cluster-fit=true",
+                "-define", "dds:mipmaps=13",
+                out_file_path
             ]
-        else:
-            conv_cmd = [
-                dds_convert_cmd,
-                "-bc3",
-                "-fast",
-                file_to_convert,
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                devnull_rdir,
-            ]
+            UI.vprint(2, f"      ImageMagick: Converting texture to DDS ({fmt.upper()})")
+        else: # Default: nvcompress (uses globally defined dds_convert_cmd)
+            dds_tool = dds_convert_cmd
+            if dds_format == "BC7":
+                fmt = "-bc7"
+            elif dds_format == "BC3":
+                fmt = "-bc3"
+            else:
+                fmt = "-bc1"
+            conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
+            UI.vprint(2, f"      nvcompress: Converting texture to DDS ({fmt[1:].upper()})")
+
+        tentative = 0
+        while True:
+            try:
+                retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            except Exception as e:
+                UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
+                return 0
+            if retcode == 0:
+                break
+
+            tentative += 1
+            if tentative == 10:
+                UI.vprint(1, f"      Error: DDS conversion failed with return code {retcode} ({dds_converter})")
+                return 0
+
+            if "--gpu" in conv_cmd:
+                conv_cmd = [x for x in conv_cmd if x != "--gpu"]
+                UI.lvprint(
+                    1,
+                    "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
+                    out_file_path,
+                )
+            else:
+                UI.lvprint(
+                    1,
+                    "WARNING: Could not convert texture",
+                    out_file_path,
+                )
+            time.sleep(1 + random.uniform(-0.5, 0.5))
     else:
         (latmax, lonmin) = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         (latmin, lonmax) = GEO.gtile_to_wgs84(
@@ -2525,27 +2773,39 @@ def convert_texture(
                 tmp_tif_file_name,
                 os.path.join(FNAMES.Geotiff_dir, out_file_name),
             ]
-    tentative = 0
-    while True:
-        if not subprocess.call(
-            conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        ):
-            break
-        tentative += 1
-        if tentative == 10:
-            UI.lvprint(
-                1,
-                "ERROR: Could not convert texture",
-                os.path.join(tile.build_dir, "textures", out_file_name),
-                "(10 tries)",
-            )
-            break
-        UI.lvprint(
-            1,
-            "WARNING: Could not convert texture",
-            os.path.join(tile.build_dir, "textures", out_file_name),
-        )
-        time.sleep(1)
+        tentative = 0
+        while True:
+            if not subprocess.call(
+                conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            ):
+                break
+            tentative += 1
+            if tentative == 10:
+                UI.lvprint(
+                    1,
+                    "ERROR: Could not convert texture",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                    "(10 tries)",
+                )
+                break
+
+            # CPU Fallback: If GPU-accelerated ASHelper failed, try without --gpu next
+            if "--gpu" in conv_cmd:
+                conv_cmd = [x for x in conv_cmd if x != "--gpu"]
+                UI.lvprint(
+                    1,
+                    "WARNING: Retrying DDS conversion with CPU fallback (removed --gpu) for",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                )
+            else:
+                UI.lvprint(
+                    1,
+                    "WARNING: Could not convert texture",
+                    os.path.join(tile.build_dir, "textures", out_file_name),
+                )
+
+            # Add random jitter to avoid lockstep retry collisions among multiprocessing workers
+            time.sleep(1 + random.uniform(-0.5, 0.5))
     if erase_tmp_png:
         try:
             os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
@@ -2553,10 +2813,15 @@ def convert_texture(
             pass
     if erase_tmp_tif:
         try:
-            os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
+            os.remove(tmp_tif_file_name)
         except:
             pass
-    return
+    if upscaled_file_to_delete:
+        try:
+            os.remove(upscaled_file_to_delete)
+        except:
+            pass
+    return 1
 
 
 ################################################################################

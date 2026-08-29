@@ -10,13 +10,14 @@ import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 
 overpass_servers = {
-    "DE": "http://overpass-api.de/api/interpreter",
-    "FR": "http://api.openstreetmap.fr/oapi/interpreter",
+    "DE": "https://overpass-api.de/api/interpreter",
+    "LZ": "https://lz4.overpass-api.de/api/interpreter",
+    "FR": "https://api.openstreetmap.fr/oapi/interpreter",
     "KU": "https://overpass.kumi.systems/api/interpreter",
-    "RU": "http://overpass.osm.rambler.ru/cgi/interpreter",
+    "CH": "https://overpass.osm.ch/api/interpreter"
 }
-overpass_server_choice = "DE"
-max_osm_tentatives = 8
+overpass_server_choice = "random"
+max_osm_tentatives = 10
 
 ################################################################################
 class OSM_layer:
@@ -522,14 +523,18 @@ def get_overpass_data(query, bbox, server_code=None):
                 else overpass_server_choice
             )
         base_url = overpass_servers[true_server_code]
+        # rel を relation に置換（互換性のため）
+        clean_query = query.replace('rel[', 'relation[') if isinstance(query, str) else [q.replace('rel[', 'relation[') for q in query]
         if isinstance(query, str):
-            overpass_query = query + str(bbox) + ";"
+            overpass_query = clean_query + str(bbox) + ";"
         else:  # query is a tuple
-            overpass_query = "".join([x + str(bbox) + ";" for x in query])
-        url = base_url + "?data=(" + overpass_query + ");(._;>>;);out meta;"
-        UI.vprint(3, url)
+            overpass_query = "".join([x + str(bbox) + ";" for x in clean_query])
+        full_query = "[timeout:300];(" + overpass_query + ");(._;>>;);out meta;"
+        UI.vprint(3, "Sending POST request to", base_url)
+        headers = {'User-Agent': 'Ortho4XP'}
         try:
-            r = s.get(url, timeout=60)
+            # GET ではなく POST を使用
+            r = s.post(base_url, data={'data': full_query}, timeout=310, headers=headers)
             UI.vprint(3, "OSM response status :", r)
             if "200" in str(r):
                 if (
@@ -562,10 +567,16 @@ def get_overpass_data(query, bbox, server_code=None):
                     1,
                     "        OSM server",
                     true_server_code,
-                    "rejected our query, new tentative in",
+                    "rejected our query (Status:",
+                    r.status_code,
+                    "), new tentative in",
                     2 ** tentative,
                     "sec...",
                 )
+                try:
+                    UI.vprint(2, "        Server message:", r.text[:200])
+                except:
+                    pass
         except:
             UI.vprint(
                 1,
