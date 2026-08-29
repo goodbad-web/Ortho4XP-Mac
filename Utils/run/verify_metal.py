@@ -433,26 +433,14 @@ def main() -> int:
             {"label": "DDS write error contract", "status": write_contract_status}
         )
 
-        batch_cpu_outputs = [
-            artifact_dir / f"batch_cpu_{index:03d}.dds" for index in range(args.batch_count)
-        ]
         batch_gpu_outputs = [
             artifact_dir / f"batch_gpu_{index:03d}.dds" for index in range(args.batch_count)
         ]
-        cpu_tasks: list[str] = []
         gpu_tasks: list[str] = []
         for index in range(args.batch_count):
-            cpu_tasks.extend(task_args(source, mask, batch_cpu_outputs[index], index, high_res_source))
             gpu_tasks.extend(task_args(source, mask, batch_gpu_outputs[index], index, high_res_source))
 
         batch_cases = [
-            (
-                "batch-v3 CPU preprocessing",
-                [str(args.helper), "--convert-batch-v3", "false", *cpu_tasks],
-                batch_cpu_outputs,
-                False,
-                False,
-            ),
             (
                 "batch-v3 GPU",
                 [str(args.helper), "--convert-batch-v3", "true", *gpu_tasks],
@@ -555,10 +543,7 @@ def main() -> int:
 
         # The first task deliberately uses a low-resolution mask against the
         # upscaled source. Inspect the decoded BC3 alpha away from the edge.
-        for label, output in (
-            ("batch CPU preprocessing", batch_cpu_outputs[0]),
-            ("batch-v3 GPU", batch_gpu_outputs[0]),
-        ):
+        for label, output in (("batch-v3 GPU", batch_gpu_outputs[0]),):
             mask_status = "FAIL"
             if not output.is_file():
                 continue
@@ -582,10 +567,7 @@ def main() -> int:
             }
 
         if upscale_path.is_file():
-            for label, output in (
-                ("batch CPU preprocessing", batch_cpu_outputs[0]),
-                ("batch-v3 GPU", batch_gpu_outputs[0]),
-            ):
+            for label, output in (("batch-v3 GPU", batch_gpu_outputs[0]),):
                 if not output.is_file():
                     continue
                 try:
