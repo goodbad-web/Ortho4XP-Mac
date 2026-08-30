@@ -17,6 +17,7 @@ import struct
 import requests
 import queue
 import random
+import importlib.util
 from math import ceil, log, tan, pi, floor
 import numpy
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
@@ -25,21 +26,38 @@ Image.MAX_IMAGE_PIXELS = 1000000000  # Not a decompression bomb attack!
 
 has_URL = False
 try:
-    import O4_Custom_URL as URL
-
-    has_URL = True
-except:
-    try:
-        # module loaded from a subdirectory of Extent for extent creation
-        sys.path.append(os.path.join("../../Providers"))
-        import O4_Custom_URL as URL
-
-        has_URL = True
-    except:
-        print(
-            "ERROR: Providers/O4_Custom_URL.py contains invalid code.",
-            "The corresponding providers won't probably work.",
+    # Resolve the provider module from the repository/module location instead
+    # of from the process working directory.  The old ../../Providers fallback
+    # pointed outside the repository when this module was imported directly.
+    _provider_path_candidates = [
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "Providers", "O4_Custom_URL.py")
+        ),
+        os.path.abspath(
+            os.path.join(FNAMES.Provider_dir, "O4_Custom_URL.py")
+        ),
+    ]
+    _provider_path = next(
+        (path for path in _provider_path_candidates if os.path.isfile(path)),
+        None,
+    )
+    if _provider_path is None:
+        raise FileNotFoundError(
+            "Providers/O4_Custom_URL.py was not found in the repository"
         )
+    _provider_spec = importlib.util.spec_from_file_location(
+        "O4_Custom_URL", _provider_path
+    )
+    if _provider_spec is None or _provider_spec.loader is None:
+        raise ImportError(f"could not create a module loader for {_provider_path}")
+    URL = importlib.util.module_from_spec(_provider_spec)
+    _provider_spec.loader.exec_module(URL)
+    has_URL = True
+except Exception as error:
+    print(
+        "ERROR: Could not load Providers/O4_Custom_URL.py:",
+        error,
+    )
 
 http_timeout = 10
 check_tms_response = False
@@ -2582,6 +2600,7 @@ def init_worker(config_data):
         'use_gpu_for_color_filters', getattr(UI, 'use_gpu_for_color_filters', False)
     )
     UI.defer_gpu_batch = config_data.get('defer_gpu_batch', False)
+    UI.preserve_batch_inputs = config_data.get('preserve_batch_inputs', False)
     is_worker_process = True
 
 def convert_texture(
@@ -2623,17 +2642,18 @@ def convert_texture(
     masked_texture = False
 
     def cleanup_conversion_temp_files():
-        if erase_tmp_png:
+        preserve_batch_inputs = getattr(UI, "preserve_batch_inputs", False)
+        if erase_tmp_png and not preserve_batch_inputs:
             try:
                 os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
             except:
                 pass
-        if erase_tmp_tif and tmp_tif_file_name:
+        if erase_tmp_tif and tmp_tif_file_name and not preserve_batch_inputs:
             try:
                 os.remove(tmp_tif_file_name)
             except:
                 pass
-        if upscaled_file_to_delete:
+        if upscaled_file_to_delete and not preserve_batch_inputs:
             try:
                 os.remove(upscaled_file_to_delete)
             except:
@@ -2825,7 +2845,10 @@ def convert_texture(
         return 0
 
     # Optional AI Upscale using Neural Engine
-    if getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
+    # A supplied prepared file already contains the preprocessing requested by
+    # the caller (including an earlier neural upscale).  Do not upscale it a
+    # second time during the CPU fallback after a failed GPU batch.
+    if prepared_file is None and getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
         # Add pid to avoid conflicts during multiprocessing
         upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
         UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
@@ -2841,7 +2864,7 @@ def convert_texture(
             UI.vprint(1, f"      ERROR: Neural upscale failed for {file_to_convert}")
             cleanup_conversion_temp_files()
             return 0
-    elif getattr(UI, 'use_neural_upscale', False):
+    elif prepared_file is None and getattr(UI, 'use_neural_upscale', False):
         UI.vprint(1, "      ERROR: Neural upscale is enabled but ASHelper is unavailable.")
         cleanup_conversion_temp_files()
         return 0

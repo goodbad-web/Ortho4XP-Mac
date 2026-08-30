@@ -38,10 +38,13 @@ def build_overlay(lat, lon):
             + FNAMES.short_latlon(lat, lon)
             + " : \n--------\n",
         )
-        scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+        file_to_sniff = FNAMES.resolve_global_scenery_dsf(
             custom_overlay_src, lat, lon
         )
-        if len(scenery_candidates) != 1:
+        if file_to_sniff is None:
+            scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+                custom_overlay_src, lat, lon
+            )
             if not scenery_candidates:
                 message = (
                     "   ERROR: Global Scenery DSF was not found below "
@@ -54,7 +57,6 @@ def build_overlay(lat, lon):
                 message = "   ERROR: Multiple Global Scenery DSFs matched:"
             UI.exit_message_and_bottom_line(message, *scenery_candidates)
             return 0
-        file_to_sniff = scenery_candidates[0]
         if not os.path.isfile(file_to_sniff):
             UI.exit_message_and_bottom_line(
                 "   ERROR: file ",

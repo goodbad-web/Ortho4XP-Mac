@@ -30,11 +30,22 @@ def get_DK_ticket():
         time.sleep(3)
     if (not DK_ticket) or (time.time()-DK_time)>=3600:
         DK_ticket="loading"
-        tmp=requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS
-        requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS='HIGH:!DH:!aNULL'
-        DK_ticket=requests.get("https://sdfekort.dk/spatialmap?").content.decode().split('ticket=')[1].split("'")[0]
-        requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS=tmp
-        DK_time=time.time()
+        ssl_module = requests.packages.urllib3.util.ssl_
+        previous_ciphers = getattr(ssl_module, "DEFAULT_CIPHERS", None)
+        try:
+            # urllib3 2.x no longer exposes DEFAULT_CIPHERS.  Keep the legacy
+            # workaround only for versions that still provide the attribute.
+            if previous_ciphers is not None:
+                ssl_module.DEFAULT_CIPHERS = 'HIGH:!DH:!aNULL'
+            DK_ticket=requests.get("https://sdfekort.dk/spatialmap?").content.decode().split('ticket=')[1].split("'")[0]
+            DK_time=time.time()
+        except Exception:
+            # Do not leave other callers waiting forever after a failed fetch.
+            DK_ticket=None
+            raise
+        finally:
+            if previous_ciphers is not None:
+                ssl_module.DEFAULT_CIPHERS = previous_ciphers
     return DK_ticket
 
 # Germany DOP40

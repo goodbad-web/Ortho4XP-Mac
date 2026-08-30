@@ -399,10 +399,13 @@ def create_terrain_file(
 ################################################################################
 def extract_elevation_and_bathymetry_data(lat, lon):
     UI.vprint(1, "     Extracting some rasters from X-Plane's Global Scenery")
-    scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+    global_scenery_dsf = FNAMES.resolve_global_scenery_dsf(
         OVL.custom_overlay_src, lat, lon
     )
-    if len(scenery_candidates) != 1:
+    if global_scenery_dsf is None:
+        scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+            OVL.custom_overlay_src, lat, lon
+        )
         if not scenery_candidates:
             UI.exit_message_and_bottom_line(
                 "   ERROR: Global Scenery DSF was not found below ",
@@ -415,7 +418,6 @@ def extract_elevation_and_bathymetry_data(lat, lon):
                 *scenery_candidates,
             )
         return None
-    global_scenery_dsf = scenery_candidates[0]
 
     tmp_file = os.path.join(
         FNAMES.Tmp_dir, FNAMES.short_latlon(lat, lon) + ".dsf"

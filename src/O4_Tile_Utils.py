@@ -22,6 +22,92 @@ skip_downloads = False
 skip_converts = False
 
 
+def _ashelper_metal_available(as_helper):
+    """Probe ASHelper once before deferring work to the Metal batch path."""
+    try:
+        result = subprocess.run(
+            [as_helper, "--capabilities"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        UI.vprint(1, f"WARNING: Could not probe ASHelper Metal capability: {error}")
+        return False
+
+    available = (
+        result.returncode == 0
+        and "metal_available=true" in (result.stdout or "").splitlines()
+    )
+    if not available:
+        detail = (result.stdout or "").strip()
+        if detail:
+            UI.vprint(1, "WARNING: ASHelper Metal is unavailable; using CPU conversion.", detail)
+        else:
+            UI.vprint(1, "WARNING: ASHelper Metal is unavailable; using CPU conversion.")
+    return available
+
+
+def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
+    """Build CPU conversion arguments while retaining prepared image work."""
+    fallback_convert_list = []
+    for item_index, item in enumerate(convert_list):
+        prepared_file = (
+            prepared_input_paths[item_index]
+            if item_index < len(prepared_input_paths)
+            else None
+        )
+        # A direct JPEG still needs the normal CPU-side color/mask
+        # preprocessing. Only reuse files that already contain that work.
+        if prepared_file:
+            item_tile, item_x, item_y, item_z, item_provider = item
+            if item_provider in IMG.providers_dict:
+                direct_jpeg = os.path.join(
+                    FNAMES.jpeg_file_dir_from_attributes(
+                        item_tile.lat,
+                        item_tile.lon,
+                        item_z,
+                        IMG.providers_dict[item_provider],
+                    ),
+                    FNAMES.jpeg_file_name_from_attributes(
+                        item_x, item_y, item_z, item_provider
+                    ),
+                )
+                if os.path.abspath(prepared_file) == os.path.abspath(direct_jpeg):
+                    prepared_file = None
+        if not prepared_file or not os.path.isfile(prepared_file):
+            prepared_file = None
+        if prepared_file:
+            fallback_convert_list.append((*item, "dds", prepared_file))
+        else:
+            fallback_convert_list.append(item)
+    return fallback_convert_list
+
+
+def _run_cpu_fallback(
+    fallback_convert_list, config_data, max_slots, progress
+):
+    """Run all fallback conversions in the configured CPU pool."""
+    cpu_config_data = dict(config_data)
+    cpu_config_data.update(
+        {
+            "use_gpu_acceleration": False,
+            "defer_gpu_batch": False,
+            "preserve_batch_inputs": True,
+        }
+    )
+    return multiprocessing_pool(
+        IMG.convert_texture,
+        fallback_convert_list,
+        max_slots,
+        progress=progress,
+        init_func=IMG.init_worker,
+        init_args=cpu_config_data,
+    )
+
+
 def _activate_dsf(dsf_tmp_path, dsf_path):
     """Atomically activate a completed DSF while preserving rollback safety."""
     backup_path = dsf_path + ".bak"
@@ -247,12 +333,24 @@ def _build_tile(tile):
             dds_format = getattr(tile, 'dds_format', getattr(UI, 'dds_format', 'BC3'))
             use_gpu = getattr(tile, 'use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
             as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
-            gpu_batch_enabled = (
+            gpu_converter_requested = (
                 use_gpu
                 and dds_converter == "TextureConverter"
                 and "dar" in sys.platform
+            )
+            gpu_batch_requested = (
+                gpu_converter_requested
                 and os.path.isfile(as_helper)
                 and os.access(as_helper, os.X_OK)
+            )
+            metal_available = (
+                _ashelper_metal_available(as_helper)
+                if gpu_converter_requested
+                else False
+            )
+            gpu_batch_enabled = gpu_batch_requested and metal_available
+            effective_gpu = use_gpu and (
+                not gpu_converter_requested or metal_available
             )
             UI.vprint(
                 1,
@@ -277,7 +375,7 @@ def _build_tile(tile):
                 'use_neural_upscale': getattr(tile, 'use_neural_upscale', False),
                 'dds_converter': getattr(tile, 'dds_converter', dds_converter),
                 'dds_format': getattr(tile, 'dds_format', dds_format),
-                'use_gpu_acceleration': getattr(tile, 'use_gpu_acceleration', True),
+                'use_gpu_acceleration': effective_gpu,
                 'use_gpu_for_color_filters': getattr(tile, 'use_gpu_for_color_filters', False),
                 'is_worker': True
             }
@@ -525,55 +623,50 @@ def _build_tile(tile):
                 if batch_attempted and not conversion_success:
                     cleanup_batch_outputs()
                     UI.vprint(1, "-> Falling back to CPU DDS conversion via ASHelper...")
-                    original_gpu = getattr(UI, 'use_gpu_acceleration', True)
-                    original_preserve = getattr(UI, 'preserve_batch_inputs', False)
-                    cpu_success_count = 0
-                    try:
-                        UI.use_gpu_acceleration = False
-                        UI.preserve_batch_inputs = True
-                        for item_index, item in enumerate(convert_list):
-                            prepared_file = prepared_input_paths[item_index]
-                            # A direct JPEG still needs the normal CPU-side
-                            # color/mask preprocessing.  Only reuse files that
-                            # already contain that preprocessing (PNG/upscaled).
-                            if prepared_file:
-                                item_tile, item_x, item_y, item_z, item_provider = item
-                                if item_provider in IMG.providers_dict:
-                                    direct_jpeg = os.path.join(
-                                        FNAMES.jpeg_file_dir_from_attributes(
-                                            item_tile.lat,
-                                            item_tile.lon,
-                                            item_z,
-                                            IMG.providers_dict[item_provider],
-                                        ),
-                                        FNAMES.jpeg_file_name_from_attributes(
-                                            item_x, item_y, item_z, item_provider
-                                        ),
-                                    )
-                                    if os.path.abspath(prepared_file) == os.path.abspath(direct_jpeg):
-                                        prepared_file = None
-                            if not prepared_file or not os.path.isfile(prepared_file):
-                                prepared_file = None
-                            if prepared_file:
-                                cpu_success_count += IMG.convert_texture(
-                                    *item, prepared_file=prepared_file
-                                )
-                            else:
-                                cpu_success_count += IMG.convert_texture(*item)
-                    finally:
-                        UI.use_gpu_acceleration = original_gpu
-                        UI.preserve_batch_inputs = original_preserve
-                    success_count = cpu_success_count
-                    conversion_success = (cpu_success_count == len(convert_list))
+                    fallback_convert_list = _cpu_fallback_convert_args(
+                        convert_list, prepared_input_paths
+                    )
+                    for item in convert_list:
+                        item_out_name = FNAMES.dds_file_name_from_attributes(
+                            item[1], item[2], item[3], item[4]
+                        )
+                        fallback_tmp_png = os.path.join(
+                            UI.Ortho4XP_dir,
+                            "tmp",
+                            item_out_name.replace("dds", "png"),
+                        )
+                        if fallback_tmp_png not in temp_files_to_delete:
+                            temp_files_to_delete.append(fallback_tmp_png)
+                        if item[4] in IMG.providers_dict and item[0].imprint_masks_to_dds:
+                            fallback_mask = os.path.join(
+                                item[0].build_dir,
+                                "textures",
+                                FNAMES.mask_file(item[1], item[2], item[3], item[4]),
+                            )
+                            if os.path.isfile(fallback_mask) and fallback_mask not in temp_files_to_delete:
+                                temp_files_to_delete.append(fallback_mask)
 
-                if conversion_success and batch_args:
+                    fallback_progress = {
+                        "done": 0,
+                        "bar": 3,
+                        "message": "CPU fallback DDS conversion",
+                    }
+                    fallback_success = _run_cpu_fallback(
+                        fallback_convert_list,
+                        config_data,
+                        max_convert_slots,
+                        fallback_progress,
+                    )
+                    success_count = len(convert_list) if fallback_success else 0
+                    conversion_success = bool(fallback_success)
+
+                if conversion_success:
                     for temp_file in temp_files_to_delete:
                         try:
                             os.remove(temp_file)
                         except:
                             pass
-
-                cleanup_generated_batch_masks()
+                    cleanup_generated_batch_masks()
 
             if not conversion_success:
                 UI.lvprint(0, f"WARNING: {len(convert_list) - success_count} textures failed to convert.")

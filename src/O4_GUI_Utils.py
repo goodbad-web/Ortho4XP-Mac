@@ -886,6 +886,7 @@ class Ortho4XP_GUI(tk.Tk):
 
         scenery_root = getattr(OVL, "custom_overlay_src", "")
         scenery_roots = FNAMES.global_scenery_roots(scenery_root)
+        resolved_scenery_root = FNAMES.resolve_global_scenery_root(scenery_root)
         if scenery_root and os.path.isdir(scenery_root):
             UI.vprint(
                 0,
@@ -894,12 +895,12 @@ class Ortho4XP_GUI(tk.Tk):
                     f"  [OK] Global Sceneryのルートを検出しました: {scenery_root}",
                 ),
             )
-            if len(scenery_roots) == 1:
+            if resolved_scenery_root is not None:
                 UI.vprint(
                     0,
                     _ui_text(
-                        f"  [OK] Global Scenery hierarchy resolved: {scenery_roots[0]}",
-                        f"  [OK] Global Sceneryの配置を解決しました: {scenery_roots[0]}",
+                        f"  [OK] Global Scenery hierarchy resolved: {resolved_scenery_root}",
+                        f"  [OK] Global Sceneryの配置を解決しました: {resolved_scenery_root}",
                     ),
                 )
             elif len(scenery_roots) > 1:

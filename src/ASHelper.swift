@@ -721,7 +721,11 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
 
 let args = ProcessInfo.processInfo.arguments
 guard args.count >= 2 else { fail("ASHelper: missing command.") }
-if args[1] == "--upscale" {
+if args[1] == "--capabilities" {
+    guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
+    print("metal_available=\(MetalCompressor.shared != nil)")
+}
+else if args[1] == "--upscale" {
     guard args.count == 4 else { fail("ASHelper: --upscale expects input and output paths.") }
     if !upscale(inputPath: args[2], outputPath: args[3]) {
         exit(1)

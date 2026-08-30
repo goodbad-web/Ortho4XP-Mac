@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 
@@ -65,6 +66,62 @@ def fake_executable(path: Path, body: str) -> Path:
     return path
 
 
+def test_provider_loader(tmp: Path, modules: dict[str, object]) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import O4_Imagery_Utils as img; "
+            "print('has_URL=', img.has_URL); assert img.has_URL",
+        ],
+        cwd=tmp,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "has_URL= True" in result.stdout
+    assert "invalid code" not in result.stdout
+
+    provider_path = ROOT / "Providers" / "O4_Custom_URL.py"
+    spec = __import__("importlib.util").util.spec_from_file_location(
+        "custom_url_urllib3_compat", provider_path
+    )
+    assert spec is not None and spec.loader is not None
+    provider = __import__("importlib.util").util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    original_requests = provider.requests
+    original_ticket, original_time = provider.DK_ticket, provider.DK_time
+
+    class SSLModule:
+        pass
+
+    class Response:
+        content = b"<script>ticket=compat-ticket'"
+
+    fake_requests = types.SimpleNamespace(
+        packages=types.SimpleNamespace(
+            urllib3=types.SimpleNamespace(
+                util=types.SimpleNamespace(ssl_=SSLModule())
+            )
+        ),
+        get=lambda _: Response(),
+    )
+    try:
+        provider.requests = fake_requests
+        provider.DK_ticket = None
+        provider.DK_time = 0
+        assert provider.get_DK_ticket() == "compat-ticket"
+        assert not hasattr(fake_requests.packages.urllib3.util.ssl_, "DEFAULT_CIPHERS")
+    finally:
+        provider.requests = original_requests
+        provider.DK_ticket, provider.DK_time = original_ticket, original_time
+
+
 def test_global_scenery_resolution(tmp: Path, modules: dict[str, object]) -> None:
     fnames = modules["FNAMES"]
     lat, lon = 35, 139
@@ -82,6 +139,9 @@ def test_global_scenery_resolution(tmp: Path, modules: dict[str, object]) -> Non
     child_file = parent_root / "X-Plane 12 Global Scenery" / relative
     child_file.parent.mkdir(parents=True)
     child_file.write_bytes(b"child")
+    airport_file = parent_root / "Global Airports" / relative
+    airport_file.parent.mkdir(parents=True)
+    airport_file.write_bytes(b"airport")
     candidates = fnames.global_scenery_dsf_candidates(str(parent_root), lat, lon)
     assert candidates == [str(child_file)]
 
@@ -336,6 +396,71 @@ def test_parallel_and_activation(tmp: Path, modules: dict[str, object]) -> None:
         tile._build_tile = original_build
 
 
+def test_gpu_capability_and_fallback(tmp: Path, modules: dict[str, object]) -> None:
+    tile_utils = modules["TILE"]
+    img = modules["IMG"]
+
+    available_helper = fake_executable(
+        tmp / "ashelper-metal-available",
+        "print('metal_available=true')\n",
+    )
+    unavailable_helper = fake_executable(
+        tmp / "ashelper-metal-unavailable",
+        "print('metal_available=false')\n",
+    )
+    assert tile_utils._ashelper_metal_available(str(available_helper)) is True
+    assert tile_utils._ashelper_metal_available(str(unavailable_helper)) is False
+    assert tile_utils._ashelper_metal_available(str(tmp / "missing-ashelper")) is False
+
+    class Tile:
+        lat = 35
+        lon = 139
+        build_dir = str(tmp / "tile")
+        imprint_masks_to_dds = False
+
+    prepared = tmp / "prepared.png"
+    prepared.write_bytes(b"prepared")
+    item = (Tile(), 0, 0, 12, "TEST")
+    original_providers = img.providers_dict
+    original_pool = tile_utils.multiprocessing_pool
+    try:
+        img.providers_dict = {}
+        fallback_args = tile_utils._cpu_fallback_convert_args(
+            [item], [str(prepared)]
+        )
+        assert fallback_args == [(*item, "dds", str(prepared))]
+
+        captured = {}
+
+        def fake_pool(task, args, workers, progress=None, init_func=None, init_args=None):
+            captured.update(
+                {
+                    "task": task,
+                    "args": args,
+                    "workers": workers,
+                    "init_args": init_args,
+                }
+            )
+            return 1
+
+        tile_utils.multiprocessing_pool = fake_pool
+        assert tile_utils._run_cpu_fallback(
+            fallback_args,
+            {"use_gpu_acceleration": True, "defer_gpu_batch": True},
+            7,
+            {"done": 0, "bar": 3, "message": "fallback"},
+        ) == 1
+        assert captured["task"] is img.convert_texture
+        assert captured["args"] == fallback_args
+        assert captured["workers"] == 7
+        assert captured["init_args"]["use_gpu_acceleration"] is False
+        assert captured["init_args"]["defer_gpu_batch"] is False
+        assert captured["init_args"]["preserve_batch_inputs"] is True
+    finally:
+        img.providers_dict = original_providers
+        tile_utils.multiprocessing_pool = original_pool
+
+
 def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
     img = modules["IMG"]
     ui = modules["UI"]
@@ -363,6 +488,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
     old_root = ui.Ortho4XP_dir
     old_dds_converter = getattr(ui, "dds_converter", None)
     old_dds_format = getattr(ui, "dds_format", None)
+    old_use_neural_upscale = getattr(ui, "use_neural_upscale", False)
     old_sleep = img.time.sleep
     try:
         img.dds_convert_cmd = str(fake_converter)
@@ -372,6 +498,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
         ui.Ortho4XP_dir = str(tmp)
         ui.dds_converter = "nvcompress"
         ui.dds_format = "BC3"
+        ui.use_neural_upscale = True
         img.time.sleep = lambda _: None
         result = img.convert_texture(
             Tile(), 0, 0, 12, "TEST", prepared_file=str(source)
@@ -379,6 +506,28 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
         assert result == 0
         output = Path(Tile.build_dir) / "textures"
         assert not output.exists() or not list(output.glob("*.dds"))
+        output.mkdir()
+
+        prepared_converter = fake_executable(
+            tmp / "converter-accepts-prepared-input",
+            "import struct, sys\n"
+            "header = bytearray(128)\n"
+            "header[0:4] = b'DDS '\n"
+            "for offset, value in ((4, 124), (12, 4), (16, 4), (20, 16), (28, 1), (76, 32), (80, 4), (108, 4096)):\n"
+            "    struct.pack_into('<I', header, offset, value)\n"
+            "header[84:88] = b'DXT5'\n"
+            "with open(sys.argv[-1], 'wb') as stream:\n"
+            "    stream.write(header + b'\\0' * 16)\n"
+            "sys.exit(0)\n",
+        )
+        img.dds_convert_cmd = str(prepared_converter)
+        result = img.convert_texture(
+            Tile(), 0, 0, 12, "TEST", prepared_file=str(source)
+        )
+        assert result == 1
+        assert list(output.glob("*.dds"))
+        for dds_file in output.glob("*.dds"):
+            dds_file.unlink()
 
         malformed_converter = fake_executable(
             tmp / "converter-writes-invalid-dds",
@@ -399,6 +548,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
         img.local_combined_providers_dict = old_combined
         img.as_helper_cmd = old_as_helper
         ui.Ortho4XP_dir = old_root
+        ui.use_neural_upscale = old_use_neural_upscale
         img.time.sleep = old_sleep
         if old_dds_converter is None:
             try:
@@ -493,11 +643,13 @@ def main() -> int:
         "UI": ui,
     }
     tests = [
+        ("Provider loader and urllib3 compatibility", test_provider_loader),
         ("Global Scenery resolution", test_global_scenery_resolution),
         ("DSF extraction and archive failure", test_dsf_extraction),
         ("OSM XML and cache quarantine", test_osm_cache_and_xml),
         ("Overpass status and fallback", test_overpass_fallback),
         ("Parallel failure and DSF activation", test_parallel_and_activation),
+        ("GPU capability and CPU fallback", test_gpu_capability_and_fallback),
         ("DDS output validation", test_missing_dds_output),
         ("levels CPU routing", test_levels_route),
         ("CLI invalid argument exit", test_cli_exit_code),
@@ -512,11 +664,13 @@ def main() -> int:
                 if name == "CLI invalid argument exit":
                     test(tmp)
                 elif name in {
+                    "Provider loader and urllib3 compatibility",
                     "Global Scenery resolution",
                     "DSF extraction and archive failure",
                     "OSM XML and cache quarantine",
                     "Overpass status and fallback",
                     "Parallel failure and DSF activation",
+                    "GPU capability and CPU fallback",
                     "DDS output validation",
                 }:
                     test(tmp, modules)
