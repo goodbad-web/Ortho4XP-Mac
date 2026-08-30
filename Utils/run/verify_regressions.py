@@ -275,7 +275,7 @@ def test_overpass_fallback(tmp: Path, modules: dict[str, object]) -> None:
         calls.clear()
         osm.max_osm_tentatives = 10
         assert osm.get_overpass_data("way[]", (35, 139, 36, 140)) == 0
-        assert len(calls) == 5 and len(set(calls)) == 5
+        assert len(calls) == 5 * osm.max_osm_tentatives and len(set(calls)) == 5
     finally:
         osm.requests.Session = old_session
         osm.max_osm_tentatives = old_tentatives

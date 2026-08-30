@@ -689,8 +689,8 @@ def get_overpass_data(query, bbox, server_code=None):
     headers = {"User-Agent": "Ortho4XP"}
     session = requests.Session()
 
-    attempted_servers = set()
     for tentative in range(max_osm_tentatives):
+        attempted_servers = set()
         for true_server_code in server_order:
             if true_server_code in attempted_servers:
                 continue
@@ -757,8 +757,6 @@ def get_overpass_data(query, bbox, server_code=None):
             if UI.red_flag:
                 return 0
 
-        if len(attempted_servers) == len(server_order):
-            return 0
         if tentative + 1 >= max_osm_tentatives:
             return 0
         delay = min(2 ** (tentative + 1), 60)
