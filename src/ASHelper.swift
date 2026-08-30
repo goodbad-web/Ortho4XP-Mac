@@ -39,18 +39,29 @@ func fail(_ message: String) -> Never {
 
 final class BatchFailureState {
     private let lock = NSLock()
-    private var failed = false
+    private var failures: [String] = []
 
-    func recordFailure() {
+    func recordFailure(index: Int, input: String, mask: String, output: String) {
         lock.lock()
-        failed = true
+        failures.append(
+            "task=\(index) input='\(input)' mask='\(mask)' output='\(output)'"
+        )
         lock.unlock()
     }
 
     func hasFailure() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return failed
+        return !failures.isEmpty
+    }
+
+    func reportFailures() {
+        lock.lock()
+        let currentFailures = failures
+        lock.unlock()
+        for failure in currentFailures {
+            reportError("ASHelper: GPU batch failed (\(failure))")
+        }
     }
 }
 
@@ -195,10 +206,17 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     let w = Int(bounds.width)
     let h = Int(bounds.height)
     
-    // 1. Create an empty empty MTLTexture in VRAM (with mipmapped = true)
+    // 1. Create an empty MTLTexture in VRAM (with mipmapped = true)
     let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: true)
-    desc.usage = [.shaderRead, .shaderWrite]
+    desc.usage = [.shaderRead, .shaderWrite, .pixelFormatView]
     guard let mtlTexture = dev.makeTexture(descriptor: desc) else { return nil }
+    let expectedMipCount = Int(floor(log2(Double(max(w, h))))) + 1
+    guard mtlTexture.mipmapLevelCount == expectedMipCount else {
+        reportError(
+            "ASHelper: Metal texture mip count mismatch (expected \(expectedMipCount), got \(mtlTexture.mipmapLevelCount))."
+        )
+        return nil
+    }
     
     // 2. Render preprocessed CIImage directly into the MTLTexture level 0 [100% Zero-Copy]
     // [Y-Flip Fix] CIImage has bottom-left origin, while MTLTexture has top-left origin.
@@ -213,17 +231,20 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     
     // 3. Generate lower mipmap levels directly inside VRAM using GPU Blit Encoder
     guard let cmb = q.makeCommandBuffer() else { return nil }
-    if let mipEncoder = cmb.makeBlitCommandEncoder() {
-        mipEncoder.generateMipmaps(for: mtlTexture)
-        mipEncoder.endEncoding()
+    guard let mipEncoder = cmb.makeBlitCommandEncoder() else {
+        reportError("ASHelper: Failed to create the Metal mipmap blit encoder.")
+        return nil
     }
+    mipEncoder.generateMipmaps(for: mtlTexture)
+    mipEncoder.endEncoding()
     
     // 4. Run Metal compute kernels to compress each mipmap level
     var buffers: [MTLBuffer] = []
     for level in 0..<mtlTexture.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
         let sz = bW * bH * (mode == 0 ? 8 : 16)
-        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { return nil }
+        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared),
+              buf.length == sz else { return nil }
         buffers.append(buf)
         
         guard let enc = cmb.makeComputeCommandEncoder() else { return nil }
@@ -239,10 +260,32 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     
     cmb.commit()
     cmb.waitUntilCompleted()
-    
+    guard cmb.status == .completed else {
+        reportError(
+            "ASHelper: Metal preprocessing command buffer failed with status \(cmb.status.rawValue): "
+            + (cmb.error?.localizedDescription ?? "unknown error")
+        )
+        return nil
+    }
+    if let error = cmb.error {
+        reportError("ASHelper: Metal preprocessing command buffer error: \(error.localizedDescription)")
+        return nil
+    }
+
     var outData = Data()
     for buf in buffers {
         outData.append(Data(bytes: buf.contents(), count: buf.length))
+    }
+    let expectedSize = (0..<mtlTexture.mipmapLevelCount).reduce(0) { total, level in
+        let lW = max(1, w >> level)
+        let lH = max(1, h >> level)
+        return total + ((lW + 3) / 4) * ((lH + 3) / 4) * (mode == 0 ? 8 : 16)
+    }
+    guard outData.count == expectedSize else {
+        reportError(
+            "ASHelper: Metal compression payload size mismatch (expected \(expectedSize), got \(outData.count))."
+        )
+        return nil
     }
     return outData
 }
@@ -351,6 +394,13 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     
     guard let tex = try? loader.newTexture(cgImage: cgImage, options: options) else { return nil }
     let w = tex.width; let h = tex.height
+    let expectedMipCount = Int(floor(log2(Double(max(w, h))))) + 1
+    guard tex.mipmapLevelCount == expectedMipCount else {
+        reportError(
+            "ASHelper: Metal texture mip count mismatch (expected \(expectedMipCount), got \(tex.mipmapLevelCount))."
+        )
+        return nil
+    }
     
     guard let cmb = q.makeCommandBuffer() else { return nil }
     var buffers: [MTLBuffer] = []
@@ -358,7 +408,8 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     for level in 0..<tex.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
         let sz = bW * bH * (mode == 0 ? 8 : 16)
-        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared) else { return nil }
+        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared),
+              buf.length == sz else { return nil }
         buffers.append(buf)
         
         guard let enc = cmb.makeComputeCommandEncoder() else { return nil }
@@ -374,10 +425,32 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     
     cmb.commit()
     cmb.waitUntilCompleted()
+    guard cmb.status == .completed else {
+        reportError(
+            "ASHelper: Metal mipmap command buffer failed with status \(cmb.status.rawValue): "
+            + (cmb.error?.localizedDescription ?? "unknown error")
+        )
+        return nil
+    }
+    if let error = cmb.error {
+        reportError("ASHelper: Metal mipmap command buffer error: \(error.localizedDescription)")
+        return nil
+    }
     
     var outData = Data()
     for buf in buffers {
         outData.append(Data(bytes: buf.contents(), count: buf.length))
+    }
+    let expectedSize = (0..<tex.mipmapLevelCount).reduce(0) { total, level in
+        let lW = max(1, w >> level)
+        let lH = max(1, h >> level)
+        return total + ((lW + 3) / 4) * ((lH + 3) / 4) * (mode == 0 ? 8 : 16)
+    }
+    guard outData.count == expectedSize else {
+        reportError(
+            "ASHelper: Metal mipmap payload size mismatch (expected \(expectedSize), got \(outData.count))."
+        )
+        return nil
     }
     return outData
 }
@@ -533,12 +606,32 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     return writeDDS(out, to: outputPath)
 }
 
-func upscale(inputPath: String, outputPath: String) {
-    let url = URL(fileURLWithPath: inputPath); guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else { exit(1) }
+func upscale(inputPath: String, outputPath: String) -> Bool {
+    let url = URL(fileURLWithPath: inputPath)
+    guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else {
+        reportError("ASHelper: Failed to load image or create upscale filter for '\(inputPath)'.")
+        return false
+    }
     f.setValue(ci, forKey: kCIInputImageKey); f.setValue(2.0, forKey: kCIInputScaleKey)
-    guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else { exit(1) }
-    let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outputPath) as CFURL, UTType.png.identifier as CFString, 1, nil)!
-    CGImageDestinationAddImage(dest, cg, nil); CGImageDestinationFinalize(dest)
+    guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else {
+        reportError("ASHelper: Failed to render upscaled image '\(inputPath)'.")
+        return false
+    }
+    guard let dest = CGImageDestinationCreateWithURL(
+        URL(fileURLWithPath: outputPath) as CFURL,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    ) else {
+        reportError("ASHelper: Failed to create upscaled image output '\(outputPath)'.")
+        return false
+    }
+    CGImageDestinationAddImage(dest, cg, nil)
+    guard CGImageDestinationFinalize(dest) else {
+        reportError("ASHelper: Failed to write upscaled image '\(outputPath)'.")
+        return false
+    }
+    return true
 }
 
 func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) -> Bool {
@@ -630,7 +723,9 @@ let args = ProcessInfo.processInfo.arguments
 guard args.count >= 2 else { fail("ASHelper: missing command.") }
 if args[1] == "--upscale" {
     guard args.count == 4 else { fail("ASHelper: --upscale expects input and output paths.") }
-    upscale(inputPath: args[2], outputPath: args[3])
+    if !upscale(inputPath: args[2], outputPath: args[3]) {
+        exit(1)
+    }
 }
 else if args[1] == "--convert" {
     guard args.count >= 4 else { fail("ASHelper: --convert expects input and output paths.") }
@@ -707,13 +802,23 @@ else if args[1] == "--convert-batch-v3" {
     }
     
     let failureState = BatchFailureState()
+    let concurrencyLimit = min(8, max(1, tasks.count))
+    let semaphore = DispatchSemaphore(value: concurrencyLimit)
     DispatchQueue.concurrentPerform(iterations: tasks.count) { i in
+        semaphore.wait()
+        defer { semaphore.signal() }
         let t = tasks[i]
         if !convertWithPreprocess(jpegPath: t.jpeg, maskPath: t.mask, r: t.r, g: t.g, b: t.b, contrast: t.contrast, brightness: t.brightness, saturation: t.saturation, outputPath: t.output, format: t.format, useGPU: useGPU) {
-            failureState.recordFailure()
+            failureState.recordFailure(
+                index: i,
+                input: t.jpeg,
+                mask: t.mask,
+                output: t.output
+            )
         }
     }
     if failureState.hasFailure() {
+        failureState.reportFailures()
         exit(1)
     }
 }

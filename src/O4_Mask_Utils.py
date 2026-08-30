@@ -68,6 +68,7 @@ def build_masks(tile, for_imagery=False):
     try:
         return _build_masks(tile, for_imagery)
     finally:
+        UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
 def _build_masks(tile, for_imagery=False):
@@ -217,15 +218,20 @@ def _build_masks(tile, for_imagery=False):
         masks_queue.put(key)
     dico_progress = {"done": 0, "bar": 1}
 
-    parallel_execute(build_mask, masks_queue, masks_build_slots,
-                     progress=dico_progress)
+    success = parallel_execute(
+        build_mask, masks_queue, masks_build_slots, progress=dico_progress
+    )
+
+    if not success:
+        UI.exit_message_and_bottom_line("ERROR: Could not build all water masks.")
+        return 0
 
     UI.progress_bar(1, 100)
     UI.timings_and_bottom_line(timer)
     UI.logprint(
         "Step 2.5 for tile lat=", tile.lat, ", lon=", tile.lon, ": normal exit."
     )
-    return
+    return 1
 ################################################################################
     
 ################################################################################
@@ -824,7 +830,11 @@ if __name__ == "__main__":
             sys.exit(0)
     else:
         print("Recycling OSM file...")
-        osm_layer.update_dicosm(cached_file_name, None)
+        if not osm_layer.update_dicosm(cached_file_name, None):
+            print("OSM extent cache is corrupted. Exiting.")
+            del vector_map
+            time.sleep(1)
+            sys.exit(1)
     print("Transform to multipolygon...")
     multipolygon_area = OSM.OSM_to_MultiPolygon(osm_layer, 0, 0)
     del osm_layer

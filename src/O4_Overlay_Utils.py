@@ -38,12 +38,24 @@ def build_overlay(lat, lon):
             + FNAMES.short_latlon(lat, lon)
             + " : \n--------\n",
         )
-        file_to_sniff = os.path.join(
-            custom_overlay_src,
-            "Earth nav data",
-            FNAMES.long_latlon(lat, lon) + ".dsf",
+        scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+            custom_overlay_src, lat, lon
         )
-        if not os.path.exists(file_to_sniff):
+        if len(scenery_candidates) != 1:
+            if not scenery_candidates:
+                message = (
+                    "   ERROR: Global Scenery DSF was not found below "
+                    + (custom_overlay_src or "(empty path)")
+                    + ". Expected Earth nav data/"
+                    + FNAMES.long_latlon(lat, lon)
+                    + ".dsf."
+                )
+            else:
+                message = "   ERROR: Multiple Global Scenery DSFs matched:"
+            UI.exit_message_and_bottom_line(message, *scenery_candidates)
+            return 0
+        file_to_sniff = scenery_candidates[0]
+        if not os.path.isfile(file_to_sniff):
             UI.exit_message_and_bottom_line(
                 "   ERROR: file ",
                 file_to_sniff,
@@ -69,23 +81,31 @@ def build_overlay(lat, lon):
             UI.vprint(1, "-> The original DSF is a 7z archive, uncompressing...")
             archive_path = file_to_sniff_loc + ".7z"
             os.replace(file_to_sniff_loc, archive_path)
-            unzip_res = subprocess.run(
-                [
-                    unzip_cmd.strip(),
-                    "e",
-                    "-o" + FNAMES.Tmp_dir,
-                    archive_path,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            try:
+                unzip_res = subprocess.run(
+                    [
+                        unzip_cmd.strip(),
+                        "e",
+                        "-y",
+                        "-o" + FNAMES.Tmp_dir,
+                        archive_path,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError as error:
+                UI.exit_message_and_bottom_line(
+                    "   ERROR: could not run 7-Zip:", error
+                )
+                return 0
             if unzip_res.stdout:
                 for line in unzip_res.stdout.splitlines():
                     UI.vprint(1, "     " + line)
-            if unzip_res.returncode != 0:
+            if unzip_res.returncode != 0 or not os.path.isfile(file_to_sniff_loc):
                 UI.exit_message_and_bottom_line("   ERROR: could not uncompress overlay DSF.")
                 return 0
             try:
@@ -96,24 +116,33 @@ def build_overlay(lat, lon):
         dsf2text_out = os.path.join(
             FNAMES.Tmp_dir, FNAMES.short_latlon(lat, lon) + "_tmp_dsf.txt"
         )
+        try:
+            os.remove(dsf2text_out)
+        except OSError:
+            pass
         dsfconvertcmd = [
             dsftool_cmd.strip(),
             "-dsf2text",
             file_to_sniff_loc,
             dsf2text_out,
         ]
-        dsf2text_res = subprocess.run(
-            dsfconvertcmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            dsf2text_res = subprocess.run(
+                dsfconvertcmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as error:
+            UI.exit_message_and_bottom_line("   ERROR: could not run DSFTool:", error)
+            return 0
         if dsf2text_res.stdout:
             for line in dsf2text_res.stdout.splitlines():
                 UI.vprint(1, "     " + line)
-        if dsf2text_res.returncode != 0:
+        if dsf2text_res.returncode != 0 or not os.path.isfile(dsf2text_out):
             UI.exit_message_and_bottom_line("   ERROR: DSFTool crashed.")
             return 0
         UI.vprint(1, "-> Selecting overlays for copy/paste")
@@ -213,18 +242,31 @@ def build_overlay(lat, lon):
                 FNAMES.short_latlon(lat, lon) + "_tmp_dsf_without_mesh.dsf",
             ),
         ]
-        text2dsf_res = subprocess.run(
-            dsfconvertcmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        output_overlay = os.path.join(
+            FNAMES.Tmp_dir,
+            FNAMES.short_latlon(lat, lon) + "_tmp_dsf_without_mesh.dsf",
         )
+        try:
+            os.remove(output_overlay)
+        except OSError:
+            pass
+        try:
+            text2dsf_res = subprocess.run(
+                dsfconvertcmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as error:
+            UI.exit_message_and_bottom_line("   ERROR: could not run DSFTool:", error)
+            return 0
         if text2dsf_res.stdout:
             for line in text2dsf_res.stdout.splitlines():
                 UI.vprint(1, "     " + line)
-        if text2dsf_res.returncode != 0:
+        if text2dsf_res.returncode != 0 or not os.path.isfile(output_overlay):
             UI.exit_message_and_bottom_line("   ERROR: DSFTool crashed.")
             return 0
         dest_dir = os.path.join(
@@ -240,13 +282,16 @@ def build_overlay(lat, lon):
                     + str(dest_dir)
                 )
                 return 0
-        shutil.copy(
-            os.path.join(
-                FNAMES.Tmp_dir,
-                FNAMES.short_latlon(lat, lon) + "_tmp_dsf_without_mesh.dsf",
-            ),
-            os.path.join(dest_dir, FNAMES.short_latlon(lat, lon) + ".dsf"),
-        )
+        try:
+            shutil.copy(
+                output_overlay,
+                os.path.join(dest_dir, FNAMES.short_latlon(lat, lon) + ".dsf"),
+            )
+        except OSError as error:
+            UI.exit_message_and_bottom_line(
+                "   ERROR: could not copy final overlay DSF:", error
+            )
+            return 0
         UI.timings_and_bottom_line(timer)
         return 1
     finally:

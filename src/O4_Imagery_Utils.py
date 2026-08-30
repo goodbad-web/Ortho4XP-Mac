@@ -13,6 +13,7 @@ import sys
 import shutil
 import subprocess
 import io
+import struct
 import requests
 import queue
 import random
@@ -67,6 +68,110 @@ def dds_format_support_error(dds_converter, dds_format):
             f"{dds_converter} cannot be used."
         )
     return None
+
+
+def validate_dds_file(
+    path,
+    expected_format=None,
+    expected_dimensions=None,
+    require_mipmaps=False,
+):
+    """Validate a compressed DDS header and its complete payload size.
+
+    A converter returning zero is not sufficient evidence that the output is
+    usable.  This check intentionally accepts both legacy DXT headers and the
+    DX10 header used by BC7-capable tools, while rejecting truncated or
+    mismatched output before a tile can be activated.
+    """
+    try:
+        if not os.path.isfile(path):
+            return False, "DDS output is missing"
+        file_size = os.path.getsize(path)
+        if file_size < 128:
+            return False, f"DDS output is too small ({file_size} bytes)"
+        with open(path, "rb") as stream:
+            header = stream.read(148)
+        if len(header) < 128 or header[:4] != b"DDS ":
+            return False, "DDS magic/header is missing"
+        if struct.unpack_from("<I", header, 4)[0] != 124:
+            return False, "DDS header size is invalid"
+
+        height = struct.unpack_from("<I", header, 12)[0]
+        width = struct.unpack_from("<I", header, 16)[0]
+        if width < 1 or height < 1:
+            return False, "DDS dimensions are invalid"
+        if expected_dimensions is not None:
+            expected_width, expected_height = expected_dimensions
+            if (width, height) != (int(expected_width), int(expected_height)):
+                return False, (
+                    f"DDS dimensions are {(width, height)}, expected "
+                    f"{(int(expected_width), int(expected_height))}"
+                )
+
+        mipmaps = struct.unpack_from("<I", header, 28)[0] or 1
+        max_mipmaps = max(width, height).bit_length()
+        if mipmaps > max_mipmaps:
+            return False, f"DDS mip count {mipmaps} exceeds {max_mipmaps}"
+        if require_mipmaps and mipmaps <= 1:
+            return False, "DDS output has no generated mipmaps"
+        if struct.unpack_from("<I", header, 76)[0] != 32:
+            return False, "DDS pixel-format header size is invalid"
+
+        fourcc = header[84:88]
+        dx10 = fourcc == b"DX10"
+        data_offset = 128
+        if fourcc == b"DXT1":
+            actual_format = "BC1"
+            block_size = 8
+        elif fourcc == b"DXT5":
+            actual_format = "BC3"
+            block_size = 16
+        elif dx10:
+            if len(header) < 148:
+                return False, "DDS DX10 header is missing"
+            dxgi_format = struct.unpack_from("<I", header, 128)[0]
+            dxgi_formats = {
+                71: ("BC1", 8),
+                72: ("BC1", 8),
+                77: ("BC3", 16),
+                78: ("BC3", 16),
+                98: ("BC7", 16),
+                99: ("BC7", 16),
+            }
+            try:
+                actual_format, block_size = dxgi_formats[dxgi_format]
+            except KeyError:
+                return False, f"unsupported DDS DXGI format {dxgi_format}"
+            data_offset = 148
+        else:
+            return False, f"unsupported DDS compression FourCC {fourcc!r}"
+
+        if expected_format is not None:
+            normalized_format = str(expected_format).upper()
+            if actual_format != normalized_format:
+                return False, (
+                    f"DDS format is {actual_format}, expected {normalized_format}"
+                )
+
+        expected_payload = 0
+        level_width = width
+        level_height = height
+        for _ in range(mipmaps):
+            expected_payload += (
+                max(1, (level_width + 3) // 4)
+                * max(1, (level_height + 3) // 4)
+                * block_size
+            )
+            level_width = max(1, level_width // 2)
+            level_height = max(1, level_height // 2)
+        expected_size = data_offset + expected_payload
+        if file_size != expected_size:
+            return False, (
+                f"DDS payload size is {file_size}, expected {expected_size}"
+            )
+    except (OSError, struct.error, ValueError) as error:
+        return False, f"could not validate DDS: {error}"
+    return True, None
 
 if "dar" in sys.platform:
     # 1. Try native 'magick' (Apple Silicon optimization)
@@ -736,7 +841,10 @@ def initialize_local_combined_providers_dict(tile):
                     )
                     del extents_dict[new_extent_code]
                     return 0
-                osm_layer.update_dicosm(cached_file_name, None)
+                if not osm_layer.update_dicosm(cached_file_name, None):
+                    UI.vprint(0, "Error, erroneous OSM data for extent code", name)
+                    del extents_dict[new_extent_code]
+                    return 0
                 multipolygon_area = OSM.OSM_to_MultiPolygon(osm_layer, 0, 0)
                 del osm_layer
                 if not multipolygon_area.area:
@@ -1603,12 +1711,12 @@ def download_jpeg_ortho(
         return 0
     if not success:
         UI.lvprint(
-            1,
-            "Part of image",
+            0,
+            "ERROR: Part of image",
             file_name,
-            "could not be obtained ",
-            "(even at lower ZL), it was filled with white there.",
+            "could not be obtained (even at lower ZL).",
         )
+        return 0
     os.makedirs(file_dir, exist_ok=True)
     try:
         if super_resol_factor == 1:
@@ -1962,23 +2070,28 @@ def build_geotiffs(tile, texture_attributes_list):
     todo = len(texture_attributes_list)
     for texture_attributes in texture_attributes_list:
         (til_x_left, til_y_top, zoomlevel, provider_code) = texture_attributes
-        if build_jpeg_ortho(
+        if not build_jpeg_ortho(
             tile, til_x_left, til_y_top, zoomlevel, provider_code
         ):
-            convert_texture(
-                tile,
-                til_x_left,
-                til_y_top,
-                zoomlevel,
-                provider_code,
-                type="tif",
-            )
+            UI.exit_message_and_bottom_line("ERROR: Could not download orthophoto.")
+            return 0
+        if not convert_texture(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            provider_code,
+            type="tif",
+        ):
+            UI.exit_message_and_bottom_line("ERROR: Could not create GeoTIFF.")
+            return 0
         done += 1
         UI.progress_bar(1, int(100 * done / todo))
         if UI.red_flag:
             UI.exit_message_and_bottom_line()
+            return 0
     UI.timings_and_bottom_line(timer)
-    return
+    return 1
 
 
 ################################################################################
@@ -2267,6 +2380,17 @@ def gpu_batch_color_filter_supported(color_code):
     )
 
 
+def can_defer_gpu_batch(provider_code):
+    """Return whether a direct provider can use the ASHelper batch path."""
+    if provider_code not in providers_dict:
+        return False
+    if provider_code in local_combined_providers_dict:
+        return False
+    return gpu_batch_color_filter_supported(
+        providers_dict[provider_code].get("color_filters", "none")
+    )
+
+
 ################################################################################
 
 ################################################################################
@@ -2451,13 +2575,21 @@ def init_worker(config_data):
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
     UI.use_neural_upscale = config_data.get('use_neural_upscale', False)
+    UI.dds_converter = config_data.get('dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
+    UI.dds_format = config_data.get('dds_format', getattr(UI, 'dds_format', 'BC3'))
+    UI.use_gpu_acceleration = config_data.get('use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
+    UI.use_gpu_for_color_filters = config_data.get(
+        'use_gpu_for_color_filters', getattr(UI, 'use_gpu_for_color_filters', False)
+    )
+    UI.defer_gpu_batch = config_data.get('defer_gpu_batch', False)
     is_worker_process = True
 
 def convert_texture(
-    tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds"
+    tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds", prepared_file=None
 ):
     upscaled_file_to_delete = None
     tmp_tif_file_name = None
+    dds_tmp_file_path = None
     if type == "dds":
         out_file_name = FNAMES.dds_file_name_from_attributes(
             til_x_left, til_y_top, zoomlevel, provider_code
@@ -2506,8 +2638,13 @@ def convert_texture(
                 os.remove(upscaled_file_to_delete)
             except:
                 pass
+        if dds_tmp_file_path:
+            try:
+                os.remove(dds_tmp_file_path)
+            except:
+                pass
 
-    if tile.imprint_masks_to_dds and type == "dds":
+    if prepared_file is None and tile.imprint_masks_to_dds and type == "dds":
         mask_path = os.path.join(
             tile.build_dir,
             "textures",
@@ -2539,7 +2676,7 @@ def convert_texture(
                 small_array = numpy.array(mask_im, dtype=numpy.uint8)
                 if small_array.max() > 30:
                     masked_texture = True
-    elif tile.imprint_masks_to_dds:  # type = 'tif'
+    elif prepared_file is None and tile.imprint_masks_to_dds:  # type = 'tif'
         if int(zoomlevel) >= tile.mask_zl:
             factor = 2 ** (zoomlevel - tile.mask_zl)
             m_til_x = (int(til_x_left / factor) // 16) * 16
@@ -2578,7 +2715,6 @@ def convert_texture(
         or not jpeg_ready
     )
     use_upscale = getattr(UI, 'use_neural_upscale', False)
-    use_gpu_batch = getattr(UI, 'use_gpu_acceleration', True) and getattr(UI, 'dds_converter', 'nvcompress') == "TextureConverter" and "dar" in sys.platform
     is_worker = globals().get('is_worker_process', False)
     direct_color_filter_supported = True
     if not is_combined and provider_code in providers_dict:
@@ -2586,18 +2722,37 @@ def convert_texture(
             providers_dict[provider_code].get("color_filters", "none")
         )
     
-    if (
-        use_gpu_batch
+    defer_gpu_batch = (
+        getattr(UI, "defer_gpu_batch", False)
         and is_worker
         and not is_combined
-        and not use_upscale
         and type == "dds"
         and direct_color_filter_supported
-    ):
+        and prepared_file is None
+    )
+    if defer_gpu_batch and not use_upscale:
         return 1
         
-    file_to_convert = jpeg_path if (provider_code in providers_dict and jpeg_ready) else None
-    if (provider_code in local_combined_providers_dict) and (
+    file_to_convert = (
+        prepared_file
+        if prepared_file is not None
+        else (jpeg_path if (provider_code in providers_dict and jpeg_ready) else None)
+    )
+    if prepared_file is not None:
+        if not os.path.isfile(prepared_file):
+            UI.vprint(1, f"   ERROR: prepared texture source unavailable for {out_file_name}")
+            return 0
+        try:
+            with Image.open(prepared_file) as prepared_image:
+                if (
+                    prepared_image.mode in ("RGBA", "LA")
+                    or (prepared_image.mode == "P" and "transparency" in prepared_image.info)
+                ):
+                    dxt5 = True
+        except Exception as error:
+            UI.vprint(1, f"   ERROR: could not inspect prepared texture {prepared_file}: {error}")
+            return 0
+    elif (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not jpeg_ready
     ):
@@ -2607,7 +2762,7 @@ def convert_texture(
         if masked_texture:
             UI.vprint(2, "      Applying alpha mask directly to orthophoto.")
             big_image.putalpha(mask_im.resize((4096, 4096), Image.BICUBIC))
-            if type == "dds":
+            if type == "dds" and not getattr(UI, "defer_gpu_batch", False) and not getattr(UI, "preserve_batch_inputs", False):
                 try:
                     os.remove(
                         os.path.join(
@@ -2630,9 +2785,11 @@ def convert_texture(
         #     'textures', out_file_name.replace('dds', 'jpg')), quality=70)
     # now if provider_code was not in local_combined_providers_dict but
     # color correction is required.
-    elif (
-        providers_dict[provider_code]["color_filters"] != "none"
-    ) or masked_texture or (int(zoomlevel) >= 18):
+    elif prepared_file is None and (
+        (provider_code in providers_dict and providers_dict[provider_code]["color_filters"] != "none")
+        or masked_texture
+        or (int(zoomlevel) >= 18)
+    ):
         jpeg_full_path = os.path.join(file_dir, jpeg_file_name)
         if not _jpeg_file_is_ready(jpeg_full_path):
             UI.vprint(1, f"   ERROR: missing orthophoto {jpeg_file_name}")
@@ -2645,7 +2802,7 @@ def convert_texture(
         if masked_texture:
             UI.vprint(2, "      Applying alpha mask directly to orthophoto.")
             big_image.putalpha(mask_im.resize((4096, 4096), Image.BICUBIC))
-            if type == "dds":
+            if type == "dds" and not getattr(UI, "defer_gpu_batch", False) and not getattr(UI, "preserve_batch_inputs", False):
                 try:
                     os.remove(
                         os.path.join(
@@ -2672,24 +2829,50 @@ def convert_texture(
         # Add pid to avoid conflicts during multiprocessing
         upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
         UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
-        if not subprocess.call([as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT):
+        upscale_result = subprocess.call(
+            [as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        if upscale_result == 0 and os.path.isfile(upscaled_tmp):
             file_to_convert = upscaled_tmp
             upscaled_file_to_delete = upscaled_tmp
+        else:
+            UI.vprint(1, f"      ERROR: Neural upscale failed for {file_to_convert}")
+            cleanup_conversion_temp_files()
+            return 0
+    elif getattr(UI, 'use_neural_upscale', False):
+        UI.vprint(1, "      ERROR: Neural upscale is enabled but ASHelper is unavailable.")
+        cleanup_conversion_temp_files()
+        return 0
+
+    # A deferred worker has completed all image preparation (including
+    # optional upscaling) and leaves those inputs for the main-process batch.
+    if defer_gpu_batch:
+        return 1
 
     # finally if nothing needs to be done prior to the conversion
     # eventually the dds conversion
     if type == "dds":
         out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
+        dds_tmp_file_path = out_file_path + ".tmp.dds"
+        try:
+            os.remove(dds_tmp_file_path)
+        except OSError:
+            pass
+        try:
+            with Image.open(file_to_convert) as source_image:
+                expected_dds_dimensions = source_image.size
+        except Exception as error:
+            UI.vprint(1, f"      Error: could not inspect DDS input {file_to_convert}: {error}")
+            cleanup_conversion_temp_files()
+            return 0
 
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
-            # GPUバッチ一括変換時は、各ワーカーでは準備のみを行いメインプロセスで一括処理するため早期リターン
-            if is_worker and getattr(UI, 'use_gpu_acceleration', True):
-                return 1
-            
             # Native Apple Silicon conversion via ASHelper
             executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
             target_fmt = dds_format if (not dxt5 or dds_format == "BC7") else "BC3"
-            conv_cmd = [executable, "--convert", file_to_convert, out_file_path, target_fmt]
+            conv_cmd = [executable, "--convert", file_to_convert, dds_tmp_file_path, target_fmt]
             if getattr(UI, 'use_gpu_acceleration', True):
                 conv_cmd.append("--gpu")
             UI.vprint(2, f"      ASHelper: Converting texture to DDS ({target_fmt})")
@@ -2702,7 +2885,7 @@ def convert_texture(
                 "-define", f"dds:compression={fmt}",
                 "-define", "dds:cluster-fit=true",
                 "-define", "dds:mipmaps=13",
-                out_file_path
+                dds_tmp_file_path
             ]
             UI.vprint(2, f"      ImageMagick: Converting texture to DDS ({fmt.upper()})")
         else: # Default: nvcompress (uses globally defined dds_convert_cmd)
@@ -2713,19 +2896,39 @@ def convert_texture(
                 fmt = "-bc3"
             else:
                 fmt = "-bc1"
-            conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, out_file_path]
+            conv_cmd = [dds_tool, fmt, "-fast", file_to_convert, dds_tmp_file_path]
             UI.vprint(2, f"      nvcompress: Converting texture to DDS ({fmt[1:].upper()})")
 
         tentative = 0
         while True:
             try:
+                try:
+                    os.remove(dds_tmp_file_path)
+                except OSError:
+                    pass
                 retcode = subprocess.call(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             except Exception as e:
                 UI.vprint(1, f"      Error during DDS conversion execution: {str(e)}")
                 cleanup_conversion_temp_files()
                 return 0
             if retcode == 0:
-                break
+                dds_valid, dds_error = validate_dds_file(
+                    dds_tmp_file_path,
+                    expected_dimensions=expected_dds_dimensions,
+                )
+                if dds_valid:
+                    try:
+                        os.replace(dds_tmp_file_path, out_file_path)
+                    except OSError as error:
+                        UI.vprint(1, f"      Error: could not activate DDS {out_file_path}: {error}")
+                        dds_error = str(error)
+                    else:
+                        break
+                UI.vprint(
+                    1,
+                    f"      Error: DDS converter produced invalid output for {out_file_path}: {dds_error}",
+                )
+                retcode = -1
 
             tentative += 1
             if tentative == 10:
@@ -2818,9 +3021,11 @@ def convert_texture(
             ]
         tentative = 0
         while True:
-            if not subprocess.call(
+            retcode = subprocess.call(
                 conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-            ):
+            )
+            geotiff_output = os.path.join(FNAMES.Geotiff_dir, out_file_name)
+            if retcode == 0 and os.path.isfile(geotiff_output) and os.path.getsize(geotiff_output) > 0:
                 break
             tentative += 1
             if tentative == 10:
@@ -2830,7 +3035,8 @@ def convert_texture(
                     os.path.join(tile.build_dir, "textures", out_file_name),
                     "(10 tries)",
                 )
-                break
+                cleanup_conversion_temp_files()
+                return 0
 
             # CPU Fallback: If GPU-accelerated ASHelper failed, try without --gpu next
             if "--gpu" in conv_cmd:

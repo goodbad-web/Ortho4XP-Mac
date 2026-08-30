@@ -22,6 +22,22 @@ skip_downloads = False
 skip_converts = False
 
 
+def _activate_dsf(dsf_tmp_path, dsf_path):
+    """Atomically activate a completed DSF while preserving rollback safety."""
+    backup_path = dsf_path + ".bak"
+    had_existing = os.path.exists(dsf_path)
+    if not os.path.isfile(dsf_tmp_path):
+        raise FileNotFoundError(dsf_tmp_path)
+    if had_existing:
+        os.replace(dsf_path, backup_path)
+    try:
+        os.replace(dsf_tmp_path, dsf_path)
+    except Exception:
+        if had_existing and not os.path.exists(dsf_path) and os.path.exists(backup_path):
+            os.replace(backup_path, dsf_path)
+        raise
+
+
 def _resolve_gpu_batch_mask(tile, til_x_left, til_y_top, zoomlevel, provider_code, png_file_name):
     """Return an exact or materialized mask path for an ASHelper batch task."""
     possible_mask_path = os.path.join(
@@ -66,10 +82,14 @@ def download_textures(tile, download_queue, convert_queue):
         progress=dico_dl_progress,
     )
 
-    parallel_join(dl_workers)
+    download_success = parallel_join(dl_workers)
 
     if UI.red_flag:
         UI.vprint(1, "Download process interrupted.")
+        return 0
+
+    if not download_success:
+        UI.vprint(0, "ERROR: One or more orthophotos could not be downloaded.")
         return 0
 
     if dico_dl_progress["done"]:
@@ -80,9 +100,25 @@ def download_textures(tile, download_queue, convert_queue):
 def build_tile(tile):
     if not UI.is_building_all:
         UI.initialize_build_log(tile.build_dir)
+    result = 0
     try:
-        return _build_tile(tile)
+        result = _build_tile(tile)
+        return result
     finally:
+        # A DSF can be fully written before a later imagery/download stage
+        # fails.  Never leave that unactivated artifact behind: the next run
+        # must either rebuild it or activate it atomically.
+        if not result:
+            dsf_tmp_path = os.path.join(
+                tile.build_dir,
+                "Earth nav data",
+                FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf.tmp",
+            )
+            try:
+                os.remove(dsf_tmp_path)
+            except OSError:
+                pass
+        UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
 def _build_tile(tile):
@@ -109,7 +145,9 @@ def _build_tile(tile):
 
     timer = time.time()
 
-    tile.write_to_config()
+    if not tile.write_to_config():
+        UI.exit_message_and_bottom_line("ERROR: Could not save tile configuration.")
+        return 0
 
     if not IMG.initialize_local_combined_providers_dict(tile):
         UI.exit_message_and_bottom_line("")
@@ -159,12 +197,30 @@ def _build_tile(tile):
     download_launched = False
     convert_launched = False
     conversion_success = True
+    dsf_state = {"result": 0, "error": None}
+    download_state = {"result": 0, "error": None}
+
+    def run_dsf():
+        try:
+            dsf_state["result"] = DSF.build_dsf(tile, download_queue)
+        except Exception as error:
+            dsf_state["error"] = error
+            UI.vprint(0, "ERROR: DSF worker failed:", error)
+
+    def run_downloads():
+        try:
+            download_state["result"] = download_textures(
+                tile, download_queue, convert_queue
+            )
+        except Exception as error:
+            download_state["error"] = error
+            UI.vprint(0, "ERROR: Download worker failed:", error)
 
     build_dsf_thread = threading.Thread(
-        target=DSF.build_dsf, args=[tile, download_queue]
+        target=run_dsf, name="Ortho4XP-DSF"
     )
     download_thread = threading.Thread(
-        target=download_textures, args=[tile, download_queue, convert_queue]
+        target=run_downloads, name="Ortho4XP-downloads"
     )
     build_dsf_thread.start()
     if not skip_downloads:
@@ -178,9 +234,26 @@ def _build_tile(tile):
         for _ in range(max_download_slots):
             download_queue.put("quit")
         download_thread.join()
-        if convert_launched:
-            dds_converter = getattr(UI, 'dds_converter', 'nvcompress')
-            dds_format = getattr(UI, 'dds_format', 'BC3')
+    if dsf_state["error"] is not None or not dsf_state["result"]:
+        UI.exit_message_and_bottom_line("ERROR: DSF construction failed.")
+        return 0
+    if download_launched and (
+        download_state["error"] is not None or not download_state["result"]
+    ):
+        UI.exit_message_and_bottom_line("ERROR: Texture download failed.")
+        return 0
+    if convert_launched:
+            dds_converter = getattr(tile, 'dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
+            dds_format = getattr(tile, 'dds_format', getattr(UI, 'dds_format', 'BC3'))
+            use_gpu = getattr(tile, 'use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
+            as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+            gpu_batch_enabled = (
+                use_gpu
+                and dds_converter == "TextureConverter"
+                and "dar" in sys.platform
+                and os.path.isfile(as_helper)
+                and os.access(as_helper, os.X_OK)
+            )
             UI.vprint(
                 1,
                 "-> Starting multiprocessing pool with",
@@ -202,6 +275,10 @@ def _build_tile(tile):
                 'verbosity': UI.verbosity,
                 'cleaning_level': UI.cleaning_level,
                 'use_neural_upscale': getattr(tile, 'use_neural_upscale', False),
+                'dds_converter': getattr(tile, 'dds_converter', dds_converter),
+                'dds_format': getattr(tile, 'dds_format', dds_format),
+                'use_gpu_acceleration': getattr(tile, 'use_gpu_acceleration', True),
+                'use_gpu_for_color_filters': getattr(tile, 'use_gpu_for_color_filters', False),
                 'is_worker': True
             }
             # Collect conversion arguments from queue
@@ -211,13 +288,24 @@ def _build_tile(tile):
                 if item != "quit":
                     convert_list.append(item)
 
+            def can_defer_to_gpu_batch(item):
+                _, _, _, _, provider_code = item
+                return IMG.can_defer_gpu_batch(provider_code)
+
+            defer_gpu_batch = bool(
+                gpu_batch_enabled
+                and convert_list
+                and all(can_defer_to_gpu_batch(item) for item in convert_list)
+            )
+            config_data['defer_gpu_batch'] = defer_gpu_batch
+
             dds_error = IMG.dds_format_support_error(dds_converter, dds_format)
             if dds_error:
                 UI.vprint(1, f"ERROR: {dds_error}")
                 success_count = 0
                 conversion_success = False
             else:
-                success_count = multiprocessing_pool(
+                pool_success = multiprocessing_pool(
                     IMG.convert_texture,
                     convert_list,
                     max_convert_slots,
@@ -225,17 +313,18 @@ def _build_tile(tile):
                     init_func=IMG.init_worker,
                     init_args=config_data
                 )
-                conversion_success = (success_count == len(convert_list))
+                success_count = len(convert_list) if pool_success else 0
+                conversion_success = bool(pool_success)
             
             # GPU Batch DDS Conversion integration for macOS
-            use_gpu = getattr(UI, 'use_gpu_acceleration', True)
-            if conversion_success and use_gpu and dds_converter == "TextureConverter" and "dar" in sys.platform:
+            if conversion_success and defer_gpu_batch:
                 import O4_RAMDisk_Utils
                 UI.vprint(1, "-> Executing ultra-fast GPU Batch DDS Conversion via ASHelper...")
-                as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
                 batch_args = []
                 temp_files_to_delete = []
                 batch_generated_mask_files = []
+                prepared_input_paths = [None] * len(convert_list)
+                batch_output_specs = []
                 batch_attempted = False
 
                 def cleanup_generated_batch_masks():
@@ -244,8 +333,15 @@ def _build_tile(tile):
                             os.remove(temp_file)
                         except:
                             pass
+
+                def cleanup_batch_outputs():
+                    for temp_path, _, _, _ in batch_output_specs:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
                 
-                for item in convert_list:
+                for item_index, item in enumerate(convert_list):
                     tile, til_x_left, til_y_top, zoomlevel, provider_code = item
                     out_file_name = FNAMES.dds_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
                     out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
@@ -260,10 +356,10 @@ def _build_tile(tile):
                     else:
                         jpeg_path = None
                     
-                    if os.path.exists(upscaled_tmp):
+                    if getattr(tile, "use_neural_upscale", False) and os.path.exists(upscaled_tmp):
                         input_path = upscaled_tmp
                         temp_files_to_delete.append(upscaled_tmp)
-                    elif os.path.exists(tmp_png):
+                    elif getattr(tile, "use_neural_upscale", False) and os.path.exists(tmp_png):
                         input_path = tmp_png
                         temp_files_to_delete.append(tmp_png)
                     elif jpeg_path and IMG._jpeg_file_is_ready(jpeg_path):
@@ -273,6 +369,8 @@ def _build_tile(tile):
                         conversion_success = False
                         batch_attempted = True
                         break
+
+                    prepared_input_paths[item_index] = input_path
                     
                     mask_path = "none"
                     if input_path == jpeg_path and tile.imprint_masks_to_dds:
@@ -297,6 +395,20 @@ def _build_tile(tile):
                             batch_generated_mask_files.append(generated_mask_path)
                         elif mask_path != "none":
                             temp_files_to_delete.append(mask_path)
+
+                    if tile.imprint_masks_to_dds and provider_code in IMG.providers_dict:
+                        exact_mask_path = os.path.join(
+                            tile.build_dir,
+                            "textures",
+                            FNAMES.mask_file(
+                                til_x_left, til_y_top, zoomlevel, provider_code
+                            ),
+                        )
+                        if (
+                            os.path.isfile(exact_mask_path)
+                            and exact_mask_path not in temp_files_to_delete
+                        ):
+                            temp_files_to_delete.append(exact_mask_path)
                     
                     r, g, b = 1.0, 1.0, 1.0
                     contrast, brightness, saturation = 1.0, 0.0, 1.0
@@ -334,14 +446,22 @@ def _build_tile(tile):
                             pass
                     
                     target_fmt = dds_format if (not has_alpha or dds_format == "BC7") else "BC3"
+                    batch_tmp_path = out_file_path + ".gpu.tmp.dds"
+                    try:
+                        os.remove(batch_tmp_path)
+                    except OSError:
+                        pass
                     batch_args.extend([
                         input_path, 
                         mask_path, 
                         str(r), str(g), str(b), 
                         str(contrast), str(brightness), str(saturation), 
-                        out_file_path, 
+                        batch_tmp_path,
                         target_fmt
                     ])
+                    batch_output_specs.append(
+                        (batch_tmp_path, out_file_path, target_fmt, input_path)
+                    )
                 
                 if conversion_success and batch_args:
                     batch_attempted = True
@@ -350,7 +470,18 @@ def _build_tile(tile):
                         chunk = batch_args[i:i + chunk_size * 10]
                         cmd = [as_helper, "--convert-batch-v3", "true"] + chunk
                         try:
-                            ret = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                            batch_result = subprocess.run(
+                                cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                check=False,
+                            )
+                            ret = batch_result.returncode
+                            if batch_result.stdout:
+                                output_level = 0 if ret != 0 else 2
+                                for line in batch_result.stdout.splitlines():
+                                    UI.vprint(output_level, "      " + line)
                             if ret != 0:
                                 UI.vprint(1, f"ERROR: GPU Batch DDS conversion failed with return code {ret}")
                                 conversion_success = False
@@ -359,18 +490,79 @@ def _build_tile(tile):
                             UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
                             conversion_success = False
                             break
-                
+                    if conversion_success:
+                        invalid_outputs = []
+                        for temp_path, _, target_fmt, input_path in batch_output_specs:
+                            try:
+                                with Image.open(input_path) as source_image:
+                                    expected_dimensions = source_image.size
+                            except Exception as error:
+                                invalid_outputs.append((temp_path, f"input inspection failed: {error}"))
+                                continue
+                            dds_valid, dds_error = IMG.validate_dds_file(
+                                temp_path,
+                                expected_format=target_fmt,
+                                expected_dimensions=expected_dimensions,
+                                require_mipmaps=True,
+                            )
+                            if not dds_valid:
+                                invalid_outputs.append((temp_path, dds_error))
+                        if invalid_outputs:
+                            for path, reason in invalid_outputs:
+                                UI.vprint(
+                                    0,
+                                    f"ERROR: GPU batch produced invalid DDS {path}: {reason}",
+                                )
+                            conversion_success = False
+                        else:
+                            try:
+                                for temp_path, final_path, _, _ in batch_output_specs:
+                                    os.replace(temp_path, final_path)
+                            except OSError as error:
+                                UI.vprint(0, "ERROR: Could not activate GPU batch DDS output:", error)
+                                conversion_success = False
+
                 if batch_attempted and not conversion_success:
+                    cleanup_batch_outputs()
                     UI.vprint(1, "-> Falling back to CPU DDS conversion via ASHelper...")
                     original_gpu = getattr(UI, 'use_gpu_acceleration', True)
+                    original_preserve = getattr(UI, 'preserve_batch_inputs', False)
                     cpu_success_count = 0
                     try:
                         UI.use_gpu_acceleration = False
-                        for item in convert_list:
-                            cpu_success_count += IMG.convert_texture(*item)
+                        UI.preserve_batch_inputs = True
+                        for item_index, item in enumerate(convert_list):
+                            prepared_file = prepared_input_paths[item_index]
+                            # A direct JPEG still needs the normal CPU-side
+                            # color/mask preprocessing.  Only reuse files that
+                            # already contain that preprocessing (PNG/upscaled).
+                            if prepared_file:
+                                item_tile, item_x, item_y, item_z, item_provider = item
+                                if item_provider in IMG.providers_dict:
+                                    direct_jpeg = os.path.join(
+                                        FNAMES.jpeg_file_dir_from_attributes(
+                                            item_tile.lat,
+                                            item_tile.lon,
+                                            item_z,
+                                            IMG.providers_dict[item_provider],
+                                        ),
+                                        FNAMES.jpeg_file_name_from_attributes(
+                                            item_x, item_y, item_z, item_provider
+                                        ),
+                                    )
+                                    if os.path.abspath(prepared_file) == os.path.abspath(direct_jpeg):
+                                        prepared_file = None
+                            if not prepared_file or not os.path.isfile(prepared_file):
+                                prepared_file = None
+                            if prepared_file:
+                                cpu_success_count += IMG.convert_texture(
+                                    *item, prepared_file=prepared_file
+                                )
+                            else:
+                                cpu_success_count += IMG.convert_texture(*item)
                     finally:
                         UI.use_gpu_acceleration = original_gpu
-                        cleanup_generated_batch_masks()
+                        UI.preserve_batch_inputs = original_preserve
                     success_count = cpu_success_count
                     conversion_success = (cpu_success_count == len(convert_list))
 
@@ -391,6 +583,12 @@ def _build_tile(tile):
                 UI.vprint(1, "DDS conversion process interrupted.")
             elif dico_conv_progress["done"] >= 1:
                 UI.vprint(1, " *DDS conversion of textures completed.")
+    if convert_launched and not conversion_success:
+        UI.exit_message_and_bottom_line("ERROR: DDS conversion failed.")
+        return 0
+    if UI.red_flag:
+        UI.exit_message_and_bottom_line()
+        return 0
     UI.vprint(1, " *Activating DSF file.")
     dsf_file_name = os.path.join(
         tile.build_dir,
@@ -398,10 +596,13 @@ def _build_tile(tile):
         FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf",
     )
     try:
-        os.replace(dsf_file_name + ".tmp", dsf_file_name)
-    except:
-        UI.vprint(0, "ERROR : could not rename DSF file, tile is not actived.")
-    if UI.red_flag:
+        _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
+    except Exception as error:
+        UI.vprint(0, "ERROR: could not activate DSF file; existing tile was preserved:", error)
+        try:
+            os.remove(dsf_file_name + ".tmp")
+        except OSError:
+            pass
         UI.exit_message_and_bottom_line()
         return 0
     if UI.cleaning_level > 1:
@@ -447,29 +648,25 @@ def build_all(tile):
         return _build_all(tile)
     finally:
         UI.is_building_all = False
+        UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
 def _build_all(tile):
-    VMAP.build_poly_file(tile)
-    if UI.red_flag:
+    if not VMAP.build_poly_file(tile) or UI.red_flag:
         UI.exit_message_and_bottom_line("")
         return 0
-    MESH.build_mesh(tile)
-    if UI.red_flag:
+    if not MESH.build_mesh(tile) or UI.red_flag:
         UI.exit_message_and_bottom_line("")
         return 0
-    MASK.build_masks(tile)
-    if UI.red_flag:
+    if not MASK.build_masks(tile) or UI.red_flag:
         UI.exit_message_and_bottom_line("")
         return 0
-    build_tile(tile)
-    if UI.red_flag:
+    if not build_tile(tile) or UI.red_flag:
         UI.exit_message_and_bottom_line("")
         return 0
     if getattr(tile, 'build_overlays_in_all_in_one', False):
         UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
-        OVL.build_overlay(tile.lat, tile.lon)
-        if UI.red_flag:
+        if not OVL.build_overlay(tile.lat, tile.lon) or UI.red_flag:
             UI.exit_message_and_bottom_line("")
             return 0
     UI.is_working = 0
@@ -504,32 +701,29 @@ def build_tile_list(
         )
         tile.dem = None
         if do_ptc:
-            tile.read_from_config()
+            if not tile.read_from_config():
+                UI.exit_message_and_bottom_line()
+                return 0
         if do_osm or do_mesh or do_dsf:
             tile.make_dirs()
         if do_osm:
-            VMAP.build_poly_file(tile)
-            if UI.red_flag:
+            if not VMAP.build_poly_file(tile) or UI.red_flag:
                 UI.exit_message_and_bottom_line()
                 return 0
         if do_mesh:
-            MESH.build_mesh(tile)
-            if UI.red_flag:
+            if not MESH.build_mesh(tile) or UI.red_flag:
                 UI.exit_message_and_bottom_line()
                 return 0
         if do_mask:
-            MASK.build_masks(tile)
-            if UI.red_flag:
+            if not MASK.build_masks(tile) or UI.red_flag:
                 UI.exit_message_and_bottom_line()
                 return 0
         if do_dsf:
-            build_tile(tile)
-            if UI.red_flag:
+            if not build_tile(tile) or UI.red_flag:
                 UI.exit_message_and_bottom_line()
                 return 0
         if do_ovl:
-            OVL.build_overlay(lat, lon)
-            if UI.red_flag:
+            if not OVL.build_overlay(lat, lon) or UI.red_flag:
                 UI.exit_message_and_bottom_line()
                 return 0
         try:

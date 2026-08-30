@@ -2,6 +2,7 @@ import os
 import pickle
 import shutil
 import io
+import subprocess
 from math import floor, ceil
 import array
 import numpy
@@ -398,109 +399,179 @@ def create_terrain_file(
 ################################################################################
 def extract_elevation_and_bathymetry_data(lat, lon):
     UI.vprint(1, "     Extracting some rasters from X-Plane's Global Scenery")
-    global_scenery_dsf = os.path.join(
-        OVL.custom_overlay_src,
-        "Earth nav data",
-        FNAMES.long_latlon(lat, lon) + ".dsf",
+    scenery_candidates = FNAMES.global_scenery_dsf_candidates(
+        OVL.custom_overlay_src, lat, lon
     )
-    if not os.path.exists(global_scenery_dsf):
-        UI.exit_message_and_bottom_line(
-            "   ERROR: file ",
-            global_scenery_dsf,
-            "absent. Global Scenery directory needs to be set in the config ",
-            "window first.",
-        )
-        return (b"", b"")
+    if len(scenery_candidates) != 1:
+        if not scenery_candidates:
+            UI.exit_message_and_bottom_line(
+                "   ERROR: Global Scenery DSF was not found below ",
+                OVL.custom_overlay_src or "(empty path)",
+                ". Expected Earth nav data/" + FNAMES.long_latlon(lat, lon) + ".dsf.",
+            )
+        else:
+            UI.exit_message_and_bottom_line(
+                "   ERROR: Multiple Global Scenery DSFs matched:",
+                *scenery_candidates,
+            )
+        return None
+    global_scenery_dsf = scenery_candidates[0]
+
     tmp_file = os.path.join(
         FNAMES.Tmp_dir, FNAMES.short_latlon(lat, lon) + ".dsf"
     )
+    archive_path = tmp_file + ".7z"
+    try:
+        os.makedirs(FNAMES.Tmp_dir, exist_ok=True)
+    except OSError:
+        pass
     UI.vprint(2, "     Making a copy of the Global Scenery DSF in tmp dir")
     try:
         shutil.copy(global_scenery_dsf, tmp_file)
-    except:
+    except Exception as error:
         UI.exit_message_and_bottom_line(
-            "     ERROR: could not copy it. Disk full, write permissions,",
-            " erased tmp dir ?",
+            "     ERROR: could not copy Global Scenery DSF:",
+            error,
         )
-        return (b"", b"")
+        return None
 
-    f = open(tmp_file, "rb")
-    dsfid = f.read(2).decode("ascii")
-    f.close()
-    if dsfid == "7z":
-        UI.vprint(2, "     The original DSF is a 7z archive, uncompressing...")
-        os.replace(tmp_file, tmp_file + ".7z")
-        os.system(
-            OVL.unzip_cmd + " e -o" + FNAMES.Tmp_dir + ' "' + tmp_file + '.7z"'
-        )
-        os.remove(tmp_file + '.7z')
-    file_len = os.path.getsize(tmp_file)
-    f = open(tmp_file, "rb")
-    # read filetype cookie
-    dsfid = f.read(8).decode("ascii")
-    if dsfid != "XPLNEDSF":
-        UI.exit_message_and_bottom_line("     ERROR: Corrupted DSF file.")
-        os.remove(tmp_file)
-        return (b"", b"")
-    # skip format number
-    f.read(4)
-    # read atoms
-    atoms_len = file_len - 12 - 16  # 12 for HDR and 16 for MD5
-    atoms_consumed = 0
-    while atoms_consumed < atoms_len:
-        atom_hdr = f.read(4).decode("ascii")
-        atom_len = struct.unpack("<I", f.read(4))[0]
-        if atom_hdr == "SMED":
-            bDEMS_orig = f.read(atom_len - 8)
+    try:
+        with open(tmp_file, "rb") as source:
+            magic = source.read(2)
+        if magic == b"7z":
+            UI.vprint(2, "     The original DSF is a 7z archive, uncompressing...")
+            os.replace(tmp_file, archive_path)
+            unzip_result = subprocess.run(
+                [OVL.unzip_cmd.strip(), "e", "-y", "-o" + FNAMES.Tmp_dir, archive_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if unzip_result.stdout:
+                for line in unzip_result.stdout.splitlines():
+                    UI.vprint(2, "     " + line)
+            if unzip_result.returncode != 0 or not os.path.isfile(tmp_file):
+                UI.exit_message_and_bottom_line(
+                    "     ERROR: could not uncompress Global Scenery DSF."
+                )
+                return None
+
+        file_len = os.path.getsize(tmp_file)
+        if file_len < 28:
+            raise ValueError("DSF file is shorter than its header and checksum")
+
+        with open(tmp_file, "rb") as source:
+            body = source.read(file_len - 16)
+            checksum = source.read(16)
+            if len(checksum) != 16 or hashlib.md5(body).digest() != checksum:
+                raise ValueError("DSF checksum is invalid")
+            source.seek(0)
+            if source.read(8) != b"XPLNEDSF":
+                raise ValueError("DSF file type cookie is invalid")
+            source.read(4)  # format number
+            atoms_len = file_len - 12 - 16  # header and MD5 checksum
+            atoms_consumed = 0
+            bDEMN = None
             bDEMS = b""
-            bELEV = b""
-            g = io.BytesIO(bDEMS_orig)
-            consumed = 8
-            i = 0
-            while consumed < atom_len:
-                bH = g.read(4)
-                sub_atom_hdr = bH.decode("ascii")
-                bL = g.read(4)
-                sub_atom_len = struct.unpack("<I", bL)[0]
-                bDATA = g.read(sub_atom_len - 8)
-                if (sub_atom_len > 100):
-                    i += 1
-                    if (i == 1):
-                        bELEV = bDATA
-                    elif (i == 2):
-                        # XP bathy data for inland water is only partial,
-                        # we use a safe margin = DEM_elev - 2 to cope with it
-                        bathy = numpy.frombuffer(bDATA, dtype=numpy.int16)
-                        safe  = numpy.frombuffer(bELEV, dtype=numpy.int16) - 2 
-                        bathy = numpy.minimum(bathy, safe)
-                        bDATA = bytes(bathy)
-                bDEMS += bH + bL + bDATA
-                consumed += sub_atom_len
-            g.close()
-        elif atom_hdr == "NFED":
-            consumed = 8
-            while consumed < atom_len:
-                sub_atom_hdr = f.read(4).decode("ascii")
-                sub_atom_len = struct.unpack("<I", f.read(4))[0]
-                data = f.read(sub_atom_len - 8)
-                if sub_atom_hdr == "NMED":
-                    bDEMN = data
-                consumed += sub_atom_len
-        else:
-            f.read(atom_len - 8)
 
-        atoms_consumed += atom_len
+            while atoms_consumed < atoms_len:
+                if atoms_len - atoms_consumed < 8:
+                    raise ValueError("truncated DSF atom header")
+                atom_hdr = source.read(4).decode("ascii")
+                atom_len = struct.unpack("<I", source.read(4))[0]
+                if atom_len < 8 or atom_len > atoms_len - atoms_consumed:
+                    raise ValueError("invalid DSF atom length")
+                atom_data = source.read(atom_len - 8)
+                if len(atom_data) != atom_len - 8:
+                    raise ValueError("truncated DSF atom")
 
-    f.close()
-    os.remove(tmp_file)
+                if atom_hdr == "SMED":
+                    dem_parts = []
+                    elevation_data = None
+                    large_subatom_index = 0
+                    consumed = 0
+                    while consumed < len(atom_data):
+                        if len(atom_data) - consumed < 8:
+                            raise ValueError("truncated SMED sub-atom header")
+                        sub_hdr = atom_data[consumed : consumed + 4]
+                        sub_len = struct.unpack(
+                            "<I", atom_data[consumed + 4 : consumed + 8]
+                        )[0]
+                        if sub_len < 8 or sub_len > len(atom_data) - consumed:
+                            raise ValueError("invalid SMED sub-atom length")
+                        sub_data = atom_data[consumed + 8 : consumed + sub_len]
+                        if sub_len > 100:
+                            large_subatom_index += 1
+                            if large_subatom_index == 1:
+                                elevation_data = sub_data
+                            elif large_subatom_index == 2 and elevation_data is not None:
+                                bathy = numpy.frombuffer(sub_data, dtype=numpy.int16)
+                                safe = numpy.frombuffer(elevation_data, dtype=numpy.int16) - 2
+                                if bathy.size != safe.size:
+                                    raise ValueError("DEM and bathymetry raster sizes differ")
+                                sub_data = bytes(numpy.minimum(bathy, safe))
+                        dem_parts.append(sub_hdr + struct.pack("<I", sub_len) + sub_data)
+                        consumed += sub_len
+                    bDEMS = b"".join(dem_parts)
+                elif atom_hdr == "NFED":
+                    consumed = 0
+                    while consumed < len(atom_data):
+                        if len(atom_data) - consumed < 8:
+                            raise ValueError("truncated NFED sub-atom header")
+                        sub_hdr = atom_data[consumed : consumed + 4]
+                        sub_len = struct.unpack(
+                            "<I", atom_data[consumed + 4 : consumed + 8]
+                        )[0]
+                        if sub_len < 8 or sub_len > len(atom_data) - consumed:
+                            raise ValueError("invalid NFED sub-atom length")
+                        if sub_hdr == b"NMED":
+                            bDEMN = atom_data[consumed + 8 : consumed + sub_len]
+                        consumed += sub_len
+                atoms_consumed += atom_len
 
-    return (bDEMN, bDEMS)
+        if bDEMN is None:
+            raise ValueError("Global Scenery DSF has no NMED raster")
+        return (bDEMN, bDEMS)
+    except (OSError, UnicodeDecodeError, struct.error, ValueError) as error:
+        UI.exit_message_and_bottom_line(
+            "     ERROR: Could not extract Global Scenery elevation data:",
+            error,
+        )
+        return None
+    finally:
+        for path in (tmp_file, archive_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 ################################################################################
 
 ################################################################################
 def build_dsf(tile, download_queue):
+
+    dsf_tmp = os.path.join(
+        tile.build_dir,
+        "Earth nav data",
+        FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf.tmp",
+    )
+    result = 0
+    try:
+        result = _build_dsf(tile, download_queue)
+        return result
+    finally:
+        if result != 1:
+            try:
+                os.remove(dsf_tmp)
+            except OSError:
+                pass
+
+
+def _build_dsf(tile, download_queue):
 
     
     dico_customzl = zone_list_to_ortho_dico(tile)
@@ -1147,9 +1218,6 @@ def build_dsf(tile, download_queue):
         FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf",
     )
     
-    if os.path.exists(dsf_file_name):
-        os.replace(dsf_file_name, dsf_file_name + ".bak")
-
     # Note: present code should always choose the first branch.
     if bPROP == b"":
         bPROP = bytes(
@@ -1172,8 +1240,12 @@ def build_dsf(tile, download_queue):
     else:
         bPROP += b"sim/creation_agent\0Patched by Ortho4XP\0"
 
-    # Transfer DEM and bathymetry raster from Global Scenery tiles
-    (bDEMN, bDEMS) = extract_elevation_and_bathymetry_data(tile.lat, tile.lon)
+    # Transfer DEM and bathymetry raster from Global Scenery tiles before any
+    # temporary DSF can replace the currently active tile.
+    extracted_rasters = extract_elevation_and_bathymetry_data(tile.lat, tile.lon)
+    if extracted_rasters is None:
+        return 0
+    (bDEMN, bDEMS) = extracted_rasters
 
     # Computation of intermediate and of total length
     size_of_head_atom = 16 + len(bPROP)
@@ -1256,6 +1328,7 @@ def build_dsf(tile, download_queue):
     UI.progress_bar(1, 95)
     if UI.red_flag:
         UI.vprint(1, "DSF construction interrupted.")
+        f.close()
         return 0
 
     # Since we possibly skipped some pools, and since we possibly
@@ -1368,6 +1441,7 @@ def build_dsf(tile, download_queue):
     UI.progress_bar(1, 98)
     if UI.red_flag:
         UI.vprint(1, "DSF construction interrupted.")
+        f.close()
         return 0
 
     f.close()

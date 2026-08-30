@@ -199,6 +199,79 @@ def dsf_file(build_dir, lat, lon):
     )
 
 
+def _global_scenery_search_roots(global_scenery_root):
+    root = os.path.abspath(os.path.expanduser(str(global_scenery_root)))
+    roots = [root]
+    # Also accept an X-Plane installation root such as
+    # ``/Users/.../X-Plane``.  ``Global Scenery`` is a known container name;
+    # do not recurse through arbitrary descendants.
+    container = os.path.join(root, "Global Scenery")
+    if os.path.isdir(container) and os.path.normcase(container) != os.path.normcase(root):
+        roots.append(container)
+    return roots
+
+
+def global_scenery_dsf_candidates(global_scenery_root, lat, lon):
+    """Return matching Global Scenery DSFs at the configured hierarchy.
+
+    X-Plane installations commonly configure either the scenery package
+    itself (``.../X-Plane 12 Global Scenery``) or its parent
+    ``.../Global Scenery`` directory.  Only the configured directory and its
+    immediate children are considered so that an ambiguous installation is
+    never selected silently.
+    """
+    if not global_scenery_root:
+        return []
+
+    relative_path = os.path.join(
+        "Earth nav data", long_latlon(lat, lon) + ".dsf"
+    )
+    candidates = []
+    for root in _global_scenery_search_roots(global_scenery_root):
+        direct_path = os.path.join(root, relative_path)
+        if os.path.isfile(direct_path):
+            candidates.append(direct_path)
+
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            entries = []
+        for entry in entries:
+            child_root = os.path.join(root, entry)
+            if not os.path.isdir(child_root):
+                continue
+            child_path = os.path.join(child_root, relative_path)
+            if os.path.isfile(child_path):
+                candidates.append(child_path)
+    return candidates
+
+
+def global_scenery_roots(global_scenery_root):
+    """Return configured scenery roots containing an Earth nav data folder."""
+    if not global_scenery_root:
+        return []
+    roots = []
+    for root in _global_scenery_search_roots(global_scenery_root):
+        if os.path.isdir(os.path.join(root, "Earth nav data")):
+            roots.append(root)
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            entries = []
+        for entry in entries:
+            child_root = os.path.join(root, entry)
+            if os.path.isdir(os.path.join(child_root, "Earth nav data")):
+                roots.append(child_root)
+    roots = list(dict.fromkeys(roots))
+    return roots
+
+
+def resolve_global_scenery_dsf(global_scenery_root, lat, lon):
+    """Return the unique matching Global Scenery DSF, otherwise ``None``."""
+    candidates = global_scenery_dsf_candidates(global_scenery_root, lat, lon)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def obj_file(til_x_left, til_y_top, zoomlevel, provider_code):
     return os.path.join(
         Geotiff_dir,

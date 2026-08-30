@@ -168,9 +168,11 @@ def build_curv_tol_weight_map(tile, weight_array):
         custom_coastline_dir = FNAMES.custom_coastline_dir(tile.lat, tile.lon)
         if os.path.isfile(custom_coastline):
             UI.vprint(1, "    * User defined custom coastline data detected.")
-            sea_layer.update_dicosm(
+            if not sea_layer.update_dicosm(
                 custom_coastline, input_tags=None, target_tags=None
-            )
+            ):
+                UI.exit_message_and_bottom_line("ERROR: Could not read custom coastline data.")
+                return 0
         elif os.path.isdir(custom_coastline_dir):
             UI.vprint(
                 1,
@@ -179,12 +181,20 @@ def build_curv_tol_weight_map(tile, weight_array):
             )
             for osm_file in os.listdir(custom_coastline_dir):
                 UI.vprint(2, "      ", osm_file)
-                sea_layer.update_dicosm(
+                if not sea_layer.update_dicosm(
                     os.path.join(custom_coastline_dir, osm_file),
                     input_tags=None,
                     target_tags=None,
+                ):
+                    UI.exit_message_and_bottom_line(
+                        "ERROR: Could not read custom coastline data:", osm_file
+                    )
+                    return 0
+            if not sea_layer.write_to_file(custom_coastline):
+                UI.exit_message_and_bottom_line(
+                    "ERROR: Could not update custom coastline cache."
                 )
-                sea_layer.write_to_file(custom_coastline)
+                return 0
         else:
             queries = ['way["natural"="coastline"]']
             tags_of_interest = []
@@ -223,7 +233,7 @@ def build_curv_tol_weight_map(tile, weight_array):
     # editing from PIL import Image
     # Image.fromarray((weight_array!=1).astype(numpy.uint8)*255).save(
     # 'weight.png')
-    return
+    return 1
 
 
 ################################################################################
@@ -349,37 +359,41 @@ def write_mesh_file(tile, vertices, tri_rows=None):
         f_ele.close()
     else:
         nbr_tri = len(tri_rows)
-    f = open(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon), "w")
-    f.write("MeshVersionFormatted 2\n")
-    f.write("Dimension 3\n\n")
-    f.write("Vertices\n")
-    f.write(str(nbr_vert) + "\n")
-    for i in range(0, nbr_vert):
-        f.write(
-            "{:.15f}".format(vertices[6 * i] + tile.lon)
-            + " "
-            + "{:.15f}".format(vertices[6 * i + 1] + tile.lat)
-            + " "
-            + "{:.15f}".format(vertices[6 * i + 2] / 100000)
-            + " 0\n"
-        )
-    f.write("\n")
-    f.write("Normals\n")
-    f.write(str(nbr_vert) + "\n")
-    for i in range(0, nbr_vert):
-        f.write(
-            "{:.2f}".format(vertices[6 * i + 3])
-            + " "
-            + "{:.2f}".format(vertices[6 * i + 4])
-            + " 0\n"
-        )
-    f.write("\n")
-    f.write("Triangles\n")
-    f.write(str(nbr_tri) + "\n")
-    for row in tri_rows:
-        f.write(row + "\n")
-    f.close()
-    return
+    mesh_path = FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon)
+    try:
+        with open(mesh_path, "w") as f:
+            f.write("MeshVersionFormatted 2\n")
+            f.write("Dimension 3\n\n")
+            f.write("Vertices\n")
+            f.write(str(nbr_vert) + "\n")
+            for i in range(0, nbr_vert):
+                f.write(
+                    "{:.15f}".format(vertices[6 * i] + tile.lon)
+                    + " "
+                    + "{:.15f}".format(vertices[6 * i + 1] + tile.lat)
+                    + " "
+                    + "{:.15f}".format(vertices[6 * i + 2] / 100000)
+                    + " 0\n"
+                )
+            f.write("\n")
+            f.write("Normals\n")
+            f.write(str(nbr_vert) + "\n")
+            for i in range(0, nbr_vert):
+                f.write(
+                    "{:.2f}".format(vertices[6 * i + 3])
+                    + " "
+                    + "{:.2f}".format(vertices[6 * i + 4])
+                    + " 0\n"
+                )
+            f.write("\n")
+            f.write("Triangles\n")
+            f.write(str(nbr_tri) + "\n")
+            for row in tri_rows:
+                f.write(row + "\n")
+    except OSError as error:
+        UI.vprint(0, "ERROR: Could not write mesh file:", mesh_path, error)
+        return 0
+    return int(os.path.isfile(mesh_path) and os.path.getsize(mesh_path) > 0)
 
 
 ################################################################################
@@ -549,7 +563,10 @@ def extract_mesh_to_obj(
     )
     f.close()
     UI.timings_and_bottom_line(timer)
-    return
+    if not os.path.isfile(obj_file_name) or not os.path.isfile(mtl_file_name):
+        UI.vprint(0, "ERROR: OBJ mesh extraction did not produce its output files.")
+        return 0
+    return 1
 
 
 ################################################################################
@@ -561,6 +578,9 @@ def build_mesh(tile):
     try:
         return _build_mesh(tile)
     finally:
+        # Keep subsequent GUI operations usable after an unexpected worker
+        # exception.
+        UI.is_working = 0
         if hasattr(tile, "original_curvature_tol"):
             tile.curvature_tol = tile.original_curvature_tol
         UI.flush_build_log(tile.build_dir)
@@ -684,7 +704,8 @@ def _build_mesh(tile):
     )
 
     weight_array = numpy.ones((1001, 1001), dtype=numpy.float32)
-    build_curv_tol_weight_map(tile, weight_array)
+    if not build_curv_tol_weight_map(tile, weight_array):
+        return 0
     weight_array.tofile(weight_file)
     del weight_array
 
@@ -793,7 +814,9 @@ def _build_mesh(tile):
         UI.is_working = 0  # Re-enable execution for the retry
         return _build_mesh(tile)
 
-    write_mesh_file(tile, vertices, tri_rows)
+    if not write_mesh_file(tile, vertices, tri_rows):
+        UI.exit_message_and_bottom_line("\nERROR: Could not write final mesh file.")
+        return 0
     #
     if UI.cleaning_level:
         try:

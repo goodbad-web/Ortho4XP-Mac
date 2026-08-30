@@ -17,6 +17,9 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
+os.chdir(ROOT)
 
 
 def fail(message: str) -> None:
@@ -53,7 +56,7 @@ def parse_probe(probe: Path) -> tuple[bool, str, bool]:
     return available, result.stdout, host_metal_supported
 
 
-def make_fixtures(directory: Path) -> tuple[Path, Path, Path]:
+def make_fixtures(directory: Path) -> tuple[Path, Path, Path, Path, Path]:
     try:
         from PIL import Image, ImageDraw
     except ImportError as error:
@@ -78,6 +81,12 @@ def make_fixtures(directory: Path) -> tuple[Path, Path, Path]:
     source = directory / "source.jpg"
     image.save(source, format="JPEG", quality=97, subsampling=0)
 
+    resampling = getattr(Image, "Resampling", Image).BICUBIC
+    source_4096 = directory / "source_4096.png"
+    image.resize((4096, 4096), resampling).save(source_4096, format="PNG")
+    upscale_seed_2048 = directory / "upscale_seed_2048.png"
+    image.resize((2048, 2048), resampling).save(upscale_seed_2048, format="PNG")
+
     # Deliberately lower resolution than the source. ASHelper must scale it
     # before applying it to the high-resolution image.
     mask = Image.new("L", (128, 128), color=0)
@@ -98,7 +107,7 @@ def make_fixtures(directory: Path) -> tuple[Path, Path, Path]:
     alpha_mask_draw.line((0, 0, 127, 127), fill=(255, 255, 255, 64), width=3)
     alpha_mask_path = directory / "low_resolution_alpha_mask.png"
     alpha_mask.save(alpha_mask_path, format="PNG")
-    return source, mask_path, alpha_mask_path
+    return source, mask_path, alpha_mask_path, source_4096, upscale_seed_2048
 
 
 def dds_info(path: Path) -> dict[str, Any]:
@@ -293,18 +302,47 @@ def check_outputs(
 
 
 def task_args(
-    source: Path, mask: Path, output: Path, index: int, high_res_source: Path
+    source: Path,
+    mask: Path,
+    alpha_mask: Path,
+    source_4096: Path,
+    output: Path,
+    index: int,
+    high_res_source: Path,
+    high_res_upscaled_source: Path,
 ) -> list[str]:
-    selected_source = high_res_source if index == 0 else source
-    if index % 3 == 0:
+    # Keep the 64-task contract while exercising only a few large inputs; the
+    # remaining tasks keep the fixture run practical on a constrained host.
+    if index == 0:
+        selected_source = high_res_source
         selected_mask = str(mask)
         contrast, brightness, saturation = "1.0", "0.0", "1.0"
-    elif index % 3 == 1:
+        target_format = "BC3"
+    elif index == 1:
+        selected_source = high_res_source
         selected_mask = "none"
         contrast, brightness, saturation = "1.15", "0.08", "0.82"
-    else:
+        target_format = "BC3"
+    elif index == 2:
+        selected_source = high_res_upscaled_source
         selected_mask = str(mask)
         contrast, brightness, saturation = "0.92", "-0.06", "1.18"
+        target_format = "BC3"
+    elif index == 3:
+        selected_source = source_4096
+        selected_mask = str(alpha_mask)
+        contrast, brightness, saturation = "1.0", "0.0", "1.0"
+        target_format = "BC3"
+    elif index % 2 == 0:
+        selected_source = source
+        selected_mask = "none"
+        contrast, brightness, saturation = "1.0", "0.0", "1.0"
+        target_format = "BC1"
+    else:
+        selected_source = source
+        selected_mask = str(mask)
+        contrast, brightness, saturation = "0.92", "-0.06", "1.18"
+        target_format = "BC3"
     return [
         str(selected_source),
         selected_mask,
@@ -315,7 +353,7 @@ def task_args(
         brightness,
         saturation,
         str(output),
-        "BC3",
+        target_format,
     ]
 
 
@@ -351,25 +389,63 @@ def main() -> int:
     }
 
     try:
-        source, mask, alpha_mask = make_fixtures(artifact_dir)
-        upscale_path = artifact_dir / "source_upscaled.png"
-        upscale_result = run_command(
-            "upscale fixture",
-            [str(args.helper), "--upscale", str(source), str(upscale_path)],
+        source, mask, alpha_mask, source_4096, upscale_seed_2048 = make_fixtures(
+            artifact_dir
         )
-        upscale_status = "PASS"
-        if upscale_result.returncode != 0 or not upscale_path.is_file():
-            upscale_status = "SKIP(no Metal/Core Image context)" if not metal_available else "FAIL"
-            overall_ok = overall_ok and not metal_available
-        else:
-            from PIL import Image
+        from PIL import Image
 
-            with Image.open(upscale_path) as upscaled:
-                if upscaled.size != (1024, 1024):
-                    upscale_status = f"FAIL(size={upscaled.size})"
+        upscale_cases = [
+            ("1024px upscale fixture", source, artifact_dir / "source_upscaled.png", (1024, 1024)),
+            (
+                "4096px upscale fixture",
+                upscale_seed_2048,
+                artifact_dir / "source_upscaled_4096.png",
+                (4096, 4096),
+            ),
+        ]
+        upscale_report: dict[str, Any] = {}
+        for label, upscale_input, upscale_output, expected_size in upscale_cases:
+            upscale_result = run_command(
+                label,
+                [
+                    str(args.helper),
+                    "--upscale",
+                    str(upscale_input),
+                    str(upscale_output),
+                ],
+            )
+            if upscale_result.returncode != 0 or not upscale_output.is_file():
+                upscale_status = (
+                    "SKIP(no Metal/Core Image context)"
+                    if not metal_available
+                    else "FAIL"
+                )
+                if metal_available:
                     overall_ok = False
-        report["upscale"] = {"status": upscale_status, "path": str(upscale_path)}
-        high_res_source = upscale_path if upscale_path.is_file() else source
+            else:
+                with Image.open(upscale_output) as upscaled:
+                    if upscaled.size != expected_size:
+                        upscale_status = f"FAIL(size={upscaled.size})"
+                        overall_ok = False
+                    else:
+                        upscale_status = "PASS"
+            upscale_report[label] = {
+                "status": upscale_status,
+                "input": str(upscale_input),
+                "path": str(upscale_output),
+                "expected_size": expected_size,
+            }
+        report["upscale"] = upscale_report
+        high_res_source = (
+            artifact_dir / "source_upscaled.png"
+            if (artifact_dir / "source_upscaled.png").is_file()
+            else source
+        )
+        high_res_upscaled_source = (
+            artifact_dir / "source_upscaled_4096.png"
+            if (artifact_dir / "source_upscaled_4096.png").is_file()
+            else source_4096
+        )
 
         direct_cpu = artifact_dir / "direct_cpu.dds"
         direct_gpu = artifact_dir / "direct_gpu_requested.dds"
@@ -386,7 +462,7 @@ def main() -> int:
                 [
                     str(args.helper),
                     "--convert",
-                    str(source),
+                    str(high_res_source),
                     str(direct_gpu),
                     "BC3",
                     "--gpu",
@@ -438,7 +514,18 @@ def main() -> int:
         ]
         gpu_tasks: list[str] = []
         for index in range(args.batch_count):
-            gpu_tasks.extend(task_args(source, mask, batch_gpu_outputs[index], index, high_res_source))
+            gpu_tasks.extend(
+                task_args(
+                    source,
+                    mask,
+                    alpha_mask,
+                    source_4096,
+                    batch_gpu_outputs[index],
+                    index,
+                    high_res_source,
+                    high_res_upscaled_source,
+                )
+            )
 
         batch_cases = [
             (
@@ -461,6 +548,111 @@ def main() -> int:
             print(f"status={status}")
             report["cases"].append({"label": label, "status": status, "outputs": infos})
             overall_ok = overall_ok and status.startswith(("PASS", "SKIP"))
+
+        invalid_output = artifact_dir / "batch_invalid_input.dds"
+        valid_output = artifact_dir / "batch_valid_with_invalid_sibling.dds"
+        invalid_task = [
+            str(artifact_dir / "missing-input.png"),
+            "none",
+            "1.0",
+            "1.0",
+            "1.0",
+            "1.0",
+            "0.0",
+            "1.0",
+            str(invalid_output),
+            "BC3",
+        ]
+        valid_task = task_args(
+            source,
+            mask,
+            alpha_mask,
+            source_4096,
+            valid_output,
+            1,
+            high_res_source,
+            high_res_upscaled_source,
+        )
+        invalid_batch_result = run_command(
+            "batch-v3 one invalid task",
+            [str(args.helper), "--convert-batch-v3", "true", *invalid_task, *valid_task],
+        )
+        diagnostic_text = invalid_batch_result.stdout or ""
+        invalid_batch_status = "PASS"
+        if (
+            invalid_batch_result.returncode == 0
+            or invalid_output.exists()
+            or "task=0" not in diagnostic_text
+            or "input=" not in diagnostic_text
+            or "output=" not in diagnostic_text
+        ):
+            invalid_batch_status = "FAIL(batch failure/diagnostic contract)"
+            overall_ok = False
+        elif metal_available:
+            if not valid_output.is_file():
+                invalid_batch_status = "FAIL(valid sibling output is missing)"
+                overall_ok = False
+            else:
+                try:
+                    dds_info(valid_output)
+                except ValueError as error:
+                    invalid_batch_status = f"FAIL(valid sibling output: {error})"
+                    overall_ok = False
+        elif valid_output.exists():
+            try:
+                dds_info(valid_output)
+            except ValueError as error:
+                invalid_batch_status = f"FAIL(unexpected sibling output: {error})"
+                overall_ok = False
+        print(f"status={invalid_batch_status}")
+        report["cases"].append(
+            {
+                "label": "batch-v3 one invalid task",
+                "status": invalid_batch_status,
+                "valid_sibling_output": str(valid_output),
+            }
+        )
+
+        levels_status = "PASS"
+        levels_detail: dict[str, Any] = {}
+        try:
+            import O4_Imagery_Utils as imagery
+
+            imagery.initialize_color_filters_dict()
+            imagery.initialize_providers_dict()
+            levels_codes = [
+                code
+                for code, filters in imagery.color_filters_dict.items()
+                if any(item and item[0] == "levels" for item in filters)
+            ]
+            if not levels_codes:
+                raise ValueError("no levels color filter was loaded")
+            not_deferred = [
+                code
+                for code in levels_codes
+                if not imagery.gpu_batch_color_filter_supported(code)
+            ]
+            if not not_deferred:
+                raise ValueError("levels filter is still batch-compatible")
+            levels_detail = {
+                "levels_codes": levels_codes,
+                "not_deferred_codes": not_deferred,
+                "GeoPunt2012_provider": imagery.providers_dict.get("GeoPunt2012", {}).get(
+                    "color_filters"
+                ),
+                "GeoPunt2012_can_defer": imagery.can_defer_gpu_batch("GeoPunt2012"),
+            }
+            if "GeoPunt2012" in imagery.providers_dict and imagery.can_defer_gpu_batch(
+                "GeoPunt2012"
+            ):
+                raise ValueError("GeoPunt2012 was incorrectly deferred")
+        except Exception as error:
+            levels_status = f"FAIL({error})"
+            overall_ok = False
+        print(f"levels CPU route={levels_status} detail={json.dumps(levels_detail, sort_keys=True)}")
+        report["cases"].append(
+            {"label": "levels CPU route", "status": levels_status, "detail": levels_detail}
+        )
 
         # A filtered task and the unfiltered direct GPU task use the same
         # source and dimensions. Their decoded base-level means should differ
@@ -566,27 +758,26 @@ def main() -> int:
                 "profile": profile,
             }
 
-        if upscale_path.is_file():
-            for label, output in (("batch-v3 GPU", batch_gpu_outputs[0]),):
-                if not output.is_file():
-                    continue
-                try:
-                    high_res_info = dds_info(output)
-                    expected_dimensions = (1024, 1024)
-                    actual_dimensions = (
-                        high_res_info["width"],
-                        high_res_info["height"],
+        for label, output in (("batch-v3 GPU", batch_gpu_outputs[0]),):
+            if not output.is_file():
+                continue
+            try:
+                high_res_info = dds_info(output)
+                expected_dimensions = (1024, 1024)
+                actual_dimensions = (
+                    high_res_info["width"],
+                    high_res_info["height"],
+                )
+                if actual_dimensions != expected_dimensions:
+                    raise ValueError(
+                        f"expected high-resolution DDS {expected_dimensions}, "
+                        f"got {actual_dimensions}"
                     )
-                    if actual_dimensions != expected_dimensions:
-                        raise ValueError(
-                            f"expected high-resolution DDS {expected_dimensions}, "
-                            f"got {actual_dimensions}"
-                        )
-                    report.setdefault("high_resolution_mask_case", {})[label] = "PASS"
-                except (ValueError, IndexError) as error:
-                    report.setdefault("high_resolution_mask_case", {})[label] = str(error)
-                    if metal_available:
-                        overall_ok = False
+                report.setdefault("high_resolution_mask_case", {})[label] = "PASS"
+            except (ValueError, IndexError) as error:
+                report.setdefault("high_resolution_mask_case", {})[label] = str(error)
+                if metal_available:
+                    overall_ok = False
 
         report_path = artifact_dir / "report.json"
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

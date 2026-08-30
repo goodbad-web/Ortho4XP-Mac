@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import locale
 from math import floor, cos, pi
 import queue
 import threading
@@ -33,10 +34,22 @@ import O4_Mask_Utils as MASK
 import O4_Tile_Utils as TILE
 import O4_UI_Utils as UI
 import O4_Config_Utils as CFG
+import O4_Overlay_Utils as OVL
 
 # Set OsX=True if you prefer the OsX way of drawing existing tiles but 
 # are on Linux or Windows.
 OsX = "dar" in sys.platform
+
+
+def _ui_text(english, japanese):
+    """Use Japanese for Japanese locales while keeping English as default."""
+    language = (
+        os.environ.get("ORTHO4XP_LANG")
+        or os.environ.get("LC_ALL")
+        or os.environ.get("LANG")
+        or (locale.getlocale()[0] or "")
+    )
+    return japanese if language.lower().startswith("ja") else english
 
 ################################################################################
 class Ortho4XP_GUI(tk.Tk):
@@ -103,6 +116,7 @@ class Ortho4XP_GUI(tk.Tk):
         # Let UI know ourself
         UI.gui = self
         self.status_queue = queue.Queue()
+        self.stage_result_queue = queue.Queue()
         # Initialize providers combobox entries
         self.map_list = sorted(
             [
@@ -195,7 +209,7 @@ class Ortho4XP_GUI(tk.Tk):
         ).grid(row=0, column=0, columnspan=8, sticky=W + E)
 
         self.lat = tk.StringVar()
-        self.lat.trace("w", self.tile_change)
+        self.lat.trace_add("write", self.tile_change)
         tk.Label(self.frame_tile, text="Latitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR).grid(
             row=1, column=0, padx=5, pady=5, sticky=E + W
         )
@@ -210,7 +224,7 @@ class Ortho4XP_GUI(tk.Tk):
         self.lat_entry.grid(row=1, column=1, padx=5, pady=5, sticky=W)
 
         self.lon = tk.StringVar()
-        self.lon.trace("w", self.tile_change)
+        self.lon.trace_add("write", self.tile_change)
         tk.Label(
             self.frame_tile, anchor=W, text="Longitude:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=1, column=2, padx=5, pady=5, sticky=E + W)
@@ -225,7 +239,7 @@ class Ortho4XP_GUI(tk.Tk):
         self.lon_entry.grid(row=1, column=3, padx=5, pady=5, sticky=W)
 
         self.default_website = tk.StringVar()
-        self.default_website.trace("w", self.update_cfg)
+        self.default_website.trace_add("write", self.update_cfg)
         tk.Label(
             self.frame_tile, anchor=W, text="Imagery:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=1, column=4, padx=5, pady=5, sticky=E + W)
@@ -240,7 +254,7 @@ class Ortho4XP_GUI(tk.Tk):
         self.img_combo.grid(row=1, column=5, padx=5, pady=5, sticky=W)
 
         self.default_zl = tk.StringVar()
-        self.default_zl.trace("w", self.update_cfg)
+        self.default_zl.trace_add("write", self.update_cfg)
         tk.Label(
             self.frame_tile, anchor=W, text="Zoomlevel:", bg=UI.BG_COLOR, fg=UI.FG_COLOR
         ).grid(row=1, column=6, padx=5, pady=5, sticky=E + W)
@@ -574,6 +588,17 @@ class Ortho4XP_GUI(tk.Tk):
                 self.status_var.set(self.status_queue.get_nowait())
         except queue.Empty:
             pass
+        try:
+            while 1:
+                label, result, was_cancelled = self.stage_result_queue.get_nowait()
+                if was_cancelled:
+                    self.status_var.set(_ui_text(f"Cancelled: {label}", f"キャンセル: {label}"))
+                elif result:
+                    self.status_var.set(_ui_text(f"Completed: {label}", f"完了: {label}"))
+                else:
+                    self.status_var.set(_ui_text(f"Failed: {label}", f"失敗: {label}"))
+        except queue.Empty:
+            pass
         self.callback_status = self.after(100, self.status_update)
 
     def tile_change(self, *args):
@@ -624,6 +649,34 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             raise Exception
 
+    def _run_background_stage(self, label, target, *args):
+        result = 0
+        try:
+            result = target(*args)
+        except Exception as error:
+            UI.vprint(0, f"ERROR: {label} failed unexpectedly: {error}")
+        finally:
+            # Some legacy auxiliary actions do not reset this flag themselves.
+            UI.is_working = 0
+            self.stage_result_queue.put((label, result == 1, bool(UI.red_flag)))
+
+    def _start_background_stage(self, label, target, *args):
+        if getattr(self, "working_thread", None) is not None and self.working_thread.is_alive():
+            message = _ui_text(
+                "A process is already running.",
+                "すでに別の処理を実行中です。",
+            )
+            UI.vprint(0, message)
+            self.status_var.set(message)
+            return 0
+        self.status_var.set(_ui_text(f"Running: {label}", f"実行中: {label}"))
+        self.working_thread = threading.Thread(
+            target=self._run_background_stage,
+            args=(label, target, *args),
+        )
+        self.working_thread.start()
+        return 1
+
     def build_poly_file(self):
         try:
             tile = self.tile_from_interface()
@@ -631,10 +684,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=VMAP.build_poly_file, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Vector data", VMAP.build_poly_file, tile)
 
     def build_mesh(self, event):
         try:
@@ -643,10 +693,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=MESH.build_mesh, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Mesh", MESH.build_mesh, tile)
 
     def sort_mesh(self, event):
         try:
@@ -655,10 +702,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=MESH.sort_mesh, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Sort mesh", MESH.sort_mesh, tile)
 
     def community_mesh(self, event):
         try:
@@ -667,10 +711,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=MESH.community_mesh, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Community mesh", MESH.community_mesh, tile)
 
     def build_masks(self, event):
         for_imagery = "Shift" in str(event) or "shift" in str(event)
@@ -680,10 +721,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=MASK.build_masks, args=[tile, for_imagery]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Masks", MASK.build_masks, tile, for_imagery)
 
     def build_tile(self):
         try:
@@ -692,10 +730,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=TILE.build_tile, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("Tile", TILE.build_tile, tile)
 
     def build_all(self):
         try:
@@ -704,10 +739,7 @@ class Ortho4XP_GUI(tk.Tk):
         except:
             UI.vprint(1, "Process aborted.\n")
             return 0
-        self.working_thread = threading.Thread(
-            target=TILE.build_all, args=[tile]
-        )
-        self.working_thread.start()
+        return self._start_background_stage("All steps", TILE.build_all, tile)
 
     def choose_custom_build_dir(self):
         tmp = filedialog.askdirectory()
@@ -753,37 +785,178 @@ class Ortho4XP_GUI(tk.Tk):
 
     def set_red_flag(self):
         UI.red_flag = True
-        self.status_var.set("Stop requested. Waiting for the current step to stop...")
+        self.status_var.set(
+            _ui_text(
+                "Stop requested. Waiting for the current step to stop...",
+                "停止を要求しました。現在の処理が停止するまでお待ちください...",
+            )
+        )
 
     def check_dependencies(self):
-        UI.vprint(0, "\nChecking dependencies...")
+        UI.vprint(0, _ui_text("\nChecking dependencies...", "\n依存関係を確認しています..."))
         all_found = True
-        
-        # Tools to check
-        tools = {
-            "gdal_translate": "GDAL (for geotagging/conversion)",
-            "gdalwarp": "GDAL (for reprojecting)",
-        }
-        
-        if OsX:
-            tools["magick"] = "ImageMagick (for Apple Silicon DDS conversion)"
-        else:
-            tools["nvcompress"] = "NVIDIA Texture Tools (for DDS conversion)"
+        configured_dds_converter = getattr(UI, "dds_converter", "nvcompress")
+        needs_ashelper = OsX and (
+            configured_dds_converter == "TextureConverter"
+            or getattr(UI, "use_neural_upscale", False)
+            or getattr(UI, "use_gpu_acceleration", False)
+        )
 
-        for tool, desc in tools.items():
-            path = shutil.which(tool)
-            if path:
-                UI.vprint(0, f"  [OK] {tool} found: {path}")
+        tools = {
+            "gdal_translate": ("gdal_translate", "GDAL (for geotagging/conversion)"),
+            "gdalwarp": ("gdalwarp", "GDAL (for reprojecting)"),
+            "7z": (OVL.unzip_cmd.strip(), "7-Zip (for DSF archives)"),
+            "DSFTool": (OVL.dsftool_cmd.strip(), "bundled DSFTool (for overlays)"),
+            "Triangle4XP": (MESH.Triangle4XP_cmd.strip(), "bundled Triangle4XP (for meshes)"),
+        }
+        required_tools = set(tools)
+        if OsX:
+            tools["ASHelper"] = (
+                os.path.join(FNAMES.Utils_dir, "mac", "ASHelper"),
+                "bundled ASHelper (for Apple Silicon conversion/upscale)",
+            )
+            if configured_dds_converter == "magick":
+                tools["magick"] = ("magick", "ImageMagick (configured DDS converter)")
+                required_tools.add("magick")
+            elif configured_dds_converter == "nvcompress":
+                tools["nvcompress"] = (
+                    getattr(IMG, "dds_convert_cmd", "nvcompress"),
+                    "NVIDIA Texture Tools (configured DDS converter)",
+                )
+                required_tools.add("nvcompress")
+            if needs_ashelper:
+                required_tools.add("ASHelper")
+        else:
+            tools["nvcompress"] = (
+                getattr(IMG, "dds_convert_cmd", "nvcompress"),
+                "NVIDIA Texture Tools (configured DDS converter)",
+            )
+            required_tools.add("nvcompress")
+
+        for label, (candidate, desc) in tools.items():
+            candidate = str(candidate).strip()
+            path = (
+                shutil.which(candidate)
+                if os.path.basename(candidate) == candidate
+                else candidate
+            )
+            if path and os.path.isfile(path) and os.access(path, os.X_OK):
+                suffix = "" if label in required_tools else " (optional)"
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        f"  [OK] {label} found{suffix}: {path}",
+                        f"  [OK] {label} を検出しました{suffix}: {path}",
+                    ),
+                )
             else:
-                UI.vprint(0, f"  [!!] {tool} NOT FOUND ({desc})")
+                suffix = "" if label in required_tools else " (optional)"
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        f"  [!!] {label} NOT FOUND{suffix} ({desc})",
+                        f"  [!!] {label} が見つかりません{suffix} ({desc})",
+                    ),
+                )
+                if label in required_tools:
+                    all_found = False
+
+        python_modules = ("numpy", "PIL", "requests", "shapely", "rtree", "skfmm", "cv2", "osgeo")
+        import importlib
+        for module_name in python_modules:
+            try:
+                importlib.import_module(module_name)
+            except Exception as error:
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        f"  [!!] Python module {module_name} NOT FOUND ({error})",
+                        f"  [!!] Pythonモジュール {module_name} が見つかりません ({error})",
+                    ),
+                )
                 all_found = False
+            else:
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        f"  [OK] Python module {module_name} available",
+                        f"  [OK] Pythonモジュール {module_name} を利用できます",
+                    ),
+                )
+
+        scenery_root = getattr(OVL, "custom_overlay_src", "")
+        scenery_roots = FNAMES.global_scenery_roots(scenery_root)
+        if scenery_root and os.path.isdir(scenery_root):
+            UI.vprint(
+                0,
+                _ui_text(
+                    f"  [OK] Global Scenery root found: {scenery_root}",
+                    f"  [OK] Global Sceneryのルートを検出しました: {scenery_root}",
+                ),
+            )
+            if len(scenery_roots) == 1:
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        f"  [OK] Global Scenery hierarchy resolved: {scenery_roots[0]}",
+                        f"  [OK] Global Sceneryの配置を解決しました: {scenery_roots[0]}",
+                    ),
+                )
+            elif len(scenery_roots) > 1:
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        "  [!!] Global Scenery is ambiguous; choose one scenery package:",
+                        "  [!!] Global Sceneryの候補が複数あります。1つのシーナリーパッケージを指定してください:",
+                    ),
+                )
+                for root in scenery_roots:
+                    UI.vprint(0, f"       {root}")
+                all_found = False
+            else:
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        "  [!!] Global Scenery Earth nav data directory could not be resolved",
+                        "  [!!] Global SceneryのEarth nav dataを解決できませんでした",
+                    ),
+                )
+                all_found = False
+        else:
+            UI.vprint(
+                0,
+                _ui_text(
+                    f"  [!!] Global Scenery root NOT FOUND: {scenery_root or '(empty)'}",
+                    f"  [!!] Global Sceneryのルートが見つかりません: {scenery_root or '(空のパス)'}",
+                ),
+            )
+            all_found = False
         
         if all_found:
-            UI.vprint(0, "All essential dependencies are satisfied!\n")
+            UI.vprint(
+                0,
+                _ui_text(
+                    "All essential dependencies are satisfied!\n",
+                    "必要な依存関係はすべて揃っています。\n",
+                ),
+            )
         else:
-            UI.vprint(0, "Some dependencies are missing. Please install them via Homebrew.\n")
+            UI.vprint(
+                0,
+                _ui_text(
+                    "Some dependencies are missing. Please install them via Homebrew.\n",
+                    "不足している依存関係があります。Homebrewでインストールしてください。\n",
+                ),
+            )
             if OsX:
-                UI.vprint(0, "Try: brew install gdal imagemagick\n")
+                UI.vprint(
+                    0,
+                    _ui_text(
+                        "Try: brew install gdal imagemagick\n",
+                        "例: brew install gdal imagemagick\n",
+                    ),
+                )
+        return 1 if all_found else 0
 
     def exit_prg(self):
         try:
@@ -1402,13 +1575,14 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         UI.vprint(1, "\nBuilding geotiffs.\n------------------\n")
         tile = CFG.Tile(self.lat, self.lon, "")
         tile.zone_list = fake_zone_list
-        IMG.initialize_local_combined_providers_dict(tile)
-        fargs_build_geotiffs = [tile, texture_attributes_list]
-        build_geotiffs_thread = threading.Thread(
-            target=IMG.build_geotiffs, args=fargs_build_geotiffs
+        if not IMG.initialize_local_combined_providers_dict(tile):
+            UI.exit_message_and_bottom_line(
+                "ERROR: Could not initialize local imagery providers."
+            )
+            return 0
+        return self.parent._start_background_stage(
+            "GeoTIFFs", IMG.build_geotiffs, tile, texture_attributes_list
         )
-        build_geotiffs_thread.start()
-        return
 
     def extract_mesh_ifc(self):
         polygon = self.polygon_list[0]
@@ -1438,11 +1612,9 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
             zoomlevel,
             provider_code,
         ]
-        extract_mesh_thread = threading.Thread(
-            target=MESH.extract_mesh_to_obj, args=fargs_extract_mesh
+        return self.parent._start_background_stage(
+            "OBJ mesh", MESH.extract_mesh_to_obj, *fargs_extract_mesh
         )
-        extract_mesh_thread.start()
-        return
 
     def delete_zone_cmd(self):
         try:
@@ -2142,8 +2314,9 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
             self.v_["Extract overlays"].get(),
             self.v_["Read per tile cfg"].get(),
         ]
-        threading.Thread(target=TILE.build_tile_list, args=args).start()
-        return
+        return self.parent._start_background_stage(
+            "Batch build", TILE.build_tile_list, *args
+        )
 
     def scroll_start(self, event):
         self.canvas.config(cursor="closedhand")

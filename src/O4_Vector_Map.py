@@ -22,6 +22,8 @@ def build_poly_file(tile):
     try:
         return _build_poly_file(tile)
     finally:
+        # A worker exception must not leave the GUI permanently busy.
+        UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
 def _build_poly_file(tile):
@@ -59,7 +61,11 @@ def _build_poly_file(tile):
         return 0
 
     # Airports
-    (apt_array, apt_area) = include_airports(vector_map, tile)
+    airport_result = include_airports(vector_map, tile)
+    if airport_result is None:
+        UI.exit_message_and_bottom_line("ERROR: Could not load airport data.")
+        return 0
+    (apt_array, apt_area) = airport_result
     UI.vprint(
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
@@ -69,7 +75,9 @@ def _build_poly_file(tile):
         return 0
 
     # Roads
-    include_roads(vector_map, tile, apt_array, apt_area)
+    if not include_roads(vector_map, tile, apt_array, apt_area):
+        UI.exit_message_and_bottom_line("ERROR: Could not load road data.")
+        return 0
     if tile.road_level:
         UI.vprint(
             1, "   Number of edges at this point:", len(vector_map.dico_edges)
@@ -80,7 +88,8 @@ def _build_poly_file(tile):
         return 0
 
     # Sea
-    include_sea(vector_map, tile)
+    if not include_sea(vector_map, tile):
+        return 0
     UI.vprint(
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
@@ -90,7 +99,8 @@ def _build_poly_file(tile):
         return 0
 
     # Water
-    include_water(vector_map, tile)
+    if not include_water(vector_map, tile):
+        return 0
     UI.vprint(
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
@@ -173,8 +183,9 @@ def _build_poly_file(tile):
         else:
             vector_map.seeds["SEA"] = [numpy.array([0.5, 0.5])]
     vector_map.snap_to_grid(9) 
-    vector_map.write_node_file(node_file)
-    vector_map.write_poly_file(poly_file)
+    if not vector_map.write_node_file(node_file) or not vector_map.write_poly_file(poly_file):
+        UI.exit_message_and_bottom_line("ERROR: Could not write vector data files.")
+        return 0
 
     UI.vprint(
         1, "\nFinal number of constrained edges :", len(vector_map.dico_edges)
@@ -200,7 +211,7 @@ def include_airports(vector_map, tile):
         tags_of_interest,
         cached_suffix="airports",
     ):
-        return (0, 0)
+        return None
     dico_airports = {}
     APT.discover_airport_names(airport_layer, dico_airports)
     APT.attach_surfaces_to_airports(airport_layer, dico_airports)
@@ -259,7 +270,7 @@ def include_roads(vector_map, tile, apt_array, apt_area):
         return tile.dem.alt_vec(VECT.shift_way(way, tile.lane_width))
 
     if not tile.road_level:
-        return
+        return 1
     UI.vprint(0, "-> Dealing with roads")
     tags_of_interest = ["bridge", "tunnel"]
     # Need to evaluate if including bridges is better or worse
@@ -375,9 +386,11 @@ def include_sea(vector_map, tile):
     custom_coastline_dir = FNAMES.custom_coastline_dir(tile.lat, tile.lon)
     if os.path.isfile(custom_coastline):
         UI.vprint(1, "    * User defined custom coastline data detected.")
-        sea_layer.update_dicosm(
+        if not sea_layer.update_dicosm(
             custom_coastline, input_tags=None, target_tags=None
-        )
+        ):
+            UI.exit_message_and_bottom_line("ERROR: Could not read custom coastline data.")
+            return 0
         custom_source = True
     elif os.path.isdir(custom_coastline_dir):
         UI.vprint(
@@ -388,14 +401,22 @@ def include_sea(vector_map, tile):
         has_custom_files = False
         for osm_file in os.listdir(custom_coastline_dir):
             UI.vprint(2, "      ", osm_file)
-            sea_layer.update_dicosm(
+            if not sea_layer.update_dicosm(
                 os.path.join(custom_coastline_dir, osm_file),
                 input_tags=None,
                 target_tags=None,
-            )
+            ):
+                UI.exit_message_and_bottom_line(
+                    "ERROR: Could not read custom coastline data:", osm_file
+                )
+                return 0
             has_custom_files = True
         if has_custom_files:
-            sea_layer.write_to_file(custom_coastline)
+            if not sea_layer.write_to_file(custom_coastline):
+                UI.exit_message_and_bottom_line(
+                    "ERROR: Could not update custom coastline cache."
+                )
+                return 0
         custom_source = True
     else:
         queries = ['way["natural"="coastline"]']
@@ -458,6 +479,7 @@ def include_sea(vector_map, tile):
                 vector_map.seeds["SEA"].append(seed)
             else:
                 vector_map.seeds["SEA"] = [seed]
+    return 1
 
 
 ################################################################################
@@ -516,9 +538,11 @@ def include_water(vector_map, tile):
     custom_water_dir = FNAMES.custom_water_dir(tile.lat, tile.lon)
     if os.path.isfile(custom_water):
         UI.vprint(1, "    * User defined custom water data detected.")
-        water_layer.update_dicosm(
+        if not water_layer.update_dicosm(
             custom_water, input_tags=None, target_tags=None
-        )
+        ):
+            UI.exit_message_and_bottom_line("ERROR: Could not read custom water data.")
+            return 0
     elif os.path.isdir(custom_water_dir):
         UI.vprint(
             1, "    * User defined custom water data detected (multiple files)."
@@ -526,14 +550,22 @@ def include_water(vector_map, tile):
         has_custom_files = False
         for osm_file in os.listdir(custom_water_dir):
             UI.vprint(2, "      ", osm_file)
-            water_layer.update_dicosm(
+            if not water_layer.update_dicosm(
                 os.path.join(custom_water_dir, osm_file),
                 input_tags=None,
                 target_tags=None,
-            )
+            ):
+                UI.exit_message_and_bottom_line(
+                    "ERROR: Could not read custom water data:", osm_file
+                )
+                return 0
             has_custom_files = True
         if has_custom_files:
-            water_layer.write_to_file(custom_water)
+            if not water_layer.write_to_file(custom_water):
+                UI.exit_message_and_bottom_line(
+                    "ERROR: Could not update custom water cache."
+                )
+                return 0
     else:
         queries = [
             'rel["natural"="water"]',
@@ -670,13 +702,15 @@ def include_patches(vector_map, tile):
         UI.vprint(1, "   Patching", pfile_name)
         patch_layer = OSM.OSM_layer()
         try:
-            patch_layer.update_dicosm(
+            if not patch_layer.update_dicosm(
                 os.path.join(patch_dir, pfile_name),
                 input_tags=None,
                 target_tags=None,
-            )
+            ):
+                raise ValueError("invalid patch OSM data")
         except:
             UI.vprint(1, "     Error in treating", pfile_name, ", skipped.")
+            continue
         patches_list.append(pfile_name[:-10])
         dw = patch_layer.dicosmw
         dn = patch_layer.dicosmn
