@@ -18,10 +18,22 @@ The output contains a readable text DSF, `library.txt`, and
 `generation-report.json`. Add `--dsftool Utils/mac/DSFTool` to create a binary
 DSF.
 
-The Overpass query should use `out geom`, for example:
+The Overpass query should use `out geom`, for example. For larger areas,
+split the bbox into multiple requests and repeat `--overpass-json`; duplicate
+way IDs at tile boundaries are ignored:
 
 ```text
 [out:json][timeout:120];way["building"](34.600,133.900,34.630,133.970);out geom;
+```
+
+```sh
+.venv/bin/python tools/xp_buildings.py \
+  --lat 34 --lon 133 \
+  --overpass-json /tmp/okayama-west.json \
+  --overpass-json /tmp/okayama-east.json \
+  --asset-root /tmp/own-xplane-objects \
+  --output /tmp/zz_Ortho4XP_AI_Buildings_+34+133 \
+  --dsftool Utils/mac/DSFTool
 ```
 
 The generated package expects self-owned assets at:
@@ -39,9 +51,11 @@ For a display-path smoke test, create simple self-owned assets first:
 .venv/bin/python tools/create_demo_assets.py /tmp/own-xplane-objects
 ```
 
-`--asset-root` must contain those four OBJ files and their referenced texture
-files. The entire directory is copied into the generated package's `objects/`
-directory; no files are copied from Japan Pro or X-World.
+`--asset-root` is required and must contain those four OBJ files and their
+referenced texture files. Generation fails before creating the package when the
+directory or any base OBJ is missing. The entire directory is copied into the
+generated package's `objects/` directory; no files are copied from Japan Pro or
+X-World.
 
 When the asset directory comes from `create_demo_assets.py`, the DSF selects a
 small/medium/large and low/mid/high variant according to each footprint's

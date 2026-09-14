@@ -114,9 +114,15 @@ def _building_from_polygon(
     ]
     length, index = max(edges)
     start, end = corners[index], corners[(index + 1) % 4]
-    heading = math.degrees(math.atan2(end[0] - start[0], end[1] - start[1])) % 360
+    edge_bearing = math.degrees(math.atan2(end[0] - start[0], end[1] - start[1])) % 360
+    # The generated/custom building assets use their long dimension on local +X.
+    # X-Plane places local +X east at heading 0, so convert a compass bearing
+    # (clockwise from north) to the rotation of that +X axis.
+    heading = (edge_bearing - 90.0) % 360
     other = min(edge[0] for edge in edges)
     centroid = polygon.centroid
+    if not polygon.contains(centroid):
+        centroid = polygon.representative_point()
     scale_x = 111320.0 * math.cos(math.radians(tile_lat + 0.5))
     scale_y = 110540.0
     return Building(
@@ -300,22 +306,23 @@ def build_package(
     assets: dict[str, str], mode: str, dsftool: Path | None,
     exclude_rect: tuple[float, float, float, float] | None, asset_root: Path | None,
 ) -> None:
+    if asset_root is None:
+        raise ValueError("asset-root is required to create a self-contained package")
+    if not asset_root.is_dir():
+        raise FileNotFoundError(f"asset-root directory does not exist: {asset_root}")
+    missing_assets = []
+    for relative_path in sorted(set(assets.values())):
+        source = asset_root / Path(relative_path).name
+        if not source.is_file():
+            missing_assets.append(str(source))
+    if missing_assets:
+        raise FileNotFoundError("asset-root is missing: " + ", ".join(missing_assets))
+
     output.mkdir(parents=True, exist_ok=True)
     earth_dir = output / "Earth nav data" / f"{tile_lat // 10 * 10:+03d}{tile_lon // 10 * 10:+04d}"
     earth_dir.mkdir(parents=True, exist_ok=True)
     (output / "objects").mkdir(exist_ok=True)
-    missing_assets = []
-    if asset_root:
-        for relative_path in sorted(set(assets.values())):
-            source = asset_root / Path(relative_path).name
-            if not source.is_file():
-                missing_assets.append(str(source))
-        if missing_assets:
-            raise FileNotFoundError("asset-root is missing: " + ", ".join(missing_assets))
-        if not missing_assets:
-            shutil.copytree(asset_root, output / "objects", dirs_exist_ok=True)
-    else:
-        missing_assets = [str(output / relative_path) for relative_path in sorted(set(assets.values()))]
+    shutil.copytree(asset_root, output / "objects", dirs_exist_ok=True)
     write_library(output / "library.txt", tile_lat, tile_lon, assets, mode)
     available_assets = {
         str(path.relative_to(output)) for path in (output / "objects").rglob("*.obj")
@@ -333,7 +340,10 @@ def build_package(
         "exclusion": "explicit rectangle" if exclude_rect else "none; compare for duplicate buildings",
         "missing_assets": [
             str(output / asset)
-            for asset in sorted(set(definitions_for_report(buildings, assets, available_assets or None)))
+            for asset in sorted(
+                set(assets.values())
+                | definitions_for_report(buildings, assets, available_assets or None)
+            )
             if not (output / asset).is_file()
         ],
     }
@@ -353,9 +363,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lon", type=int, required=True)
     parser.add_argument("--osm", type=Path)
     parser.add_argument("--geojson", type=Path, action="append")
-    parser.add_argument("--overpass-json", type=Path, help="Overpass JSON from a way[building] query with out geom")
+    parser.add_argument(
+        "--overpass-json",
+        type=Path,
+        action="append",
+        help="Overpass JSON from a way[building] query with out geom; repeat for split bboxes",
+    )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--asset-root", type=Path, help="directory containing the four self-owned OBJ files")
+    parser.add_argument(
+        "--asset-root",
+        type=Path,
+        required=True,
+        help="directory containing the four self-owned OBJ files",
+    )
     parser.add_argument("--dsftool", type=Path)
     parser.add_argument("--mode", choices=("replace", "extend"), default="replace")
     parser.add_argument("--exclude-rect", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
@@ -367,8 +387,13 @@ def main(argv: list[str] | None = None) -> int:
     buildings = load_osm(args.osm, args.lat, args.lon) if args.osm else []
     for path in args.geojson or []:
         buildings.extend(load_geojson(path, args.lat, args.lon))
-    if args.overpass_json:
-        buildings.extend(load_overpass_json(args.overpass_json, args.lat, args.lon))
+    seen_overpass_ids: set[str] = set()
+    for path in args.overpass_json or []:
+        for building in load_overpass_json(path, args.lat, args.lon):
+            if building.source_id in seen_overpass_ids:
+                continue
+            seen_overpass_ids.add(building.source_id)
+            buildings.append(building)
     exclude = tuple(args.exclude_rect) if args.exclude_rect else None
     build_package(args.output, args.lat, args.lon, buildings, dict(DEFAULT_ASSETS), args.mode, args.dsftool, exclude, args.asset_root)
     print(f"generated {len(buildings)} buildings in {args.output}")
