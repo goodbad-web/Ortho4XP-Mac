@@ -375,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
         help="allow running with normal Python when texture files are supplied; no .blend is written",
     )
     args = parser.parse_args(_script_argv(argv))
+    if bpy is None and args.allow_placeholder:
+        parser.error("--allow-placeholder requires Blender; provide --texture-root for --obj8-only")
     if bpy is None and not args.obj8_only:
         parser.error("run this script with Blender, or pass --obj8-only for the OBJ8-only path")
     if args.blend_output and bpy is None:

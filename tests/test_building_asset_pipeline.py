@@ -84,3 +84,20 @@ def test_comfy_jobs_reject_path_traversal(tmp_path):
 
     with pytest.raises(ValueError, match="invalid job name"):
         comfy_batch.load_jobs(path)
+
+
+def test_obj8_only_rejects_placeholder_without_blender(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(blender_assets, "bpy", None)
+
+    with pytest.raises(SystemExit) as error:
+        blender_assets.main(
+            [
+                "--output",
+                str(tmp_path / "assets"),
+                "--obj8-only",
+                "--allow-placeholder",
+            ]
+        )
+
+    assert error.value.code == 2
+    assert "requires Blender" in capsys.readouterr().err
