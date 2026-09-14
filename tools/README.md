@@ -53,5 +53,7 @@ with lower-priority libraries; the default `replace` mode uses `EXPORT` for
 the selected tile region.
 
 Do not use `--exclude-rect` until the models have been compared in X-Plane.
-X-Plane object exclusion is rectangular and may remove unrelated scenery.
-The default is no exclusion, which is safest for the first comparison.
+The option writes both `sim/exclude_obj` and `sim/exclude_fac`, because
+X-World buildings may be represented by objects or facade polygons. Exclusion
+is rectangular and may remove unrelated scenery inside the rectangle. The
+default is no exclusion, which is safest for the first comparison.

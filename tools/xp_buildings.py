@@ -260,7 +260,7 @@ def write_text_dsf(
     tile_lon: int,
     buildings: list[Building],
     assets: dict[str, str],
-    exclude_rect: tuple[int, int, int, int] | None,
+    exclude_rect: tuple[float, float, float, float] | None,
     available_assets: set[str] | None = None,
 ) -> None:
     definitions = sorted({asset_for_building(building, assets, available_assets) for building in buildings})
@@ -272,7 +272,8 @@ def write_text_dsf(
     ]
     if exclude_rect:
         west, south, east, north = exclude_rect
-        lines.append(f"PROPERTY sim/exclude_objects {west}/{south}/{east}/{north}")
+        lines.append(f"PROPERTY sim/exclude_obj {west}/{south}/{east}/{north}")
+        lines.append(f"PROPERTY sim/exclude_fac {west}/{south}/{east}/{north}")
     lines.extend(f"OBJECT_DEF {asset}" for asset in definitions)
     for building in buildings:
         asset = asset_for_building(building, assets, available_assets)
@@ -297,7 +298,7 @@ def definitions_for_report(
 def build_package(
     output: Path, tile_lat: int, tile_lon: int, buildings: list[Building],
     assets: dict[str, str], mode: str, dsftool: Path | None,
-    exclude_rect: tuple[int, int, int, int] | None, asset_root: Path | None,
+    exclude_rect: tuple[float, float, float, float] | None, asset_root: Path | None,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     earth_dir = output / "Earth nav data" / f"{tile_lat // 10 * 10:+03d}{tile_lon // 10 * 10:+04d}"
@@ -357,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--asset-root", type=Path, help="directory containing the four self-owned OBJ files")
     parser.add_argument("--dsftool", type=Path)
     parser.add_argument("--mode", choices=("replace", "extend"), default="replace")
-    parser.add_argument("--exclude-rect", nargs=4, type=int, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+    parser.add_argument("--exclude-rect", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
     args = parser.parse_args(argv)
     if not args.osm and not args.geojson and not args.overpass_json:
         parser.error("--osm, --geojson, or --overpass-json is required")

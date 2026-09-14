@@ -46,6 +46,24 @@ def test_load_geojson_and_write_package(tmp_path):
     assert report["building_count"] == 1
 
 
+def test_exclusion_targets_objects_and_facades(tmp_path):
+    output = tmp_path / "package"
+    xp.build_package(
+        output,
+        34,
+        133,
+        [],
+        dict(xp.DEFAULT_ASSETS),
+        "replace",
+        None,
+        (133.935, 34.620, 133.937, 34.622),
+        None,
+    )
+    dsf = next((output / "Earth nav data").rglob("*.txt")).read_text(encoding="utf-8")
+    assert "PROPERTY sim/exclude_obj 133.935/34.62/133.937/34.622" in dsf
+    assert "PROPERTY sim/exclude_fac 133.935/34.62/133.937/34.622" in dsf
+
+
 def test_asset_variant_tracks_building_size_and_height():
     polygon = xp.Polygon([(0, 0), (30, 0), (30, 20), (0, 20)])
     building = xp.Building(
