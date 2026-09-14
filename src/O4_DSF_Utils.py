@@ -42,6 +42,55 @@ def numpy_wgs84_to_orthogrid(lat, lon, zoomlevel):
     return til_x, til_y
 
 
+def _mesh_orthogrid_bounds(tile):
+    """Return tile bounds in the same unaligned grid as mesh triangles."""
+    til_x_min, til_y_min = numpy_wgs84_to_orthogrid(
+        tile.lat + 1, tile.lon, tile.mesh_zl
+    )
+    til_x_max, til_y_max = numpy_wgs84_to_orthogrid(
+        tile.lat, tile.lon + 1, tile.mesh_zl
+    )
+    return (
+        int(til_x_min),
+        int(til_y_min),
+        int(til_x_max),
+        int(til_y_max),
+    )
+
+
+def _validate_mesh_orthogrid_indices(til_xs, til_ys, bounds):
+    """Reject triangle indices outside the tile instead of hiding them."""
+    til_x_min, til_y_min, til_x_max, til_y_max = bounds
+    til_xs = numpy.asarray(til_xs)
+    til_ys = numpy.asarray(til_ys)
+    outside = (
+        (til_xs < til_x_min)
+        | (til_xs > til_x_max)
+        | (til_ys < til_y_min)
+        | (til_ys > til_y_max)
+    )
+    if not numpy.any(outside):
+        return
+
+    outside_xs = til_xs[outside]
+    outside_ys = til_ys[outside]
+    raise ValueError(
+        "Triangle orthogrid indices outside tile bounds: "
+        "{} points, x=[{}, {}], y=[{}, {}], "
+        "expected x=[{}, {}], y=[{}, {}]".format(
+            int(numpy.count_nonzero(outside)),
+            int(outside_xs.min()),
+            int(outside_xs.max()),
+            int(outside_ys.min()),
+            int(outside_ys.max()),
+            til_x_min,
+            til_x_max,
+            til_y_min,
+            til_y_max,
+        )
+    )
+
+
 def numpy_st_coord(lat, lon, tex_x, tex_y, zoomlevel):
     ratio_x = lon / 180
     ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
@@ -195,12 +244,7 @@ def zone_list_to_ortho_dico(tile):
             airport_array[rowmin : rowmax + 1, colmin : colmax + 1] = 1
     dico_customzl = {}
     dico_tmp = {}
-    til_x_min, til_y_min = GEO.wgs84_to_orthogrid(
-        tile.lat + 1, tile.lon, tile.mesh_zl
-    )
-    til_x_max, til_y_max = GEO.wgs84_to_orthogrid(
-        tile.lat, tile.lon + 1, tile.mesh_zl
-    )
+    til_x_min, til_y_min, til_x_max, til_y_max = _mesh_orthogrid_bounds(tile)
     i = 1
     base_zone = (
         [
@@ -613,12 +657,14 @@ def _build_dsf(tile, download_queue):
     tri_lons = numpy.mean(lons[tri_idx_reshaped], axis=1)
     tri_lats = numpy.mean(lats[tri_idx_reshaped], axis=1)
     til_xs, til_ys = numpy_wgs84_to_orthogrid(tri_lats, tri_lons, tile.mesh_zl)
-    
-    # Boundary clipping for safety
-    til_x_min, til_y_min = GEO.wgs84_to_orthogrid(tile.lat + 1, tile.lon, tile.mesh_zl)
-    til_x_max, til_y_max = GEO.wgs84_to_orthogrid(tile.lat, tile.lon + 1, tile.mesh_zl)
-    til_xs = numpy.clip(til_xs, til_x_min, til_x_max)
-    til_ys = numpy.clip(til_ys, til_y_min, til_y_max)
+
+    # Keep the lookup grid in the same coordinate system as the triangle indices.
+    til_x_min, til_y_min, til_x_max, til_y_max = _mesh_orthogrid_bounds(tile)
+    _validate_mesh_orthogrid_indices(
+        til_xs,
+        til_ys,
+        (til_x_min, til_y_min, til_x_max, til_y_max),
+    )
     
     # Vectorized custom ZL lookup using 2D NumPy array for huge speedup
     width = til_x_max - til_x_min + 1
@@ -635,8 +681,8 @@ def _build_dsf(tile, download_queue):
         if 0 <= idx_x < width and 0 <= idx_y < height:
             customzl_arr[idx_x, idx_y] = val
             
-    idx_xs = numpy.clip(til_xs - til_x_min, 0, width - 1)
-    idx_ys = numpy.clip(til_ys - til_y_min, 0, height - 1)
+    idx_xs = til_xs - til_x_min
+    idx_ys = til_ys - til_y_min
     tri_tex_attr = customzl_arr[idx_xs, idx_ys].tolist()
     
     # 5 Compute quadtree
