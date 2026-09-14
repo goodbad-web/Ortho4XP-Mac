@@ -1,0 +1,30 @@
+[
+  {
+    "name": "jp_house",
+    "seed": 2401,
+    "overrides": {
+      "3.text": "photorealistic Japanese detached-house facade texture atlas, neutral plaster and dark tile accents, straight-on orthographic view, clean repeated windows, no perspective, no roof, no text, no logo, no people, game-ready material reference"
+    }
+  },
+  {
+    "name": "jp_apartment",
+    "seed": 2402,
+    "overrides": {
+      "3.text": "photorealistic Japanese mid-rise apartment facade texture atlas, concrete, balconies and regular windows, straight-on orthographic view, no perspective, no roof, no text, no logo, no people, game-ready material reference"
+    }
+  },
+  {
+    "name": "jp_commercial",
+    "seed": 2403,
+    "overrides": {
+      "3.text": "photorealistic Japanese small commercial building facade texture atlas, shopfront glass and neutral panels without signage, straight-on orthographic view, no perspective, no roof, no text, no logo, no people, game-ready material reference"
+    }
+  },
+  {
+    "name": "jp_industrial",
+    "seed": 2404,
+    "overrides": {
+      "3.text": "photorealistic Japanese warehouse and factory facade texture atlas, corrugated metal and concrete, straight-on orthographic view, no perspective, no roof, no text, no logo, no people, game-ready material reference"
+    }
+  }
+]

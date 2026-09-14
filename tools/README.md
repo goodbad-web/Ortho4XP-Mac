@@ -71,3 +71,43 @@ The option writes both `sim/exclude_obj` and `sim/exclude_fac`, because
 X-World buildings may be represented by objects or facade polygons. Exclusion
 is rectangular and may remove unrelated scenery inside the rectangle. The
 default is no exclusion, which is safest for the first comparison.
+
+## Blender + ComfyUI asset path
+
+`create_demo_assets.py` is only a display-path smoke test. For reusable
+building assets, generate four category textures with ComfyUI, then let
+Blender generate the family/size/height variants. The texture batch client
+uses ComfyUI's API-format workflow and keeps the seed and prompt in the job
+file:
+
+```sh
+.venv/bin/python tools/comfyui_texture_batch.py \
+  --workflow tools/comfyui_building_texture_api.json \
+  --jobs tools/comfyui_building_texture_jobs.json \
+  --output-dir /tmp/ortho4xp-building-textures
+```
+
+Before the first run, replace `REPLACE_WITH_A_LOCAL_SDXL_CHECKPOINT.safetensors`
+in the workflow with a checkpoint available to the local ComfyUI instance.
+Use `--dry-run` to validate the four expanded workflows without connecting to
+ComfyUI. The generated files are `jp_house.png`, `jp_apartment.png`,
+`jp_commercial.png`, and `jp_industrial.png`.
+
+Run the asset generator inside Blender. It creates 40 reusable OBJ8 assets,
+copies the category textures to each variant, writes `asset-manifest.json`,
+and saves an optional inspectable `.blend`:
+
+```sh
+blender --background --python tools/blender_generate_assets.py -- \
+  --output /tmp/ortho4xp-building-assets \
+  --texture-root /tmp/ortho4xp-building-textures \
+  --blend-output /tmp/ortho4xp-building-assets/building-families.blend
+```
+
+The output directory can then be passed unchanged as `--asset-root` to
+`xp_buildings.py`. Geometry is generated from a small number of families and
+the existing footprint/height classifier selects a variant, so this does not
+create a unique heavy mesh or a unique 4K texture for every OSM building.
+The generator also has `--obj8-only` for environments that already have the
+texture files but do not have Blender installed; that path does not claim to
+produce a `.blend` file.
