@@ -171,6 +171,28 @@ def load_geojson(path: Path, tile_lat: int, tile_lon: int) -> list[Building]:
     return result
 
 
+def load_overpass_json(path: Path, tile_lat: int, tile_lon: int) -> list[Building]:
+    """Load Overpass ``[out:json]; ...; out geom`` building ways."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    result: list[Building] = []
+    for element in data.get("elements", []):
+        if element.get("type") != "way" or "building" not in element.get("tags", {}):
+            continue
+        points = [(node["lon"], node["lat"]) for node in element.get("geometry", [])]
+        if len(points) < 4 or points[0] != points[-1]:
+            continue
+        building = _building_from_polygon(
+            _local_polygon(points, tile_lat, tile_lon),
+            element.get("tags", {}),
+            str(element.get("id", "way")),
+            tile_lat,
+            tile_lon,
+        )
+        if building:
+            result.append(building)
+    return result
+
+
 def _asset_for(category: str, assets: dict[str, str]) -> str:
     return assets.get(category, DEFAULT_ASSETS[category])
 
@@ -277,19 +299,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lon", type=int, required=True)
     parser.add_argument("--osm", type=Path)
     parser.add_argument("--geojson", type=Path, action="append")
+    parser.add_argument("--overpass-json", type=Path, help="Overpass JSON from a way[building] query with out geom")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--asset-root", type=Path, help="directory containing the four self-owned OBJ files")
     parser.add_argument("--dsftool", type=Path)
     parser.add_argument("--mode", choices=("replace", "extend"), default="replace")
     parser.add_argument("--exclude-rect", nargs=4, type=int, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
     args = parser.parse_args(argv)
-    if not args.osm and not args.geojson:
-        parser.error("--osm or --geojson is required")
+    if not args.osm and not args.geojson and not args.overpass_json:
+        parser.error("--osm, --geojson, or --overpass-json is required")
     if args.lon < -180 or args.lon > 179:
         parser.error("tile longitude must be between -180 and 179")
     buildings = load_osm(args.osm, args.lat, args.lon) if args.osm else []
     for path in args.geojson or []:
         buildings.extend(load_geojson(path, args.lat, args.lon))
+    if args.overpass_json:
+        buildings.extend(load_overpass_json(args.overpass_json, args.lat, args.lon))
     exclude = tuple(args.exclude_rect) if args.exclude_rect else None
     build_package(args.output, args.lat, args.lon, buildings, dict(DEFAULT_ASSETS), args.mode, args.dsftool, exclude, args.asset_root)
     print(f"generated {len(buildings)} buildings in {args.output}")
