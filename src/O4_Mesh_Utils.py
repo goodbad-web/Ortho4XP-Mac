@@ -11,6 +11,7 @@ import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Vector_Utils as VECT
+from O4_DSF_Budget import stable_id_key
 import O4_OSM_Utils as OSM
 import O4_Version
 
@@ -179,7 +180,7 @@ def build_curv_tol_weight_map(tile, weight_array):
                 "    * User defined custom coastline data detected ",
                 "(multiple files).",
             )
-            for osm_file in os.listdir(custom_coastline_dir):
+            for osm_file in sorted(os.listdir(custom_coastline_dir), key=stable_id_key):
                 UI.vprint(2, "      ", osm_file)
                 if not sea_layer.update_dicosm(
                     os.path.join(custom_coastline_dir, osm_file),
@@ -282,7 +283,7 @@ def post_process_nodes_altitudes(tile):
 
     if tile.water_smoothing:
         UI.vprint(1, "   Smoothing inland water.")
-        v_indices = numpy.array(list(water_tris))
+        v_indices = numpy.array(sorted(water_tris))
         if v_indices.size > 0:
             for j in range(tile.water_smoothing):
                 v1, v2, v3 = v_indices[:, 0], v_indices[:, 1], v_indices[:, 2]
@@ -292,7 +293,7 @@ def post_process_nodes_altitudes(tile):
                 vertices[6 * v3 + 2] = zmean
 
     UI.vprint(1, "   Smoothing of sea water.")
-    s_indices = numpy.array(list(sea_tris))
+    s_indices = numpy.array(sorted(sea_tris))
     if s_indices.size > 0:
         v1, v2, v3 = s_indices[:, 0], s_indices[:, 1], s_indices[:, 2]
         if tile.sea_smoothing_mode == "zero":
@@ -310,7 +311,7 @@ def post_process_nodes_altitudes(tile):
             vertices[6 * v3 + 2] = numpy.maximum(vertices[6 * v3 + 2], 0)
     
     UI.vprint(1, "   Treatment of airports, roads and patches.")
-    i_indices = numpy.array(list(interp_alt_tris))
+    i_indices = numpy.array(sorted(interp_alt_tris))
     if i_indices.size > 0:
         v1, v2, v3 = i_indices[:, 0], i_indices[:, 1], i_indices[:, 2]
         for v in [v1, v2, v3]:
@@ -343,11 +344,11 @@ def write_mesh_file(tile, vertices, tri_rows=None):
     if nbr_vert > 900000:
         UI.vprint(
             0,
-            "\nWARNING: Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
+            "\nWARNING: Mesh node count ({:,}) is high (900,000-point advisory).".format(nbr_vert)
         )
         UI.vprint(
             0,
-            "         The final DSF node count might exceed the 1,000,000 Metal absolute limit and crash X-Plane 12.\n"
+            "         The final DSF point-pool budget is evaluated after DSF construction.\n"
         )
     if tri_rows is None:
         f_ele = open(FNAMES.output_ele_file(tile), "r")
@@ -572,7 +573,7 @@ def extract_mesh_to_obj(
 ################################################################################
 def build_mesh(tile):
     if not UI.is_building_all:
-        UI.initialize_build_log(tile.build_dir)
+        UI.initialize_build_log(tile.build_dir, tile)
     tile.mesh_retry_count = 0
     tile.original_curvature_tol = tile.curvature_tol
     try:
@@ -797,22 +798,12 @@ def _build_mesh(tile):
         return 0
 
     nbr_vert = len(vertices) // 6
-    if nbr_vert > 900000 and getattr(tile, "mesh_retry_count", 0) < 3:
-        tile.mesh_retry_count += 1
-        new_tol = tile.curvature_tol * 1.5
+    if nbr_vert > 900000:
         UI.vprint(
             0,
-            "\n[Auto-Retry] Final node count ({:,}) exceeds the safe mesh limit of 900,000!".format(nbr_vert)
+            "WARNING: Mesh node count ({:,}) is high; the final DSF "
+            "point-pool budget is evaluated after DSF construction.".format(nbr_vert),
         )
-        UI.vprint(
-            0,
-            "             Increasing curvature_tol from {:.4f} to {:.4f} (Attempt {}/3)...".format(
-                tile.curvature_tol, new_tol, tile.mesh_retry_count
-            )
-        )
-        tile.curvature_tol = new_tol
-        UI.is_working = 0  # Re-enable execution for the retry
-        return _build_mesh(tile)
 
     if not write_mesh_file(tile, vertices, tri_rows):
         UI.exit_message_and_bottom_line("\nERROR: Could not write final mesh file.")

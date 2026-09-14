@@ -10,6 +10,7 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import quoteattr
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
+from O4_DSF_Budget import stable_id_key
 
 overpass_servers = {
     "DE": "https://overpass-api.de/api/interpreter",
@@ -384,7 +385,8 @@ class OSM_layer:
             '<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" ' + 
             'generator="Ortho4XP">\n'
         )
-        for nodeid, (lonp, latp) in self.dicosmn.items():
+        for nodeid in sorted(self.dicosmn, key=stable_id_key):
+            (lonp, latp) = self.dicosmn[nodeid]
             node_tags = self.dicosmtags["n"].get(nodeid)
             if not node_tags:
                 fout.write(
@@ -406,7 +408,7 @@ class OSM_layer:
                 + "{:.7f}".format(lonp)
                 + '" version="1">\n'
             )
-            for tag, value in node_tags.items():
+            for tag, value in sorted(node_tags.items(), key=lambda item: str(item[0])):
                 fout.write(
                     "    <tag k="
                     + quoteattr(str(tag))
@@ -415,16 +417,20 @@ class OSM_layer:
                     + "/>\n"
                 )
             fout.write("  </node>\n")
-        for wayid in tuple(self.dicosmfirst["w"]) + tuple(
-            set(self.dicosmw).difference(self.dicosmfirst["w"])
-        ):
+        first_way_ids = sorted(self.dicosmfirst["w"], key=stable_id_key)
+        remaining_way_ids = sorted(
+            set(self.dicosmw).difference(self.dicosmfirst["w"]),
+            key=stable_id_key,
+        )
+        for wayid in tuple(first_way_ids) + tuple(remaining_way_ids):
             fout.write('  <way id="' + str(wayid) + '" version="1">\n')
             for nodeid in self.dicosmw[wayid]:
                 fout.write('    <nd ref="' + str(nodeid) + '"/>\n')
-            for tag in (
+            for tag in sorted(
                 self.dicosmtags["w"][wayid]
                 if wayid in self.dicosmtags["w"]
-                else []
+                else [],
+                key=str,
             ):
                 fout.write(
                     "    <tag k="
@@ -434,9 +440,12 @@ class OSM_layer:
                     + "/>\n"
                 )
             fout.write("  </way>\n")
-        for relid in tuple(self.dicosmfirst["r"]) + tuple(
-            set(self.dicosmrorig).difference(self.dicosmfirst["r"])
-        ):
+        first_relation_ids = sorted(self.dicosmfirst["r"], key=stable_id_key)
+        remaining_relation_ids = sorted(
+            set(self.dicosmrorig).difference(self.dicosmfirst["r"]),
+            key=stable_id_key,
+        )
+        for relid in tuple(first_relation_ids) + tuple(remaining_relation_ids):
             fout.write('  <relation id="' + str(relid) + '" version="1">\n')
             for wayid in self.dicosmrorig[relid]["outer"]:
                 fout.write(
@@ -450,10 +459,11 @@ class OSM_layer:
                     + str(wayid)
                     + '" role="inner"/>\n'
                 )
-            for tag in (
+            for tag in sorted(
                 self.dicosmtags["r"][relid]
                 if relid in self.dicosmtags["r"]
-                else []
+                else [],
+                key=str,
             ):
                 fout.write(
                     "    <tag k="
@@ -781,7 +791,7 @@ def OSM_to_MultiLineString(
     step = int(todo / 100) + 1
     done = 0
     filtered_segs = 0
-    for wayid in osm_layer.dicosmfirst["w"]:
+    for wayid in sorted(osm_layer.dicosmfirst["w"], key=stable_id_key):
         if done % step == 0:
             UI.progress_bar(1, int(100 * done / todo))
         if (
@@ -834,7 +844,7 @@ def OSM_to_MultiPolygon(osm_layer, lat, lon, filter=None):
     todo = len(osm_layer.dicosmfirst["w"]) + len(osm_layer.dicosmfirst["r"])
     step = int(todo / 100) + 1
     done = 0
-    for wayid in osm_layer.dicosmfirst["w"]:
+    for wayid in sorted(osm_layer.dicosmfirst["w"], key=stable_id_key):
         if done % step == 0:
             UI.progress_bar(1, int(100 * done / todo))
         if osm_layer.dicosmw[wayid][0] != osm_layer.dicosmw[wayid][-1]:
@@ -877,7 +887,7 @@ def OSM_to_MultiPolygon(osm_layer, lat, lon, filter=None):
         else:
             multilist.append(pol)
         done += 1
-    for relid in osm_layer.dicosmfirst["r"]:
+    for relid in sorted(osm_layer.dicosmfirst["r"], key=stable_id_key):
         if done % step == 0:
             UI.progress_bar(1, int(100 * done / todo))
         try:

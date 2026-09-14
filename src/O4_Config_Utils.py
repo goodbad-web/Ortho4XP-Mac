@@ -12,6 +12,7 @@ import O4_Vector_Map as VMAP
 import O4_Imagery_Utils as IMG
 import O4_Tile_Utils as TILE
 import O4_Overlay_Utils as OVL
+import O4_DSF_Budget as DSF_BUDGET
 
 
 cfg_vars = {
@@ -337,6 +338,12 @@ too low to grab these details.",
         "default": 18,
         "hint": "The zoomlevel with which to cover the airports zone when high_zl_airports is set. Note that if the cover_zl is lower than the zoomlevel which would otherwise be applied on a specific zone, the latter is used.",
     },
+    "dsf_node_budget": {
+        "type": int,
+        "default": DSF_BUDGET.DEFAULT_DSF_NODE_BUDGET,
+        "short_name": "DSF point budget / DSF予算",
+        "hint": "Advisory DSF point-pool budget used by the full-pipeline auto-reduction. It is a project safety threshold, not a hardware capability probe. / 全工程の自動削減に使うDSFポイントプールの目安です。ハードウェア能力の判定値ではありません。",
+    },
     "sea_texture_blur": {
         "type": float,
         "default": 0,
@@ -503,6 +510,7 @@ list_dsf_vars = [
     "cover_airports_with_highres",
     "cover_extent",
     "cover_zl",
+    "dsf_node_budget",
     "use_neural_upscale",
     "use_gpu_acceleration",
     "use_gpu_for_color_filters",
@@ -618,6 +626,7 @@ class Tile:
         )
         self.build_dir = FNAMES.build_dir(lat, lon, custom_build_dir)
         self.dem = None
+        self.last_dsf_metrics = None
         for var in list_tile_vars:
             if "module" in cfg_vars[var]:
                 module_name = cfg_vars[var]["module"]

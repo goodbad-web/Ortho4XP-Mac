@@ -5,6 +5,7 @@ from shapely import geometry, affinity
 from shapely import ops
 from rtree import index
 import O4_UI_Utils as UI
+from O4_DSF_Budget import stable_id_key
 import O4_Geo_Utils as GEO
 
 # Some functions further down rely not only on a vector structure but also on a
@@ -128,7 +129,7 @@ class Vector_Map:
         task = self.ebbox.intersection(
             self.bbox_from_node_ids(id0, id1), objects=True
         )  # which other edges to search for instersection
-        for hits in task:
+        for hits in sorted(task, key=lambda hit: stable_id_key(hit.id)):
             edge_id = hits.id
             edge_bbox = hits.bbox
             (id2, id3) = self.edges_dico[edge_id]
@@ -667,7 +668,7 @@ def split_polygon(input_pol, max_size, count=0):
 def MultiPolygon_to_Indexed_Polygons(multipol, merge_overlappings=True):
     def merge_pol(pol, id_pol):
         ids_to_merge = []
-        for polid in idx_pol.intersection(pol.bounds):
+        for polid in sorted(idx_pol.intersection(pol.bounds), key=stable_id_key):
             if pol.intersection(dico_pol[polid]).area:
                 ids_to_merge.append(polid)
         if not ids_to_merge:
@@ -840,8 +841,10 @@ def indexed_difference(idx_pol1, dico_pol1, idx_pol2, dico_pol2):
     idx_out = index.Index()
     dico_out = {}
     idnew = 0
-    for polid1, pol1 in dico_pol1.items():
-        for polid2 in idx_pol2.intersection(pol1.bounds):
+    for polid1, pol1 in sorted(dico_pol1.items(), key=lambda item: stable_id_key(item[0])):
+        for polid2 in sorted(
+            idx_pol2.intersection(pol1.bounds), key=stable_id_key
+        ):
             if pol1.intersects(dico_pol2[polid2]):
                 pol1 = pol1.difference(dico_pol2[polid2])
         if pol1.area:
@@ -1262,7 +1265,10 @@ def weighted_alt(node, alt_idx, alt_dico, dem):
     weights = 0
     (x, y) = (node[0] * scalx, node[1])
     pt = geometry.Point((x, y))
-    for idx in alt_idx.intersection((x - eps1, y - eps1, x + eps1, y + eps1)):
+    for idx in sorted(
+        alt_idx.intersection((x - eps1, y - eps1, x + eps1, y + eps1)),
+        key=stable_id_key,
+    ):
         (linestring, leastsquarefit, width) = alt_dico[idx]
         dist = pt.distance(linestring) * GEO.lat_to_m
         weight = numpy.exp(-dist / (2 * width))

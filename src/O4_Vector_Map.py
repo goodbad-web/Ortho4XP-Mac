@@ -12,13 +12,14 @@ import O4_Vector_Utils as VECT
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Airport_Utils as APT
+from O4_DSF_Budget import stable_id_key
 
 good_imagery_list = ()
 
 ################################################################################
 def build_poly_file(tile):
     if not UI.is_building_all:
-        UI.initialize_build_log(tile.build_dir)
+        UI.initialize_build_log(tile.build_dir, tile)
     try:
         return _build_poly_file(tile)
     finally:
@@ -399,7 +400,7 @@ def include_sea(vector_map, tile):
             "(multiple files).",
         )
         has_custom_files = False
-        for osm_file in os.listdir(custom_coastline_dir):
+        for osm_file in sorted(os.listdir(custom_coastline_dir), key=stable_id_key):
             UI.vprint(2, "      ", osm_file)
             if not sea_layer.update_dicosm(
                 os.path.join(custom_coastline_dir, osm_file),
@@ -548,7 +549,7 @@ def include_water(vector_map, tile):
             1, "    * User defined custom water data detected (multiple files)."
         )
         has_custom_files = False
-        for osm_file in os.listdir(custom_water_dir):
+        for osm_file in sorted(os.listdir(custom_water_dir), key=stable_id_key):
             UI.vprint(2, "      ", osm_file)
             if not water_layer.update_dicosm(
                 os.path.join(custom_water_dir, osm_file),
@@ -696,7 +697,7 @@ def include_patches(vector_map, tile):
     patch_dir = FNAMES.patch_dir(tile.lat, tile.lon)
     if not os.path.exists(patch_dir):
         return (geometry.MultiPolygon(), patches_list)
-    for pfile_name in os.listdir(patch_dir):
+    for pfile_name in sorted(os.listdir(patch_dir), key=stable_id_key):
         if pfile_name[-10:] != ".patch.osm":
             continue
         UI.vprint(1, "   Patching", pfile_name)
@@ -721,8 +722,8 @@ def include_patches(vector_map, tile):
         # waylist=list(set(dw).intersection(df['w']).intersection(dt['w']))+
         # list(set(dw).intersection(df['w']).difference(dt['w']))
         # HACK
-        waylist = tuple(df["w"].intersection(dt["w"])) + tuple(
-            df["w"].difference(dt["w"])
+        waylist = tuple(sorted(df["w"].intersection(dt["w"]), key=stable_id_key)) + tuple(
+            sorted(df["w"].difference(dt["w"]), key=stable_id_key)
         )
         for wayid in waylist:
             way = numpy.array(
@@ -877,12 +878,14 @@ def include_patches(vector_map, tile):
                 vector_map.insert_way(
                     numpy.hstack([way, alti_way]), "DUMMY", check=True
                 )
-    for pdir_name in os.listdir(patch_dir):
+    for pdir_name in sorted(os.listdir(patch_dir), key=stable_id_key):
         if not os.path.isdir(os.path.join(patch_dir, pdir_name)):
             continue
         UI.vprint(1, "   Including OBJ8 objects from", pdir_name)
         patches_list.append(pdir_name)
-        for pfile_name in os.listdir(os.path.join(patch_dir, pdir_name)):
+        for pfile_name in sorted(
+            os.listdir(os.path.join(patch_dir, pdir_name)), key=stable_id_key
+        ):
             pfile_namelong = os.path.join(patch_dir, pdir_name, pfile_name)
             try:
                 pfile = open(pfile_namelong, "r")

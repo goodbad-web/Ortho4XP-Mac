@@ -645,7 +645,17 @@ class Ortho4XP_GUI(tk.Tk):
     def tile_from_interface(self):
         try:
             (lat, lon) = self.get_lat_lon()
-            return CFG.Tile(lat, lon, str(self.custom_build_dir.get()))
+            tile = CFG.Tile(lat, lon, str(self.custom_build_dir.get()))
+            tile_cfg = os.path.join(
+                tile.build_dir,
+                "Ortho4XP_" + FNAMES.short_latlon(lat, lon) + ".cfg",
+            )
+            legacy_cfg = os.path.join(tile.build_dir, "Ortho4XP.cfg")
+            if os.path.isfile(tile_cfg):
+                tile.read_from_config(tile_cfg)
+            elif os.path.isfile(legacy_cfg):
+                tile.read_from_config(legacy_cfg)
+            return tile
         except:
             raise Exception
 

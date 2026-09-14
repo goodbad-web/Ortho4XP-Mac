@@ -13,6 +13,7 @@ import O4_Mesh_Utils as MESH
 import O4_Mask_Utils as MASK
 import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
+import O4_DSF_Budget as DSF_BUDGET
 from O4_Parallel_Utils import parallel_launch, parallel_join, multiprocessing_pool
 from PIL import Image
 
@@ -183,12 +184,12 @@ def download_textures(tile, download_queue, convert_queue):
     return 1
 
 ################################################################################
-def build_tile(tile):
+def build_tile(tile, persist_config=True):
     if not UI.is_building_all:
-        UI.initialize_build_log(tile.build_dir)
+        UI.initialize_build_log(tile.build_dir, tile)
     result = 0
     try:
-        result = _build_tile(tile)
+        result = _build_tile(tile, persist_config=persist_config)
         return result
     finally:
         # A DSF can be fully written before a later imagery/download stage
@@ -207,7 +208,7 @@ def build_tile(tile):
         UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
-def _build_tile(tile):
+def _build_tile(tile, persist_config=True):
     if UI.is_working:
         return 0
     UI.is_working = 1
@@ -231,7 +232,7 @@ def _build_tile(tile):
 
     timer = time.time()
 
-    if not tile.write_to_config():
+    if persist_config and not tile.write_to_config():
         UI.exit_message_and_bottom_line("ERROR: Could not save tile configuration.")
         return 0
 
@@ -734,30 +735,133 @@ def _build_tile(tile):
     return 1
 
 ################################################################################
-def build_all(tile):
+def _start_full_pipeline(tile, include_overlays):
     UI.is_building_all = True
-    UI.initialize_build_log(tile.build_dir)
+    UI.initialize_build_log(tile.build_dir, tile)
     try:
-        return _build_all(tile)
+        return _build_all(tile, include_overlays=include_overlays)
     finally:
         UI.is_building_all = False
         UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
 
-def _build_all(tile):
-    if not VMAP.build_poly_file(tile) or UI.red_flag:
-        UI.exit_message_and_bottom_line("")
+def build_all(tile):
+    return _start_full_pipeline(tile, include_overlays=True)
+
+
+def build_continuous(tile):
+    """Build all core stages with DSF-budget retries for the CLI path."""
+    return _start_full_pipeline(tile, include_overlays=False)
+
+
+def _run_pipeline_once(tile):
+    stages = (
+        ("vector data", VMAP.build_poly_file),
+        ("mesh", MESH.build_mesh),
+        ("water masks", MASK.build_masks),
+        ("imagery/DSF", lambda current_tile: build_tile(current_tile, persist_config=False)),
+    )
+    for stage_name, stage in stages:
+        if not stage(tile) or UI.red_flag:
+            UI.vprint(0, "ERROR: {} stage failed.".format(stage_name))
+            UI.exit_message_and_bottom_line("")
+            return 0
+    return 1
+
+
+def _snapshot_auto_reduce_settings(tile):
+    return {
+        "max_levelled_segs": int(tile.max_levelled_segs),
+        "water_simplification": float(tile.water_simplification),
+        "cover_zl": int(tile.cover_zl),
+        "curvature_tol": float(tile.curvature_tol),
+        "limit_tris": float(tile.limit_tris),
+    }
+
+
+def _apply_auto_reduce_attempt(tile, base_settings, attempt):
+    updates = DSF_BUDGET.retry_settings(
+        base_settings, attempt, int(tile.mesh_zl)
+    )
+    for name, value in updates.items():
+        setattr(tile, name, value)
+    return updates
+
+
+def _restore_auto_reduce_settings(tile, base_settings):
+    for name, value in base_settings.items():
+        setattr(tile, name, value)
+
+
+def _build_all(tile, include_overlays=True):
+    base_settings = _snapshot_auto_reduce_settings(tile)
+    budget = DSF_BUDGET.normalize_budget(
+        getattr(tile, "dsf_node_budget", DSF_BUDGET.DEFAULT_DSF_NODE_BUDGET)
+    )
+    final_attempt = 0
+
+    for attempt in range(DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS + 1):
+        final_attempt = attempt
+        if attempt:
+            updates = _apply_auto_reduce_attempt(tile, base_settings, attempt)
+            UI.vprint(
+                0,
+                "[Auto-Reduce] Full pipeline attempt {}/{}; "
+                "updated settings: {}".format(
+                    attempt,
+                    DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS,
+                    ", ".join(
+                        "{}={}".format(name, value)
+                        for name, value in updates.items()
+                    ),
+                ),
+            )
+        else:
+            UI.vprint(0, "[Auto-Reduce] Full pipeline baseline attempt.")
+
+        if not _run_pipeline_once(tile):
+            _restore_auto_reduce_settings(tile, base_settings)
+            return 0
+
+        metrics = getattr(tile, "last_dsf_metrics", None)
+        if not metrics or not metrics.get("structurally_valid", False):
+            UI.vprint(0, "ERROR: DSF metrics were not available after a successful build.")
+            _restore_auto_reduce_settings(tile, base_settings)
+            return 0
+
+        UI.vprint(
+            0,
+            "[Auto-Reduce] Attempt {} produced {:,} DSF point instances "
+            "(budget {:,}).".format(
+                attempt,
+                metrics["point_count"],
+                budget,
+            ),
+        )
+        if not metrics.get("budget_exceeded", False):
+            break
+        if attempt >= DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS:
+            UI.vprint(
+                0,
+                "WARNING: DSF point budget remains exceeded after {} "
+                "automatic reductions; keeping the structurally valid final build.".format(
+                    DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS
+                ),
+            )
+            break
+        UI.vprint(0, "[Auto-Reduce] Rebuilding all stages to reduce DSF density.")
+
+    if not tile.write_to_config():
+        UI.vprint(0, "ERROR: Could not save final tile configuration.")
         return 0
-    if not MESH.build_mesh(tile) or UI.red_flag:
-        UI.exit_message_and_bottom_line("")
-        return 0
-    if not MASK.build_masks(tile) or UI.red_flag:
-        UI.exit_message_and_bottom_line("")
-        return 0
-    if not build_tile(tile) or UI.red_flag:
-        UI.exit_message_and_bottom_line("")
-        return 0
-    if getattr(tile, 'build_overlays_in_all_in_one', False):
+    UI.vprint(
+        1,
+        "[Auto-Reduce] Saved settings from final full-pipeline attempt {} to tile config.".format(
+            final_attempt
+        ),
+    )
+
+    if include_overlays and getattr(tile, "build_overlays_in_all_in_one", False):
         UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
         if not OVL.build_overlay(tile.lat, tile.lon) or UI.red_flag:
             UI.exit_message_and_bottom_line("")

@@ -100,13 +100,29 @@ def lvprint(min_verbosity, *args):
             gui.status_queue.put(msg)
 
 
-def get_config_summary():
+def get_config_summary(tile=None):
     try:
         import O4_Config_Utils as CFG
         import O4_OSM_Utils as OSM
         import O4_Imagery_Utils as IMG
         import O4_Tile_Utils as TILE
         import O4_Overlay_Utils as OVL
+
+        tile_vars = set(getattr(CFG, "list_tile_vars", ()))
+
+        def global_value(var, info):
+            module_name = info.get("module")
+            if module_name == "UI":
+                return getattr(sys.modules.get("O4_UI_Utils"), var, None)
+            if module_name == "OSM":
+                return getattr(OSM, var, None)
+            if module_name == "IMG":
+                return getattr(IMG, var, None)
+            if module_name == "TILE":
+                return getattr(TILE, var, None)
+            if module_name == "OVL":
+                return getattr(OVL, var, None)
+            return getattr(CFG, var, None)
         
         summary = [
             "==================================================",
@@ -117,24 +133,16 @@ def get_config_summary():
         sorted_vars = sorted(CFG.cfg_vars.keys())
         for var in sorted_vars:
             info = CFG.cfg_vars[var]
-            module_name = info.get("module")
-            val = None
-            if module_name == "UI":
-                val = getattr(sys.modules.get("O4_UI_Utils"), var, None)
-            elif module_name == "OSM":
-                val = getattr(OSM, var, None)
-            elif module_name == "IMG":
-                val = getattr(IMG, var, None)
-            elif module_name == "TILE":
-                val = getattr(TILE, var, None)
-            elif module_name == "OVL":
-                val = getattr(OVL, var, None)
+            global_val = global_value(var, info)
+            if global_val is None:
+                global_val = info.get("default")
+            if tile is not None and var in tile_vars and hasattr(tile, var):
+                summary.append(
+                    f"  {var:<30} : {getattr(tile, var)} "
+                    f"[tile effective; global={global_val}]"
+                )
             else:
-                val = getattr(CFG, var, None)
-            
-            if val is None:
-                val = info.get("default")
-            summary.append(f"  {var:<30} : {val}")
+                summary.append(f"  {var:<30} : {global_val} [global]")
             
         summary.append("==================================================\n")
         return "\n".join(summary)
@@ -143,12 +151,12 @@ def get_config_summary():
 
 
 ################################################################################
-def initialize_build_log(build_dir):
+def initialize_build_log(build_dir, tile=None):
     global build_log_buffer
     build_log_buffer = []
     if not write_build_log:
         return
-    build_log_buffer.append(get_config_summary())
+    build_log_buffer.append(get_config_summary(tile))
     try:
         os.makedirs(build_dir, exist_ok=True)
         log_path = os.path.join(build_dir, "Ortho4XP_build.log")

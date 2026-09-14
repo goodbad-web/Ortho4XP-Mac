@@ -17,6 +17,7 @@ import O4_UI_Utils as UI
 import O4_Overlay_Utils as OVL
 import O4_Mesh_Utils as MESH
 import O4_Bathymetry as BATHY
+import O4_DSF_Budget as DSF_BUDGET
 
 quad_init_level = 3
 quad_capacity_high = 50000
@@ -263,7 +264,7 @@ def zone_list_to_ortho_dico(tile):
             )
     if tile.cover_airports_with_highres == "Existing":
         # what we find in the texture folder of the existing tile
-        for f in os.listdir(os.path.join(tile.build_dir, "textures")):
+        for f in sorted(os.listdir(os.path.join(tile.build_dir, "textures"))):
             if f[-4:] != ".dds":
                 continue
             items = f.split("_")
@@ -574,6 +575,8 @@ def build_dsf(tile, download_queue):
 
 
 def _build_dsf(tile, download_queue):
+
+    tile.last_dsf_metrics = None
 
     
     dico_customzl = zone_list_to_ortho_dico(tile)
@@ -1199,16 +1202,56 @@ def _build_dsf(tile, download_queue):
     
     download_queue.put("quit")
 
+    dsf_metrics = DSF_BUDGET.summarize_dsf_pools(
+        len_textured_nodes,
+        dsf_pool_length,
+        dsf_pool_plane,
+        dsf_pools,
+        pool_count=dsf_pool_nbr,
+    )
+    command_errors = DSF_BUDGET.validate_dsf_commands(
+        textured_tris, dsf_pool_length
+    )
+    if command_errors:
+        dsf_metrics["structurally_valid"] = False
+        dsf_metrics["structural_errors"] = (
+            *dsf_metrics["structural_errors"],
+            *command_errors,
+        )
+    dsf_budget = DSF_BUDGET.normalize_budget(
+        getattr(tile, "dsf_node_budget", DSF_BUDGET.DEFAULT_DSF_NODE_BUDGET)
+    )
+    dsf_metrics["budget"] = dsf_budget
+    dsf_metrics["budget_exceeded"] = dsf_metrics["point_count"] > dsf_budget
+
     UI.vprint(1, "-> Encoding of the DSF file")
-    UI.vprint(1, "     Final nbr of nodes: " + str(len_textured_nodes))
-    if len_textured_nodes > 1000000:
+    UI.vprint(1, "     Final DSF point instances: " + str(dsf_metrics["point_count"]))
+    UI.vprint(
+        1,
+        "     DSF point pools: {} active / {} total; largest pool: {} points".format(
+            dsf_metrics["active_pool_count"],
+            dsf_metrics["pool_count"],
+            dsf_metrics["max_pool_points"],
+        ),
+    )
+    if not dsf_metrics["structurally_valid"]:
+        UI.vprint(0, "ERROR: DSF point-pool structural validation failed.")
+        for reason in dsf_metrics["structural_errors"]:
+            UI.vprint(0, "       " + reason)
+        return 0
+    UI.vprint(1, "     DSF point-pool structure: valid")
+    if dsf_metrics["budget_exceeded"]:
         UI.vprint(
             0,
-            "\nWARNING: Final DSF node count ({:,}) exceeds the Metal absolute limit of 1,000,000!".format(len_textured_nodes)
+            "WARNING: Final DSF point instances ({:,}) exceed the advisory "
+            "point-pool budget of {:,}.".format(
+                dsf_metrics["point_count"], dsf_budget
+            ),
         )
         UI.vprint(
             0,
-            "         This tile may fail to load or crash in X-Plane 12 with Metal API.\n"
+            "         This is an advisory project threshold; full-pipeline "
+            "auto-reduction may retry the build.",
         )
     UI.vprint(2, "     Final nbr of cross pool tris: " + str(total_cross_pool))
 
@@ -1349,11 +1392,13 @@ def _build_dsf(tile, download_queue):
     # Commands atom
     # we first compute its size :
     size_of_cmds_atom = 8 + len(bCMDS)
-    for terrain_idx in textured_tris:
+    for terrain_idx in sorted(textured_tris, key=DSF_BUDGET.stable_id_key):
         if len(textured_tris[terrain_idx]) == 0:
             continue
         size_of_cmds_atom += 3
-        for idx_dsfpool in textured_tris[terrain_idx]:
+        for idx_dsfpool in sorted(
+            textured_tris[terrain_idx], key=DSF_BUDGET.stable_id_key
+        ):
             if idx_dsfpool != "cross-pool":
                 size_of_cmds_atom += 13 + 2 * (
                     len(textured_tris[terrain_idx][idx_dsfpool])
@@ -1370,7 +1415,7 @@ def _build_dsf(tile, download_queue):
     f.write(b"SDMC")  # CMDS header
     f.write(struct.pack("<I", size_of_cmds_atom))  # CMDS length
     f.write(bCMDS)
-    for terrain_idx in textured_tris:
+    for terrain_idx in sorted(textured_tris, key=DSF_BUDGET.stable_id_key):
         if len(textured_tris[terrain_idx]) == 0:
             continue
         # print("terrain_idx = "+str(terrain_idx))
@@ -1380,7 +1425,9 @@ def _build_dsf(tile, download_queue):
             1 if terrain_idx not in overlay_terrains else 2
         )  # physical or overlay
         lod = -1 if flag == 1 else tile.overlay_lod
-        for idx_dsfpool in textured_tris[terrain_idx]:
+        for idx_dsfpool in sorted(
+            textured_tris[terrain_idx], key=DSF_BUDGET.stable_id_key
+        ):
             if idx_dsfpool != "cross-pool":
                 f.write(struct.pack("<B", 1))  # POOL SELECT
                 f.write(
@@ -1475,6 +1522,7 @@ def _build_dsf(tile, download_queue):
         "bytes",
         "(" + UI.human_print(size_of_dsf) + ")",
     )
+    tile.last_dsf_metrics = dsf_metrics
     return 1
 
 

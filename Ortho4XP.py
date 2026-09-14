@@ -113,16 +113,9 @@ if __name__ == '__main__':
                     print("ERROR:", e)
                     print(cmd_line); sys.exit(2)
             try:
-                stages = (
-                    ("vector data", VMAP.build_poly_file),
-                    ("mesh", MESH.build_mesh),
-                    ("water masks", MASK.build_masks),
-                    ("imagery/DSF", TILE.build_tile),
-                )
-                for stage_name, stage in stages:
-                    if not stage(tile) or UI.red_flag:
-                        print(f"ERROR: {stage_name} stage failed.")
-                        sys.exit(1)
+                if not TILE.build_continuous(tile) or UI.red_flag:
+                    print("ERROR: continuous tile build failed.")
+                    sys.exit(1)
                 print("Bon vol!")
             except Exception as e:
                 import traceback
