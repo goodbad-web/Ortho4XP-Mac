@@ -87,11 +87,12 @@ file:
   --output-dir /tmp/ortho4xp-building-textures
 ```
 
-Before the first run, replace `REPLACE_WITH_A_LOCAL_SDXL_CHECKPOINT.safetensors`
-in the workflow with a checkpoint available to the local ComfyUI instance.
-Use `--dry-run` to validate the four expanded workflows without connecting to
-ComfyUI. The generated files are `jp_house.png`, `jp_apartment.png`,
-`jp_commercial.png`, and `jp_industrial.png`.
+The checked-in workflow targets `SDXL/sd_xl_turbo_1.0_fp16.safetensors` and
+uses four steps with CFG 1.0. If the file is stored under another ComfyUI
+checkpoint path, change only `2.inputs.ckpt_name`. Use `--dry-run` to validate
+the four expanded workflows without connecting to ComfyUI. The generated
+files are `jp_house.png`, `jp_apartment.png`, `jp_commercial.png`, and
+`jp_industrial.png`.
 
 Run the asset generator inside Blender. It creates 40 reusable OBJ8 assets,
 copies the category textures to each variant, writes `asset-manifest.json`,

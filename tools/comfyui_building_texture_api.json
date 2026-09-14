@@ -2,7 +2,7 @@
   "2": {
     "class_type": "CheckpointLoaderSimple",
     "inputs": {
-      "ckpt_name": "REPLACE_WITH_A_LOCAL_SDXL_CHECKPOINT.safetensors"
+      "ckpt_name": "SDXL/sd_xl_turbo_1.0_fp16.safetensors"
     }
   },
   "3": {
@@ -37,8 +37,8 @@
     "class_type": "KSampler",
     "inputs": {
       "seed": 2401,
-      "steps": 24,
-      "cfg": 6.5,
+      "steps": 4,
+      "cfg": 1.0,
       "sampler_name": "euler",
       "scheduler": "normal",
       "denoise": 1.0,
