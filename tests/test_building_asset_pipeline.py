@@ -32,6 +32,18 @@ def test_blender_asset_mesh_has_roof_and_valid_obj8():
     assert "TRIS 0 " in text
 
 
+def test_box_uses_face_specific_uv_regions_for_facade_texture():
+    mesh = blender_assets.MeshData()
+    blender_assets._box(mesh, 10.0, 6.0, 8.0)
+
+    assert mesh.face_uvs[1] == blender_assets._LEFT_SIDE_UV
+    assert mesh.face_uvs[2] == blender_assets._RIGHT_SIDE_UV
+    assert mesh.face_uvs[3] == blender_assets._FRONT_UV
+    assert mesh.face_uvs[4] == blender_assets._BACK_UV
+    assert mesh.face_uvs[5] == blender_assets._ROOF_UV
+    assert mesh.face_uvs[3] != mesh.face_uvs[1]
+
+
 def test_blender_variant_manifest_covers_categories_and_size_height_buckets():
     records = blender_assets._variant_records()
 

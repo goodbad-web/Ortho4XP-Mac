@@ -52,6 +52,16 @@ BASE_DIMENSIONS = {
     "industrial": (30.0, 8.0, 24.0),
 }
 
+# The ComfyUI inputs are facade-oriented images rather than six-sided texture
+# atlases. Keep the front readable, and use narrower, less repetitive strips
+# for the other faces. UV V=1 is the top of the source image.
+_FRONT_UV = ((0.02, 0.06), (0.02, 0.94), (0.98, 0.94), (0.98, 0.06))
+_LEFT_SIDE_UV = ((0.10, 0.08), (0.10, 0.92), (0.30, 0.92), (0.30, 0.08))
+_RIGHT_SIDE_UV = ((0.70, 0.08), (0.70, 0.92), (0.90, 0.92), (0.90, 0.08))
+_BACK_UV = ((0.30, 0.08), (0.30, 0.92), (0.70, 0.92), (0.70, 0.08))
+_ROOF_UV = ((0.12, 0.76), (0.12, 0.96), (0.88, 0.96), (0.88, 0.76))
+_BOTTOM_UV = ((0.0, 0.0), (0.0, 0.08), (1.0, 0.08), (1.0, 0.0))
+
 
 @dataclass
 class MeshData:
@@ -105,14 +115,13 @@ def _box(
         "ur": (x + hx, upper, z + hz),
         "ul": (x - hx, upper, z + hz),
     }
-    uv = ((0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0))
-    mesh.add_face((corners["bl"], corners["br"], corners["fr"], corners["fl"]), uv)
-    mesh.add_face((corners["bl"], corners["fl"], corners["ul"], corners["tl"]), uv)
-    mesh.add_face((corners["br"], corners["tr"], corners["ur"], corners["fr"]), uv)
-    mesh.add_face((corners["fr"], corners["ur"], corners["ul"], corners["fl"]), uv)
-    mesh.add_face((corners["bl"], corners["tl"], corners["tr"], corners["br"]), uv)
+    mesh.add_face((corners["bl"], corners["br"], corners["fr"], corners["fl"]), _BOTTOM_UV)
+    mesh.add_face((corners["bl"], corners["fl"], corners["ul"], corners["tl"]), _LEFT_SIDE_UV)
+    mesh.add_face((corners["br"], corners["tr"], corners["ur"], corners["fr"]), _RIGHT_SIDE_UV)
+    mesh.add_face((corners["fr"], corners["ur"], corners["ul"], corners["fl"]), _FRONT_UV)
+    mesh.add_face((corners["bl"], corners["tl"], corners["tr"], corners["br"]), _BACK_UV)
     if top:
-        mesh.add_face((corners["ul"], corners["ur"], corners["tr"], corners["tl"]), uv)
+        mesh.add_face((corners["ul"], corners["ur"], corners["tr"], corners["tl"]), _ROOF_UV)
 
 
 def _gabled_roof(mesh: MeshData, width: float, eave_y: float, depth: float, roof_height: float) -> None:
@@ -125,11 +134,11 @@ def _gabled_roof(mesh: MeshData, width: float, eave_y: float, depth: float, roof
     back_left = (-hx, eave_y, hz)
     front_ridge_left = (-hx, ridge_y, 0.0)
     front_ridge_right = (hx, ridge_y, 0.0)
-    uv = ((0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0))
-    mesh.add_face((front_left, front_ridge_left, front_ridge_right, front_right), uv)
-    mesh.add_face((front_ridge_left, back_left, back_right, front_ridge_right), uv)
-    mesh.add_face((front_left, back_left, front_ridge_left), ((0.0, 0.0), (1.0, 0.0), (0.5, 1.0)))
-    mesh.add_face((front_right, front_ridge_right, back_right), ((0.0, 0.0), (0.5, 1.0), (1.0, 0.0)))
+    roof_uv = _ROOF_UV
+    mesh.add_face((front_left, front_ridge_left, front_ridge_right, front_right), roof_uv)
+    mesh.add_face((front_ridge_left, back_left, back_right, front_ridge_right), roof_uv)
+    mesh.add_face((front_left, back_left, front_ridge_left), ((0.12, 0.76), (0.88, 0.76), (0.5, 0.96)))
+    mesh.add_face((front_right, front_ridge_right, back_right), ((0.12, 0.76), (0.5, 0.96), (0.88, 0.76)))
 
 
 def _detail_level(height_bucket: str) -> int:
@@ -349,7 +358,7 @@ def generate_pack(output: Path, texture_root: Path | None, allow_placeholder: bo
         "schema_version": 1,
         "generator": "tools/blender_generate_assets.py",
         "geometry_source": "blender-procedural",
-        "texture_policy": "ComfyUI category texture copied to each reusable variant",
+        "texture_policy": "ComfyUI facade texture with front, side, back, and roof UV regions",
         "assets": exported,
     }
     (output / "asset-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

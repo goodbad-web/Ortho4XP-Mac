@@ -109,6 +109,10 @@ The output directory can then be passed unchanged as `--asset-root` to
 `xp_buildings.py`. Geometry is generated from a small number of families and
 the existing footprint/height classifier selects a variant, so this does not
 create a unique heavy mesh or a unique 4K texture for every OSM building.
+The OBJ8 UVs keep the front facade on the main image area and use narrower
+vertical regions for the sides/back plus an upper band for roofs. This avoids
+repeating the whole front photograph on every face; separate side and roof
+generation can be added later when a fully seamless material is required.
 The generator also has `--obj8-only` for environments that already have the
 texture files but do not have Blender installed; that path does not claim to
 produce a `.blend` file.
