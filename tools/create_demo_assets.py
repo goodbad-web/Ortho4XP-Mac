@@ -9,12 +9,31 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 
-ASSETS = {
+BASE_ASSETS = {
     "jp_house_a.obj": ((9.0, 6.0, 6.0), (184, 150, 115)),
     "jp_apartment_a.obj": ((18.0, 10.0, 18.0), (150, 158, 170)),
     "jp_commercial_a.obj": ((22.0, 7.0, 16.0), (178, 178, 160)),
     "jp_industrial_a.obj": ((30.0, 8.0, 24.0), (125, 135, 142)),
 }
+
+VARIANT_STEMS = {
+    "house": "house",
+    "apartments": "apartment",
+    "commercial": "commercial",
+    "industrial": "industrial",
+}
+VARIANT_COLORS = {
+    "house": (184, 150, 115),
+    "apartments": (150, 158, 170),
+    "commercial": (178, 178, 160),
+    "industrial": (125, 135, 142),
+}
+VARIANT_FOOTPRINTS = {
+    "small": (8.0, 6.0),
+    "medium": (16.0, 10.0),
+    "large": (28.0, 18.0),
+}
+VARIANT_HEIGHTS = {"low": 6.0, "mid": 11.0, "high": 18.0}
 
 
 def _texture(path: Path, color: tuple[int, int, int]) -> None:
@@ -57,11 +76,18 @@ def main() -> int:
     parser.add_argument("output", type=Path)
     output = parser.parse_args().output
     output.mkdir(parents=True, exist_ok=True)
-    for obj_name, (dimensions, color) in ASSETS.items():
+    assets = dict(BASE_ASSETS)
+    for category, stem in VARIANT_STEMS.items():
+        for size, (width, depth) in VARIANT_FOOTPRINTS.items():
+            for height_name, height in VARIANT_HEIGHTS.items():
+                assets[f"jp_{stem}_{size}_{height_name}.obj"] = (
+                    (width, height, depth), VARIANT_COLORS[category]
+                )
+    for obj_name, (dimensions, color) in assets.items():
         texture_name = obj_name.replace(".obj", ".png")
         _texture(output / texture_name, color)
         _obj(output / obj_name, dimensions, texture_name)
-    print(f"created {len(ASSETS)} demo assets in {output}")
+    print(f"created {len(assets)} demo assets in {output}")
     return 0
 
 

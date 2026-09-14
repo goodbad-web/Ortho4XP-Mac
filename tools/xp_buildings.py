@@ -25,6 +25,19 @@ DEFAULT_ASSETS = {
     "industrial": "objects/jp_industrial_a.obj",
 }
 
+VARIANT_STEMS = {
+    "house": "house",
+    "apartments": "apartment",
+    "commercial": "commercial",
+    "industrial": "industrial",
+}
+SIZE_BUCKETS = ("small", "medium", "large")
+HEIGHT_BUCKETS = ("low", "mid", "high")
+
+
+def variant_asset(category: str, size: str, height: str) -> str:
+    return f"objects/jp_{VARIANT_STEMS[category]}_{size}_{height}.obj"
+
 
 @dataclass(frozen=True)
 class Building:
@@ -197,6 +210,32 @@ def _asset_for(category: str, assets: dict[str, str]) -> str:
     return assets.get(category, DEFAULT_ASSETS[category])
 
 
+def _size_bucket(building: Building) -> str:
+    longest = max(building.width_m, building.depth_m)
+    if longest < 10:
+        return "small"
+    if longest < 24:
+        return "medium"
+    return "large"
+
+
+def _height_bucket(building: Building) -> str:
+    if building.height_m <= 7:
+        return "low"
+    if building.height_m <= 14:
+        return "mid"
+    return "high"
+
+
+def asset_for_building(
+    building: Building, assets: dict[str, str], available_assets: set[str] | None = None
+) -> str:
+    variant = variant_asset(building.category, _size_bucket(building), _height_bucket(building))
+    if available_assets is None or variant in available_assets:
+        return variant
+    return _asset_for(building.category, assets)
+
+
 def write_library(path: Path, tile_lat: int, tile_lon: int, assets: dict[str, str], mode: str) -> None:
     lines = [
         "A", "1200", "LIBRARY", "",
@@ -222,8 +261,9 @@ def write_text_dsf(
     buildings: list[Building],
     assets: dict[str, str],
     exclude_rect: tuple[int, int, int, int] | None,
+    available_assets: set[str] | None = None,
 ) -> None:
-    definitions = sorted({_asset_for(building.category, assets) for building in buildings})
+    definitions = sorted({asset_for_building(building, assets, available_assets) for building in buildings})
     definition_index = {asset: index for index, asset in enumerate(definitions)}
     lines = [
         "PROPERTY sim/planet earth", "PROPERTY sim/overlay 1",
@@ -235,7 +275,7 @@ def write_text_dsf(
         lines.append(f"PROPERTY sim/exclude_objects {west}/{south}/{east}/{north}")
     lines.extend(f"OBJECT_DEF {asset}" for asset in definitions)
     for building in buildings:
-        asset = _asset_for(building.category, assets)
+        asset = asset_for_building(building, assets, available_assets)
         lines.append(
             f"OBJECT {definition_index[asset]} {building.lon:.7f} {building.lat:.7f} {building.heading:.2f}"
         )
@@ -246,6 +286,12 @@ def _convert_dsftool(dsftool: Path, text_dsf: Path, binary_dsf: Path) -> None:
     result = subprocess.run([str(dsftool), "-text2dsf", str(text_dsf), str(binary_dsf)], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"DSFTool failed: {result.stdout}\n{result.stderr}")
+
+
+def definitions_for_report(
+    buildings: list[Building], assets: dict[str, str], available_assets: set[str] | None
+) -> set[str]:
+    return {asset_for_building(building, assets, available_assets) for building in buildings}
 
 
 def build_package(
@@ -270,8 +316,11 @@ def build_package(
     else:
         missing_assets = [str(output / relative_path) for relative_path in sorted(set(assets.values()))]
     write_library(output / "library.txt", tile_lat, tile_lon, assets, mode)
+    available_assets = {
+        str(path.relative_to(output)) for path in (output / "objects").rglob("*.obj")
+    }
     text_dsf = earth_dir / f"{tile_lat:+03d}{tile_lon:+04d}.txt"
-    write_text_dsf(text_dsf, tile_lat, tile_lon, buildings, assets, exclude_rect)
+    write_text_dsf(text_dsf, tile_lat, tile_lon, buildings, assets, exclude_rect, available_assets or None)
     if dsftool:
         _convert_dsftool(dsftool, text_dsf, text_dsf.with_suffix(".dsf"))
         text_dsf.unlink()
@@ -281,7 +330,11 @@ def build_package(
         "categories": {category: sum(item.category == category for item in buildings) for category in sorted({item.category for item in buildings})},
         "height_source_policy": "height, building:levels, category default",
         "exclusion": "explicit rectangle" if exclude_rect else "none; compare for duplicate buildings",
-        "missing_assets": missing_assets,
+        "missing_assets": [
+            str(output / asset)
+            for asset in sorted(set(definitions_for_report(buildings, assets, available_assets or None)))
+            if not (output / asset).is_file()
+        ],
     }
     (output / "generation-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 

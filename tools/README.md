@@ -43,6 +43,11 @@ For a display-path smoke test, create simple self-owned assets first:
 files. The entire directory is copied into the generated package's `objects/`
 directory; no files are copied from Japan Pro or X-World.
 
+When the asset directory comes from `create_demo_assets.py`, the DSF selects a
+small/medium/large and low/mid/high variant according to each footprint's
+estimated dimensions. If a custom asset directory only contains the four base
+OBJ files, the generator falls back to those base files.
+
 The generator does not copy Japan Pro or X-World files. `--mode extend` mixes
 with lower-priority libraries; the default `replace` mode uses `EXPORT` for
 the selected tile region.

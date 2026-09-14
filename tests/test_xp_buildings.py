@@ -44,3 +44,19 @@ def test_load_geojson_and_write_package(tmp_path):
     assert "OBJECT 0" in dsf
     report = json.loads((output / "generation-report.json").read_text(encoding="utf-8"))
     assert report["building_count"] == 1
+
+
+def test_asset_variant_tracks_building_size_and_height():
+    polygon = xp.Polygon([(0, 0), (30, 0), (30, 20), (0, 20)])
+    building = xp.Building(
+        polygon=polygon,
+        lon=133.5,
+        lat=34.5,
+        width_m=30,
+        depth_m=20,
+        heading=0,
+        height_m=18,
+        category="house",
+        source_id="test",
+    )
+    assert xp.asset_for_building(building, xp.DEFAULT_ASSETS).endswith("jp_house_large_high.obj")
