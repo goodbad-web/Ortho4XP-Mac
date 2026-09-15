@@ -85,3 +85,15 @@ def test_rejects_nonfinite_scale(tmp_path):
 
     with pytest.raises(FP8SRPackError, match="scale"):
         validate_pack(pack)
+
+
+def test_rejects_nonfinite_raw_fp16_weight(tmp_path):
+    pack = create_fixture(tmp_path / "fixture", "Float16")
+    weights_path = pack / "conv0.f16w"
+    weights = bytearray(weights_path.read_bytes())
+    # conv0's center feature is 12; 0x7c00 is FP16 +infinity.
+    weights[12 * 128 : 12 * 128 + 2] = b"\x00\x7c"
+    weights_path.write_bytes(weights)
+
+    with pytest.raises(FP8SRPackError, match="non-finite"):
+        validate_pack(pack)

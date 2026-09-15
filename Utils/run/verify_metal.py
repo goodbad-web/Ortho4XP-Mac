@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
 import shlex
 import shutil
 import struct
@@ -67,6 +69,36 @@ def build_coreml_reference_helper(artifact_dir: Path) -> tuple[Path | None, str]
     if result.returncode != 0 or not helper.is_file():
         return None, (result.stdout or "").strip()
     return helper, (result.stdout or "").strip()
+
+
+def run_coreml_reference(
+    model: Path,
+    source: Path,
+    output: Path,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Run the optional Core ML reference model without entering normal runtime."""
+    report: dict[str, Any] = {"model": str(model), "output": str(output)}
+    if not model.exists():
+        report["status"] = "FAIL(model_missing)"
+        report["diagnostic"] = f"model does not exist: {model}"
+        return report
+    helper, compile_detail = build_coreml_reference_helper(artifact_dir)
+    if helper is None:
+        report["status"] = "FAIL(compile)"
+        report["diagnostic"] = compile_detail
+        return report
+    result = subprocess.run(
+        [str(helper), str(model), str(source), str(output)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    report["exit"] = result.returncode
+    report["diagnostic"] = (result.stdout or "").strip()
+    report["status"] = "PASS" if result.returncode == 0 and output.is_file() else "FAIL(runtime)"
+    return report
 
 
 def parse_probe(probe: Path) -> tuple[bool, str, bool]:
@@ -226,6 +258,159 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
+QUALITY_PSNR_DROP_DB = 0.25
+QUALITY_ERROR_INCREASE_RATIO = 0.05
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pack_record_metadata(pack: Path) -> dict[str, Any]:
+    manifest = pack / "manifest.json"
+    metadata: dict[str, Any] = {"pack": str(pack), "manifest_sha256": None}
+    if manifest.is_file():
+        metadata["manifest_sha256"] = sha256_file(manifest)
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest_data = {}
+        metadata["dtype"] = manifest_data.get("weight_dtype")
+        metadata["pack_version"] = manifest_data.get("version")
+    return metadata
+
+
+def precision_quality_gate(
+    candidate_quality: dict[str, Any], baseline_quality: dict[str, Any]
+) -> dict[str, Any]:
+    candidate_psnr = float(candidate_quality["psnr_db"])
+    baseline_psnr = float(baseline_quality["psnr_db"])
+    candidate_mae = float(candidate_quality["mae"])
+    baseline_mae = float(baseline_quality["mae"])
+    candidate_rmse = float(candidate_quality["rmse"])
+    baseline_rmse = float(baseline_quality["rmse"])
+    psnr_limit = baseline_psnr - QUALITY_PSNR_DROP_DB
+    if math.isinf(baseline_psnr):
+        psnr_pass = math.isinf(candidate_psnr)
+    else:
+        psnr_pass = candidate_psnr >= psnr_limit
+    mae_limit = baseline_mae * (1.0 + QUALITY_ERROR_INCREASE_RATIO)
+    rmse_limit = baseline_rmse * (1.0 + QUALITY_ERROR_INCREASE_RATIO)
+    mae_pass = candidate_mae <= mae_limit if baseline_mae else candidate_mae == 0.0
+    rmse_pass = candidate_rmse <= rmse_limit if baseline_rmse else candidate_rmse == 0.0
+    return {
+        "status": "PASS" if psnr_pass and mae_pass and rmse_pass else "FAIL",
+        "psnr_drop_limit_db": QUALITY_PSNR_DROP_DB,
+        "error_increase_limit_ratio": QUALITY_ERROR_INCREASE_RATIO,
+        "baseline": baseline_quality,
+        "candidate": candidate_quality,
+        "psnr_limit_db": psnr_limit,
+        "mae_limit": mae_limit,
+        "rmse_limit": rmse_limit,
+        "checks": {
+            "psnr": psnr_pass,
+            "mae": mae_pass,
+            "rmse": rmse_pass,
+        },
+    }
+
+
+def execution_record(
+    *,
+    backend: str,
+    role: str,
+    dtype: str | None = None,
+    status: str,
+    requested_backend: str | None = None,
+    effective_backend: str | None = None,
+    source: Path | None = None,
+    output: Path | None = None,
+    result: dict[str, Any] | None = None,
+    fallback_reason: str | None = None,
+    gpu_tools: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "backend": backend,
+        "role": role,
+        "dtype": dtype,
+        "requested_backend": requested_backend or backend,
+        "effective_backend": effective_backend or backend,
+        "status": status,
+        "fallback_reason": fallback_reason,
+        "host": platform.machine(),
+        "os": platform.platform(),
+    }
+    if source is not None:
+        record["input"] = str(source)
+        try:
+            from PIL import Image
+
+            with Image.open(source) as image:
+                record["input_size"] = list(image.size)
+        except Exception:
+            pass
+    if output is not None:
+        record["output"] = str(output)
+        try:
+            from PIL import Image
+
+            with Image.open(output) as image:
+                record["output_size"] = list(image.size)
+        except Exception:
+            pass
+    if result:
+        for key in ("pack", "manifest_sha256", "pack_version"):
+            if key in result:
+                record[key] = result[key]
+        if "timing_ms" in result:
+            record["timing_ms"] = result["timing_ms"]
+        if "quality" in result:
+            record["quality"] = result["quality"]
+        if "gate" in result:
+            record["gate"] = result["gate"]
+        if "run_exit" in result:
+            record["exit_code"] = result["run_exit"]
+        elif "warmup_exit" in result:
+            record["exit_code"] = result["warmup_exit"]
+    if gpu_tools is not None:
+        record["gpu_tools"] = gpu_tools
+        evidence_paths: list[str] = []
+        capture = gpu_tools.get("capture", {})
+        if capture.get("path"):
+            evidence_paths.append(str(capture["path"]))
+        debug = gpu_tools.get("debug", {})
+        if debug.get("path"):
+            evidence_paths.append(str(debug["path"]))
+        for key in ("traces", "overviews"):
+            evidence_paths.extend(
+                str(path)
+                for path in gpu_tools.get("metalperftrace", {}).get(key, [])
+            )
+        record["gpu_evidence_paths"] = evidence_paths
+        record["tensorops_dispatch_observed"] = bool(
+            gpu_tools.get("tensorops_dispatch_observed", False)
+        )
+        record["neural_accelerator_confirmed"] = False
+    if "exit_code" not in record:
+        record["exit_code"] = 0 if status.startswith("PASS") else None
+    return record
+
+
+def write_execution_records(path: Path | None, records: list[dict[str, Any]]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def compare_upscale_backend(
     helper: Path,
     backend: str,
@@ -235,7 +420,7 @@ def compare_upscale_backend(
     runs: int,
 ) -> dict[str, Any]:
     command_name = (
-        "--lanczos-upscale" if backend == "lanczos" else "--metalfx-spatial-upscale"
+        "--ci-lanczos-upscale" if backend == "ci_lanczos" else "--metalfx-spatial-upscale"
     )
     warmup_output = output.with_name(output.stem + "_warmup.png")
     warmup = subprocess.run(
@@ -305,7 +490,7 @@ def compare_upscale_backend(
     }
 
 
-def compare_fp8_tensorops_backend(
+def compare_tensorops_backend(
     helper: Path,
     pack: Path,
     source: Path,
@@ -315,7 +500,7 @@ def compare_fp8_tensorops_backend(
 ) -> dict[str, Any]:
     command_prefix = [
         str(helper),
-        "--fp8-tensorops-upscale",
+        "--tensorops-upscale",
         str(pack),
         str(source),
     ]
@@ -330,7 +515,7 @@ def compare_fp8_tensorops_backend(
     if warmup.returncode != 0 or not warmup_output.is_file():
         return {
             "status": "FAIL",
-            "backend": "fp8_tensorops",
+            "backend": "tensorops",
             "warmup_exit": warmup.returncode,
             "output": str(output),
             "diagnostic": (warmup.stdout or "").strip(),
@@ -355,7 +540,7 @@ def compare_fp8_tensorops_backend(
         if last_result.returncode != 0 or not output.is_file():
             return {
                 "status": "FAIL",
-                "backend": "fp8_tensorops",
+                "backend": "tensorops",
                 "warmup_exit": warmup.returncode,
                 "run_exit": last_result.returncode,
                 "output": str(output),
@@ -367,14 +552,15 @@ def compare_fp8_tensorops_backend(
     except ValueError as error:
         return {
             "status": "FAIL",
-            "backend": "fp8_tensorops",
+            "backend": "tensorops",
             "output": str(output),
             "error": str(error),
         }
     return {
         "status": "PASS",
-        "backend": "fp8_tensorops",
+        "backend": "tensorops",
         "pack": str(pack),
+        **pack_record_metadata(pack),
         "output": str(output),
         "runs": runs,
         "timing_ms": {
@@ -385,6 +571,206 @@ def compare_fp8_tensorops_backend(
             "scope": "ASHelper process plus image decode, TensorOps dispatch, readback, and PNG encode",
         },
         "quality": quality,
+    }
+
+
+def _tool_available(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def run_gpu_tool_verification(
+    helper: Path,
+    pack: Path,
+    source: Path,
+    output: Path,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Capture one TensorOps process without making capture a normal runtime dependency."""
+    required = ("gpucapture", "gpudebug", "metalperftrace")
+    missing = [name for name in required if not _tool_available(name)]
+    if missing:
+        return {"status": "SKIP(tool_missing)", "missing": missing}
+
+    capture_path = artifact_dir / "tensorops.gputrace"
+    debug_dir = artifact_dir / "gpudebug"
+    perf_dir = artifact_dir / "metalperftrace"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    perf_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["MTL_CAPTURE_ENABLED"] = "1"
+    env["MTL_CAPTURE_WAIT_FOR_SIGNAL"] = "1"
+    env["ORTHO4XP_GPU_CAPTURE_WAIT_SECONDS"] = "10"
+    capture_help = subprocess.run(
+        ["gpucapture", "start", "--help"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout or ""
+    # macOS 27's gpucapture uses a numeric boundary ID even though the
+    # documented contract names the device boundary. Keep the symbolic probe
+    # for newer tools and use the local numeric spelling when advertised.
+    boundaries = ("0",) if "ID of the boundary object" in capture_help else ("Device", "0")
+    started = time.perf_counter()
+    process = subprocess.Popen(
+        [str(helper), "--tensorops-upscale", str(pack), str(source), str(output)],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    capture: dict[str, Any] = {"status": "SKIP(capture_unavailable)"}
+    debug: dict[str, Any] = {"status": "SKIP(capture_unavailable)"}
+    try:
+        # ASHelper creates the Metal device immediately and then waits in its
+        # capture-only path. Give gpucapture a process that already owns that
+        # device before attaching.
+        time.sleep(1.0)
+        attempts: list[dict[str, Any]] = []
+        for boundary in boundaries:
+            capture_start = subprocess.run(
+                [
+                    "gpucapture",
+                    "start",
+                    "--pid",
+                    str(process.pid),
+                    "--boundary",
+                    boundary,
+                    "--count",
+                    "1",
+                    "--output",
+                    str(capture_path),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            )
+            attempt = {
+                "boundary": boundary,
+                "exit_code": capture_start.returncode,
+                "diagnostic": (capture_start.stdout or "").strip(),
+            }
+            attempts.append(attempt)
+            if capture_start.returncode == 0 and capture_path.exists():
+                break
+            if process.poll() is not None:
+                break
+        capture["boundary_attempts"] = attempts
+        last_attempt = attempts[-1]
+        capture["exit_code"] = last_attempt["exit_code"]
+        capture["diagnostic"] = last_attempt["diagnostic"]
+        process.wait(timeout=60)
+        process_output = process.stdout.read() if process.stdout else ""
+        capture["process_output"] = process_output.strip()
+        if capture_path.exists() and last_attempt["exit_code"] == 0:
+            capture["status"] = "PASS"
+            capture["path"] = str(capture_path)
+            debug_result = subprocess.run(
+                [
+                    "gpudebug",
+                    "--oneshot",
+                    "--quiet",
+                    "--json",
+                    "--gputrace",
+                    str(capture_path),
+                    "--output",
+                    str(debug_dir),
+                    "-c",
+                    "status",
+                    "-c",
+                    "go commands",
+                    "-c",
+                    "go cb0",
+                    "-c",
+                    "go ce0",
+                    "-c",
+                    "list",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=60,
+            )
+            debug_text = debug_result.stdout or ""
+            debug_path = debug_dir / "gpudebug.json"
+            debug_path.write_text(debug_text, encoding="utf-8")
+            debug = {
+                "status": "PASS" if debug_result.returncode == 0 else "SKIP(debug_failed)",
+                "exit_code": debug_result.returncode,
+                "path": str(debug_path),
+                "diagnostic": debug_text.strip(),
+                "compute_dispatch_observed": "dispatches" in debug_text.lower()
+                and "mtl4computecommandencoder" in debug_text.lower(),
+                "tensorops_shader_observed": "fp8sr" in debug_text.lower()
+                or "tensorops" in debug_text.lower(),
+            }
+        else:
+            debug["diagnostic"] = "GPU trace was not produced"
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as error:
+        capture["diagnostic"] = str(error)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    elapsed_seconds = max(5, int(math.ceil(time.perf_counter() - started)) + 2)
+    perf_collect = subprocess.run(
+        [
+            "metalperftrace",
+            "collect",
+            "--last",
+            f"{elapsed_seconds}s",
+            "--prefix",
+            "Ortho4XP",
+            "--json",
+            str(perf_dir),
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    perf: dict[str, Any] = {
+        "status": "SKIP(no_metal_layer_data)",
+        "collect_exit_code": perf_collect.returncode,
+        "collect_output": (perf_collect.stdout or "").strip(),
+    }
+    overview_paths: list[str] = []
+    for trace in sorted(perf_dir.glob("*.atrc")):
+        overview = subprocess.run(
+            ["metalperftrace", "overview", "--json", str(trace)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        overview_path = perf_dir / f"{trace.stem}.overview.json"
+        overview_path.write_text(overview.stdout or "", encoding="utf-8")
+        overview_paths.append(str(overview_path))
+        if overview.returncode == 0 and (overview.stdout or "").strip():
+            perf["status"] = "PASS"
+    perf["traces"] = [str(path) for path in sorted(perf_dir.glob("*.atrc"))]
+    perf["overviews"] = overview_paths
+    tensorops_observed = bool(
+        capture.get("status") == "PASS"
+        and debug.get("compute_dispatch_observed")
+        and debug.get("tensorops_shader_observed")
+    )
+    return {
+        "status": "PASS" if tensorops_observed else "SKIP(gpu_evidence_incomplete)",
+        "capture": capture,
+        "debug": debug,
+        "metalperftrace": perf,
+        "tensorops_dispatch_observed": tensorops_observed,
+        "neural_accelerator_confirmed": False,
     }
 
 
@@ -635,6 +1021,214 @@ def task_args(
     ]
 
 
+def make_precision_fixture(directory: Path) -> tuple[Path, Path]:
+    from PIL import Image, ImageDraw
+
+    width, height = 32, 24
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    for y in range(height):
+        for x in range(width):
+            pixels[x, y] = (
+                (x * 255) // (width - 1),
+                (y * 255) // (height - 1),
+                ((x * 3 + y * 5) * 255) // (width * 3 + height * 5 - 8),
+            )
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((2, 2, 10, 9), fill=(225, 35, 45))
+    draw.ellipse((14, 3, 28, 16), fill=(35, 185, 80))
+    draw.line((0, 19, width - 1, 19), fill=(250, 240, 30), width=2)
+    source = directory / "precision_source.png"
+    reference = directory / "precision_reference.png"
+    image.save(source, format="PNG")
+    image.resize((width * 2, height * 2), Image.Resampling.NEAREST).save(
+        reference, format="PNG"
+    )
+    return source, reference
+
+
+def run_precision_ladder(
+    args: argparse.Namespace,
+    helper: Path,
+    artifact_dir: Path,
+    tensorops_available: bool,
+    records: list[dict[str, Any]],
+) -> tuple[dict[str, Any], Path | None, bool]:
+    from fp8sr_pack import create_fixture, validate_pack
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    source, default_reference = make_precision_fixture(artifact_dir)
+    reference = args.precision_reference or default_reference
+    report: dict[str, Any] = {
+        "status": "PASS",
+        "source": str(source),
+        "reference": str(reference),
+        "quality_gate": {
+            "psnr_drop_db": QUALITY_PSNR_DROP_DB,
+            "error_increase_ratio": QUALITY_ERROR_INCREASE_RATIO,
+        },
+        "stages": {},
+    }
+    dtype_args = {
+        "Float16": args.fp16_pack,
+        "MetalFloat8E4M3": args.fp8_pack,
+        "MetalFloat4E2M1": args.fp4_pack,
+        "Int2": args.int2_pack,
+    }
+    packs: dict[str, Path | None] = {}
+    for dtype, configured in dtype_args.items():
+        if configured is not None:
+            packs[dtype] = configured
+        elif dtype in ("Float16", "MetalFloat8E4M3"):
+            packs[dtype] = create_fixture(artifact_dir / f"pack-{dtype}", dtype)
+        else:
+            packs[dtype] = None
+
+    coreml_reference_model = getattr(args, "coreml_reference_model", None)
+    if coreml_reference_model is not None:
+        coreml_output = artifact_dir / "coreml_reference_ladder.png"
+        coreml_report = run_coreml_reference(
+            coreml_reference_model,
+            source,
+            coreml_output,
+            artifact_dir,
+        )
+        report["coreml_reference"] = coreml_report
+        records.append(
+            execution_record(
+                backend="coreml",
+                role="reference_only",
+                status=coreml_report["status"],
+                source=source,
+                output=coreml_output if coreml_output.is_file() else None,
+                result=coreml_report,
+            )
+        )
+        if coreml_report["status"] == "PASS" and args.precision_reference is None:
+            reference = coreml_output
+            report["reference"] = str(reference)
+        elif coreml_report["status"] != "PASS":
+            report["status"] = "FAIL(coreml_reference)"
+            for dtype in dtype_args:
+                report["stages"][dtype] = {"status": "BLOCKED(coreml_reference)"}
+            return report, packs["MetalFloat8E4M3"], False
+
+    if not tensorops_available:
+        report["status"] = "SKIP(tensorops_unavailable)"
+        for dtype in dtype_args:
+            stage = "baseline" if dtype == "Float16" else "candidate"
+            report["stages"][dtype] = {"status": "BLOCKED(tensorops_unavailable)"}
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role=stage,
+                    dtype=dtype,
+                    status="SKIP(tensorops_unavailable)",
+                    source=source,
+                )
+            )
+        return report, packs["MetalFloat8E4M3"], True
+
+    baseline_quality: dict[str, Any] | None = None
+    blocked_reason: str | None = None
+    for dtype in ("Float16", "MetalFloat8E4M3", "MetalFloat4E2M1", "Int2"):
+        pack = packs[dtype]
+        if blocked_reason is not None:
+            status = f"BLOCKED({blocked_reason})"
+            report["stages"][dtype] = {"status": status}
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role="candidate",
+                    dtype=dtype,
+                    status=status,
+                    source=source,
+                )
+            )
+            continue
+        if pack is None:
+            status = "SKIP(pack_missing)"
+            report["stages"][dtype] = {"status": status}
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role="candidate",
+                    dtype=dtype,
+                    status=status,
+                    source=source,
+                )
+            )
+            if dtype == "MetalFloat4E2M1":
+                blocked_reason = "fp4_not_run"
+            continue
+        try:
+            normalized = validate_pack(pack)
+        except (OSError, ValueError) as error:
+            status = f"FAIL(pack_invalid:{error})"
+            report["stages"][dtype] = {"status": status}
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role="baseline" if dtype == "Float16" else "candidate",
+                    dtype=dtype,
+                    status="FAIL(pack_invalid)",
+                    source=source,
+                    result={**pack_record_metadata(pack), "error": str(error)},
+                )
+            )
+            blocked_reason = f"{dtype}_failed"
+            report["status"] = "FAIL"
+            continue
+
+        output = artifact_dir / f"precision_{dtype}.png"
+        result = compare_tensorops_backend(
+            helper, pack, source, reference, output, args.compare_runs
+        )
+        result["dtype"] = dtype
+        result.update(pack_record_metadata(pack))
+        stage_report: dict[str, Any] = {**result}
+        if result["status"] != "PASS":
+            stage_report["status"] = result["status"]
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role="baseline" if dtype == "Float16" else "candidate",
+                    dtype=dtype,
+                    status=result["status"],
+                    source=source,
+                    output=output,
+                    result=result,
+                )
+            )
+            blocked_reason = f"{dtype}_failed"
+            report["status"] = "FAIL"
+            report["stages"][dtype] = stage_report
+            continue
+        if dtype == "Float16":
+            baseline_quality = result["quality"]
+            stage_report["role"] = "baseline"
+        else:
+            gate = precision_quality_gate(result["quality"], baseline_quality or {})
+            stage_report["gate"] = gate
+            if gate["status"] != "PASS":
+                stage_report["status"] = "FAIL(quality_gate)"
+                blocked_reason = f"{dtype}_quality_gate_failed"
+                report["status"] = "FAIL"
+        records.append(
+            execution_record(
+                backend="tensorops",
+                role="baseline" if dtype == "Float16" else "candidate",
+                dtype=dtype,
+                status=stage_report["status"],
+                source=source,
+                output=output,
+                result=stage_report,
+            )
+        )
+        report["stages"][dtype] = stage_report
+    return report, packs["MetalFloat8E4M3"], report["status"] == "PASS"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", type=Path, required=True)
@@ -646,13 +1240,28 @@ def main() -> int:
         action="store_true",
         help="compare the deterministic FP8SR fixture or an external --fp8-pack",
     )
+    parser.add_argument(
+        "--precision-ladder",
+        action="store_true",
+        help="run FP16 -> FP8 -> FP4 -> INT2, stopping on the first quality failure",
+    )
+    parser.add_argument("--fp16-pack", type=Path)
     parser.add_argument("--fp8-pack", type=Path)
+    parser.add_argument("--fp4-pack", type=Path)
+    parser.add_argument("--int2-pack", type=Path)
+    parser.add_argument("--precision-reference", type=Path)
     parser.add_argument(
         "--coreml-reference-model",
         type=Path,
         help="optional compiled .mlmodelc used only as the FP8 quality reference",
     )
     parser.add_argument("--compare-runs", type=int, default=5)
+    parser.add_argument("--record-jsonl", type=Path)
+    parser.add_argument(
+        "--gpu-tools",
+        action="store_true",
+        help="capture one representative TensorOps run with GPU CLI tools",
+    )
     parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
 
@@ -661,7 +1270,12 @@ def main() -> int:
     if args.compare_runs < 1 or args.compare_runs > 20:
         fail("--compare-runs must be between 1 and 20")
     if args.coreml_reference_model is not None and not args.compare_fp8:
-        fail("--coreml-reference-model requires --compare-fp8")
+        if not args.precision_ladder:
+            fail("--coreml-reference-model requires --compare-fp8 or --precision-ladder")
+    if args.precision_reference is not None and not args.precision_ladder:
+        fail("--precision-reference requires --precision-ladder")
+    if (args.fp16_pack is not None or args.fp4_pack is not None or args.int2_pack is not None) and not args.precision_ladder:
+        fail("precision pack options require --precision-ladder")
     if not args.helper.is_file() or not os.access(args.helper, os.X_OK):
         fail(f"ASHelper is not executable: {args.helper}")
 
@@ -680,10 +1294,14 @@ def main() -> int:
         stderr=subprocess.STDOUT,
     )
     capability_output = capability_result.stdout or ""
-    fp8_tensorops_available = (
+    tensorops_available = (
         capability_result.returncode == 0
-        and "fp8_tensorops_available=true" in capability_output.splitlines()
+        and (
+            "tensorops_available=true" in capability_output.splitlines()
+            or "fp8_tensorops_available=true" in capability_output.splitlines()
+        )
     )
+    fp8_tensorops_available = tensorops_available
     artifact_dir = Path(tempfile.mkdtemp(prefix="ortho4xp-metal-"))
     print(f"artifacts={artifact_dir}")
     overall_ok = True
@@ -692,6 +1310,7 @@ def main() -> int:
         "metal_available": metal_available,
         "host_metal_supported": host_metal_supported,
         "metalfx_spatial_available": metalfx_spatial_available,
+        "tensorops_available": tensorops_available,
         "fp8_tensorops_available": fp8_tensorops_available,
         "ashelper_capabilities": capability_output,
         "probe": probe_output,
@@ -699,12 +1318,65 @@ def main() -> int:
         "compare_runs": args.compare_runs,
         "cases": [],
     }
+    records: list[dict[str, Any]] = []
+    precision_pack_for_gpu: Path | None = None
 
     try:
         source, mask, alpha_mask, source_4096, upscale_seed_2048 = make_fixtures(
             artifact_dir
         )
         from PIL import Image
+
+        if args.precision_ladder:
+            precision_report, precision_pack_for_gpu, precision_ok = run_precision_ladder(
+                args,
+                args.helper,
+                artifact_dir,
+                tensorops_available,
+                records,
+            )
+            report["precision_ladder"] = precision_report
+            print(
+                "precision ladder="
+                f"{precision_report['status']} "
+                f"stages={json.dumps(precision_report['stages'], sort_keys=True)}"
+            )
+            if not precision_ok and tensorops_available:
+                overall_ok = False
+
+        if args.gpu_tools:
+            if precision_pack_for_gpu is None:
+                from fp8sr_pack import create_fixture
+
+                precision_pack_for_gpu = create_fixture(
+                    artifact_dir / "gpu-tools-pack", "MetalFloat8E4M3"
+                )
+            gpu_source = artifact_dir / "gpu-tools-source.png"
+            # Keep the representative 512x512 fixture large enough for the
+            # capture tool to attach before the short-lived CLI exits.
+            with Image.open(source).convert("RGB") as gpu_image:
+                gpu_image.save(gpu_source, format="PNG")
+            gpu_output = artifact_dir / "gpu-tools-output.png"
+            gpu_report = run_gpu_tool_verification(
+                args.helper,
+                precision_pack_for_gpu,
+                gpu_source,
+                gpu_output,
+                artifact_dir,
+            )
+            report["gpu_tools"] = gpu_report
+            records.append(
+                execution_record(
+                    backend="tensorops",
+                    role="gpu_verification",
+                    dtype="MetalFloat8E4M3",
+                    status=gpu_report["status"],
+                    source=gpu_source,
+                    output=gpu_output,
+                    gpu_tools=gpu_report,
+                )
+            )
+            print(f"gpu tools={gpu_report['status']}")
 
         if args.compare_upscale:
             comparison_report: dict[str, Any] = {}
@@ -754,7 +1426,7 @@ def main() -> int:
                         "source": str(comparison_source),
                         "reference": str(comparison_reference),
                     }
-                    for backend in ("lanczos", "metalfx_spatial"):
+                    for backend in ("ci_lanczos", "metalfx_spatial"):
                         backend_output = artifact_dir / (
                             f"comparison_{backend}_{target_size}.png"
                         )
@@ -767,6 +1439,16 @@ def main() -> int:
                             args.compare_runs,
                         )
                         case_report[backend] = result
+                        records.append(
+                            execution_record(
+                                backend=backend,
+                                role="comparison",
+                                status=result["status"],
+                                source=comparison_source,
+                                output=backend_output,
+                                result=result,
+                            )
+                        )
                         print(
                             f"upscale comparison {target_size}px {backend}="
                             f"{result['status']} "
@@ -845,6 +1527,18 @@ def main() -> int:
                                 coreml_report["status"] = "FAIL(runtime)"
                                 coreml_failed = True
                         fp8_report["coreml_reference"] = coreml_report
+                        records.append(
+                            execution_record(
+                                backend="coreml",
+                                role="reference_only",
+                                status=coreml_report["status"],
+                                source=fp8_source,
+                                output=Path(coreml_report["output"])
+                                if coreml_report.get("output")
+                                else None,
+                                result=coreml_report,
+                            )
+                        )
 
                     if coreml_failed:
                         fp8_report["status"] = "FAIL(coreml_reference)"
@@ -852,7 +1546,7 @@ def main() -> int:
                         overall_ok = False
                     else:
                         fp8_output = artifact_dir / "fp8_tensorops_32.png"
-                        fp8_result = compare_fp8_tensorops_backend(
+                        fp8_result = compare_tensorops_backend(
                             args.helper,
                             fp8_pack,
                             fp8_source,
@@ -870,6 +1564,17 @@ def main() -> int:
                         )
                         if fp8_result["status"] != "PASS":
                             overall_ok = False
+                        records.append(
+                            execution_record(
+                                backend="tensorops",
+                                role="comparison",
+                                dtype=fp8_result.get("dtype", "MetalFloat8E4M3"),
+                                status=fp8_result["status"],
+                                source=fp8_source,
+                                output=fp8_output,
+                                result=fp8_result,
+                            )
+                        )
             report["fp8_comparison"] = fp8_report
 
         upscale_cases = [
@@ -887,7 +1592,7 @@ def main() -> int:
                 label,
                 [
                     str(args.helper),
-                    "--lanczos-upscale",
+                    "--ci-lanczos-upscale",
                     str(upscale_input),
                     str(upscale_output),
                 ],
@@ -1257,6 +1962,17 @@ def main() -> int:
                 if metal_available:
                     overall_ok = False
 
+        if not any(record.get("backend") == "coreml" for record in records):
+            records.append(
+                execution_record(
+                    backend="coreml",
+                    role="reference_only",
+                    status="SKIP(reference_not_requested)",
+                )
+            )
+        write_execution_records(args.record_jsonl, records)
+        report["execution_record_count"] = len(records)
+        report["record_jsonl"] = str(args.record_jsonl) if args.record_jsonl else None
         report_path = artifact_dir / "report.json"
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
         print(f"report={report_path}")

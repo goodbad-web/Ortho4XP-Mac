@@ -246,6 +246,96 @@ kernel void fp8sr_matmul(
     }
 }
 
+kernel void fp8sr_matmul_fp16(
+    device half *activationBuffer [[buffer(0)]],
+    device uchar *weightBuffer [[buffer(1)]],
+    device half *outputBuffer [[buffer(2)]],
+    constant FP8SRMatmulParams &params [[buffer(3)]],
+    uint2 threadgroupID [[threadgroup_position_in_grid]]) {
+    constexpr auto descriptor = tensor_ops::matmul2d_descriptor(
+        64, 32, 32, false, false, false,
+        tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    tensor_ops::matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
+        activationBuffer,
+        dextents<int, 2>{int(params.k), int(params.m)},
+        array<int, 2>{1, int(params.k)});
+    auto weights = tensor<device half, dextents<int, 2>, tensor_inline>(
+        reinterpret_cast<device half *>(weightBuffer),
+        dextents<int, 2>{int(params.n), int(params.k)},
+        array<int, 2>{1, 64});
+    auto output = tensor<device half, dextents<int, 2>, tensor_inline>(
+        outputBuffer,
+        dextents<int, 2>{int(params.n), int(params.m)},
+        array<int, 2>{1, int(params.n)});
+    for (uint k = 0; k < params.k; k += 32) {
+        auto activationChunk = activation.slice(k, threadgroupID.y * 64);
+        auto weightChunk = weights.slice(threadgroupID.x * 32, k);
+        auto outputTile = output.slice(threadgroupID.x * 32, threadgroupID.y * 64);
+        operation.run(activationChunk, weightChunk, outputTile);
+    }
+}
+
+kernel void fp8sr_matmul_fp4(
+    device half *activationBuffer [[buffer(0)]],
+    device uchar *weightBuffer [[buffer(1)]],
+    device half *outputBuffer [[buffer(2)]],
+    constant FP8SRMatmulParams &params [[buffer(3)]],
+    uint2 threadgroupID [[threadgroup_position_in_grid]]) {
+    constexpr auto descriptor = tensor_ops::matmul2d_descriptor(
+        64, 32, 32, false, false, false,
+        tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    tensor_ops::matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
+        activationBuffer,
+        dextents<int, 2>{int(params.k), int(params.m)},
+        array<int, 2>{1, int(params.k)});
+    auto weights = tensor<device metal_fp4_e2m1_format, dextents<int, 2>, tensor_inline>(
+        weightBuffer,
+        dextents<int, 2>{int(params.n), int(params.k)},
+        array<int, 2>{1, 256});
+    auto output = tensor<device half, dextents<int, 2>, tensor_inline>(
+        outputBuffer,
+        dextents<int, 2>{int(params.n), int(params.m)},
+        array<int, 2>{1, int(params.n)});
+    for (uint k = 0; k < params.k; k += 32) {
+        auto activationChunk = activation.slice(k, threadgroupID.y * 64);
+        auto weightChunk = weights.slice(threadgroupID.x * 32, k);
+        auto outputTile = output.slice(threadgroupID.x * 32, threadgroupID.y * 64);
+        operation.run(activationChunk, weightChunk, outputTile);
+    }
+}
+
+kernel void fp8sr_matmul_int2(
+    device half *activationBuffer [[buffer(0)]],
+    device uchar *weightBuffer [[buffer(1)]],
+    device half *outputBuffer [[buffer(2)]],
+    constant FP8SRMatmulParams &params [[buffer(3)]],
+    uint2 threadgroupID [[threadgroup_position_in_grid]]) {
+    constexpr auto descriptor = tensor_ops::matmul2d_descriptor(
+        64, 32, 32, false, false, false,
+        tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    tensor_ops::matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
+        activationBuffer,
+        dextents<int, 2>{int(params.k), int(params.m)},
+        array<int, 2>{1, int(params.k)});
+    auto weights = tensor<device int2b_format, dextents<int, 2>, tensor_inline>(
+        weightBuffer,
+        dextents<int, 2>{int(params.n), int(params.k)},
+        array<int, 2>{1, 512});
+    auto output = tensor<device half, dextents<int, 2>, tensor_inline>(
+        outputBuffer,
+        dextents<int, 2>{int(params.n), int(params.m)},
+        array<int, 2>{1, int(params.n)});
+    for (uint k = 0; k < params.k; k += 32) {
+        auto activationChunk = activation.slice(k, threadgroupID.y * 64);
+        auto weightChunk = weights.slice(threadgroupID.x * 32, k);
+        auto outputTile = output.slice(threadgroupID.x * 32, threadgroupID.y * 64);
+        operation.run(activationChunk, weightChunk, outputTile);
+    }
+}
+
 kernel void fp8sr_postprocess(
     device half *values [[buffer(0)]],
     device const half *bias [[buffer(1)]],
@@ -950,6 +1040,11 @@ func fp8TensorOpsAvailable() -> Bool {
 }
 
 @available(macOS 27.0, *)
+func tensorOpsAvailable() -> Bool {
+    return fp8TensorOpsAvailable()
+}
+
+@available(macOS 27.0, *)
 private struct FP8SRManifest: Decodable {
     let format: String
     let version: Int
@@ -1043,6 +1138,7 @@ private struct FP8SRPixelParams {
 private final class FP8SRRuntime {
     private struct Layer {
         let manifest: FP8SRManifestLayer
+        let weightDType: String
         let weights: MTLTensor
         let weightBuffer: MTLBuffer
         let bias: MTLBuffer
@@ -1059,7 +1155,7 @@ private final class FP8SRRuntime {
     private let residencySet: MTLResidencySet
     private let imageIm2ColPipeline: MTLComputePipelineState
     private let featureIm2ColPipeline: MTLComputePipelineState
-    private let matmulPipeline: MTLComputePipelineState
+    private let matmulPipelines: [String: MTLComputePipelineState]
     private let postprocessPipeline: MTLComputePipelineState
     private let pixelShufflePipeline: MTLComputePipelineState
     private let layers: [Layer]
@@ -1103,6 +1199,12 @@ private final class FP8SRRuntime {
             throw FP8SRError.unavailable("metal_unavailable")
         }
         self.device = device
+        if ProcessInfo.processInfo.environment["MTL_CAPTURE_WAIT_FOR_SIGNAL"] == "1" {
+            let configuredWait = ProcessInfo.processInfo.environment[
+                "ORTHO4XP_GPU_CAPTURE_WAIT_SECONDS"
+            ].flatMap(Double.init) ?? 3.0
+            Thread.sleep(forTimeInterval: max(0.5, configuredWait))
+        }
         guard let commandQueue = device.makeMTL4CommandQueue(),
               let commandAllocator = device.makeCommandAllocator(),
               let completionEvent = device.makeSharedEvent() else {
@@ -1118,8 +1220,8 @@ private final class FP8SRRuntime {
         do {
             library = try device.makeLibrary(source: fp8TensorOpsSource, options: compileOptions)
         } catch {
-            reportError("ASHelper: FP8 TensorOps shader compile detail=\(error)")
-            throw FP8SRError.unavailable("fp8_shader_compile")
+            reportError("ASHelper: TensorOps shader compile detail=\(error)")
+            throw FP8SRError.unavailable("tensorops_shader_compile")
         }
         let compiler: MTL4Compiler
         do {
@@ -1139,13 +1241,32 @@ private final class FP8SRRuntime {
         do {
             self.imageIm2ColPipeline = try makePipeline("fp8sr_im2col_image")
             self.featureIm2ColPipeline = try makePipeline("fp8sr_im2col_features")
-            self.matmulPipeline = try makePipeline("fp8sr_matmul")
             self.postprocessPipeline = try makePipeline("fp8sr_postprocess")
             self.pixelShufflePipeline = try makePipeline("fp8sr_pixel_shuffle")
         } catch {
-            reportError("ASHelper: FP8 TensorOps pipeline compile detail=\(error)")
+            reportError("ASHelper: TensorOps pipeline compile detail=\(error)")
+            throw FP8SRError.unavailable("tensorops_pipeline_compile")
+        }
+        var compiledMatmulPipelines: [String: MTLComputePipelineState] = [:]
+        for dtype in ["Float16", "MetalFloat8E4M3", "MetalFloat4E2M1", "Int2"] {
+            do {
+                let functionName: String
+                switch dtype {
+                case "Float16": functionName = "fp8sr_matmul_fp16"
+                case "MetalFloat8E4M3": functionName = "fp8sr_matmul"
+                case "MetalFloat4E2M1": functionName = "fp8sr_matmul_fp4"
+                case "Int2": functionName = "fp8sr_matmul_int2"
+                default: continue
+                }
+                compiledMatmulPipelines[dtype] = try makePipeline(functionName)
+            } catch {
+                reportError("ASHelper: TensorOps dtype=\(dtype) unavailable detail=\(error)")
+            }
+        }
+        guard compiledMatmulPipelines["MetalFloat8E4M3"] != nil else {
             throw FP8SRError.unavailable("fp8_pipeline_compile")
         }
+        self.matmulPipelines = compiledMatmulPipelines
 
         let argumentDescriptor = MTL4ArgumentTableDescriptor()
         argumentDescriptor.maxBufferBindCount = 4
@@ -1182,8 +1303,10 @@ private final class FP8SRRuntime {
             let kPadded = runtimeK
             let weightDescriptor = MTLTensorDescriptor()
             weightDescriptor.dimensions = MTLTensorExtents([32, kPadded])!
-            weightDescriptor.strides = MTLTensorExtents([1, 128])!
-            weightDescriptor.dataType = MTLTensorDataType(rawValue: 142)!
+            weightDescriptor.strides = MTLTensorExtents([
+                1, FP8SRRuntime.weightStrideElements(for: manifest.weightDType)
+            ])!
+            weightDescriptor.dataType = FP8SRRuntime.tensorDataType(for: manifest.weightDType)
             weightDescriptor.usage = .compute
             weightDescriptor.storageMode = .shared
             let attachments = MTLTensorBufferAttachments()
@@ -1196,6 +1319,7 @@ private final class FP8SRRuntime {
             }
             loadedLayers.append(Layer(
                 manifest: layerManifest,
+                weightDType: manifest.weightDType,
                 weights: weightsTensor,
                 weightBuffer: weightsBuffer,
                 bias: biasBuffer
@@ -1205,8 +1329,36 @@ private final class FP8SRRuntime {
         }
         residencySet.commit()
         self.layers = loadedLayers
-        print("fp8_dispatch=ready dtype=MetalFloat8E4M3 activation=Float16 accumulation=Float16 layout=NHWC "
-            + "simdgroup=\(matmulPipeline.threadExecutionWidth) threadgroup=\(matmulPipeline.maxTotalThreadsPerThreadgroup)")
+        let availableDTypes = ["Float16", "MetalFloat8E4M3", "MetalFloat4E2M1", "Int2"]
+            .filter { compiledMatmulPipelines[$0] != nil }
+            .joined(separator: ",")
+        print("tensorops_dispatch=ready dtype=\(manifest.weightDType) activation=Float16 accumulation=Float16 layout=NHWC "
+            + "available_dtypes=\(availableDTypes) simdgroup=\(compiledMatmulPipelines[manifest.weightDType]?.threadExecutionWidth ?? 0) "
+            + "threadgroup=\(compiledMatmulPipelines[manifest.weightDType]?.maxTotalThreadsPerThreadgroup ?? 0)")
+    }
+
+    private static func supportedWeightDTypes() -> Set<String> {
+        return ["Float16", "MetalFloat8E4M3", "MetalFloat4E2M1", "Int2"]
+    }
+
+    private static func tensorDataType(for dtype: String) -> MTLTensorDataType {
+        switch dtype {
+        case "Float16": return .float16
+        case "MetalFloat8E4M3": return MTLTensorDataType(rawValue: 142)!
+        case "MetalFloat4E2M1": return MTLTensorDataType(rawValue: 148)!
+        case "Int2": return MTLTensorDataType(rawValue: 150)!
+        default: return .float16
+        }
+    }
+
+    private static func weightStrideElements(for dtype: String) -> Int {
+        switch dtype {
+        case "Float16": return 64
+        case "MetalFloat8E4M3": return 128
+        case "MetalFloat4E2M1": return 256
+        case "Int2": return 512
+        default: return 128
+        }
     }
 
     private static func paddedKernelElements(_ layer: FP8SRManifestLayer) -> Int {
@@ -1248,16 +1400,19 @@ private final class FP8SRRuntime {
 
     private static func validate(manifest: FP8SRManifest, packURL: URL) throws {
         let exact = manifest.format == "FP8SR"
-            && manifest.version == 1
+            && (manifest.version == 1 || manifest.version == 2)
             && manifest.upscaleFactor == 2
             && manifest.layout == "NHWC"
             && manifest.inputChannels == 3
             && manifest.outputChannels == 3
-            && manifest.weightDType == "MetalFloat8E4M3"
+            && FP8SRRuntime.supportedWeightDTypes().contains(manifest.weightDType)
             && manifest.activationDType == "Float16"
             && manifest.accumulationDType == "Float16"
             && manifest.weightRowStrideBytes == 128
         guard exact else { throw FP8SRError.invalid("manifest_contract") }
+        if manifest.version == 1 && manifest.weightDType != "MetalFloat8E4M3" {
+            throw FP8SRError.invalid("legacy_manifest_dtype")
+        }
         let expected: [(String, Int, Int, Int)] = [
             ("conv0", 3, 3, 32),
             ("conv1", 3, 32, 32),
@@ -1277,7 +1432,8 @@ private final class FP8SRRuntime {
             }
             let kPadded = ((layer.kernel * layer.kernel * layer.inChannels + 31) / 32) * 32
             let outPadded = ((layer.outChannels + 31) / 32) * 32
-            guard kPadded % 32 == 0, outPadded % 32 == 0 else {
+            guard kPadded % 32 == 0, outPadded % 32 == 0,
+                  manifest.weightRowStrideBytes == 128 else {
                 throw FP8SRError.invalid("tensor_alignment_\(layer.name)")
             }
             let weightsURL = packURL.appendingPathComponent(layer.weights)
@@ -1383,8 +1539,12 @@ private final class FP8SRRuntime {
         weights: MTLBuffer,
         output: MTLBuffer,
         params: inout FP8SRMatmulParams,
+        weightDType: String,
         pixelCount: Int
     ) throws {
+        guard let matmulPipeline = matmulPipelines[weightDType] else {
+            throw FP8SRError.unavailable("tensorops_dtype_\(weightDType)")
+        }
         let paramsBuffer = try makeParamsBuffer(&params)
         argumentTable.setAddress(activation.gpuAddress, index: 0)
         argumentTable.setAddress(weights.gpuAddress, index: 1)
@@ -1563,6 +1723,7 @@ private final class FP8SRRuntime {
                 weights: layer.weightBuffer,
                 output: layerOutput,
                 params: &matmulParams,
+                weightDType: layer.weightDType,
                 pixelCount: pixelCount
             )
             var postParams = FP8SRPostParams(
@@ -1640,18 +1801,26 @@ private final class FP8SRRuntime {
         guard CGImageDestinationFinalize(destination) else {
             throw FP8SRError.execution("output_write")
         }
-        print("fp8_dispatch=completed dtype=MetalFloat8E4M3 accumulation=Float16 output=\(image.width * 2)x\(image.height * 2)")
+        let dtype = layers.first?.weightDType ?? "unknown"
+        print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 output=\(image.width * 2)x\(image.height * 2)")
     }
 }
 
 @available(macOS 27.0, *)
 func fp8TensorOpsUpscale(inputPath: String, outputPath: String, packPath: String) -> Bool {
     do {
+        let captureRequested = ProcessInfo.processInfo.environment["MTL_CAPTURE_WAIT_FOR_SIGNAL"] == "1"
         let runtime = try FP8SRRuntime.cached(packPath: packPath)
         try runtime.upscale(inputPath: inputPath, outputPath: outputPath)
+        if captureRequested {
+            let configuredWait = ProcessInfo.processInfo.environment[
+                "ORTHO4XP_GPU_CAPTURE_WAIT_SECONDS"
+            ].flatMap(Double.init) ?? 3.0
+            Thread.sleep(forTimeInterval: max(0.5, configuredWait))
+        }
         return true
     } catch {
-        reportError("ASHelper: FP8 TensorOps fallback reason=\(error)")
+        reportError("ASHelper: TensorOps fallback reason=\(error)")
         return false
     }
 }
@@ -1747,11 +1916,16 @@ if args[1] == "--capabilities" {
     guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
     print("metal_available=\(MetalCompressor.shared != nil)")
     print("metalfx_spatial_available=\(metalFXSpatialAvailable())")
-    print("fp8_tensorops_available=\(fp8TensorOpsAvailable())")
+    var tensorops = false
+    if #available(macOS 27.0, *) {
+        tensorops = tensorOpsAvailable()
+    }
+    print("tensorops_available=\(tensorops)")
+    print("fp8_tensorops_available=\(tensorops)")
 }
-else if args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
-    // --upscale remains as a compatibility alias for older scripts.
-    guard args.count == 4 else { fail("ASHelper: --lanczos-upscale expects input and output paths.") }
+else if args[1] == "--ci-lanczos-upscale" || args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
+    // The older spellings remain compatibility aliases.
+    guard args.count == 4 else { fail("ASHelper: --ci-lanczos-upscale expects input and output paths.") }
     if !lanczosUpscale(inputPath: args[2], outputPath: args[3]) {
         exit(1)
     }
@@ -1765,20 +1939,20 @@ else if args[1] == "--metalfx-spatial-upscale" {
         exit(1)
     }
 }
-else if args[1] == "--fp8-tensorops-upscale" {
-    guard args.count == 5 else { fail("ASHelper: --fp8-tensorops-upscale expects pack, input, and output paths.") }
+else if args[1] == "--tensorops-upscale" || args[1] == "--fp8-tensorops-upscale" {
+    guard args.count == 5 else { fail("ASHelper: --tensorops-upscale expects pack, input, and output paths.") }
     guard #available(macOS 27.0, *) else {
-        fail("ASHelper: FP8 TensorOps requires macOS 27 or newer.")
+        fail("ASHelper: TensorOps requires macOS 27 or newer.")
     }
     if !fp8TensorOpsUpscale(inputPath: args[3], outputPath: args[4], packPath: args[2]) {
         exit(1)
     }
 }
-else if args[1] == "--fp8-tensorops-upscale-batch" {
-    guard args.count >= 5 else { fail("ASHelper: --fp8-tensorops-upscale-batch expects pack and at least one input/output pair.") }
-    guard (args.count - 3) % 2 == 0 else { fail("ASHelper: --fp8-tensorops-upscale-batch argument count is invalid.") }
+else if args[1] == "--tensorops-upscale-batch" || args[1] == "--fp8-tensorops-upscale-batch" {
+    guard args.count >= 5 else { fail("ASHelper: --tensorops-upscale-batch expects pack and at least one input/output pair.") }
+    guard (args.count - 3) % 2 == 0 else { fail("ASHelper: --tensorops-upscale-batch argument count is invalid.") }
     guard #available(macOS 27.0, *) else {
-        fail("ASHelper: FP8 TensorOps requires macOS 27 or newer.")
+        fail("ASHelper: TensorOps requires macOS 27 or newer.")
     }
     do {
         let runtime = try FP8SRRuntime.cached(packPath: args[2])
@@ -1788,7 +1962,7 @@ else if args[1] == "--fp8-tensorops-upscale-batch" {
             index += 2
         }
     } catch {
-        reportError("ASHelper: FP8 TensorOps batch fallback reason=\(error)")
+        reportError("ASHelper: TensorOps batch fallback reason=\(error)")
         exit(1)
     }
 }

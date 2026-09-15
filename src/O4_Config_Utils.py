@@ -123,10 +123,10 @@ a particular server.",
         "module": "IMG",
         "type": str,
         "default": "none",
-        "values": ("none", "lanczos", "metalfx_spatial", "fp8_tensorops"),
+        "values": ("none", "ci_lanczos", "metalfx_spatial", "tensorops"),
         "short_name": "Upscale Backend",
         "short_name_japanese": "アップスケール方式",
-        "hint": "Select the optional 2x orthophoto upscaling backend. Lanczos is a conventional Core Image filter; MetalFX Spatial is an Apple GPU scaler; FP8 TensorOps uses an external FP8SR pack on macOS 27 or newer. Each GPU backend is used only when explicitly selected.\n\n日本語: オルソフォトの2倍拡大バックエンドを選択します。Lanczosは通常のCore Imageフィルタ、MetalFX SpatialはApple GPUのスケーラ、FP8 TensorOpsはmacOS 27以降で外部FP8SRパックを使います。GPU方式は明示的に選択した場合だけ使用し、非対応時はLanczosへフォールバックします。",
+        "hint": "Select the optional 2x orthophoto upscaling backend. Core Image Lanczos is the compatibility path; MetalFX Spatial is an Apple GPU scaler; TensorOps uses an external FP8SR pack on macOS 27 or newer. Each GPU backend is used only when explicitly selected.\n\n日本語: オルソフォトの2倍拡大バックエンドを選択します。Core Image Lanczosは互換経路、MetalFX SpatialはApple GPUのスケーラ、TensorOpsはmacOS 27以降で外部FP8SRパックを使います。GPU方式は明示的に選択した場合だけ使用し、非対応時はCore Image Lanczosへフォールバックします。",
     },
     "fp8_model_path": {
         "module": "IMG",
@@ -142,13 +142,13 @@ a particular server.",
         "module": "IMG",
         "type": bool,
         "default": False,
-        "hint": "Deprecated compatibility key. Use upscale_backend=lanczos for the existing Core Image Lanczos filter.",
+        "hint": "Deprecated compatibility key. Use upscale_backend=ci_lanczos for the existing Core Image Lanczos filter.",
     },
     "use_neural_upscale": {
         "module": "IMG",
         "type": bool,
         "default": False,
-        "hint": "Deprecated compatibility key. Use upscale_backend=lanczos for the existing Core Image Lanczos filter; this key never enabled Neural Engine inference.",
+        "hint": "Deprecated compatibility key. Use upscale_backend=ci_lanczos for the existing Core Image Lanczos filter; this key never enabled Neural Engine inference.",
     },
     "use_gpu_for_masks": {
         "module": "UI",
@@ -483,30 +483,41 @@ def _legacy_upscale_backend(values):
         return value if isinstance(value, bool) else str(value).lower() == "true"
 
     if "use_lanczos_upscale" in values:
-        return "lanczos" if as_bool(values["use_lanczos_upscale"]) else "none"
+        return "ci_lanczos" if as_bool(values["use_lanczos_upscale"]) else "none"
     if "use_neural_upscale" in values:
-        return "lanczos" if as_bool(values["use_neural_upscale"]) else "none"
+        return "ci_lanczos" if as_bool(values["use_neural_upscale"]) else "none"
     return None
 
 
 def _upscale_backend_label(value):
     labels = {
         "none": ("None", "なし"),
-        "lanczos": ("Lanczos", "Lanczos"),
+        "ci_lanczos": ("Core Image Lanczos", "Core Image Lanczos"),
         "metalfx_spatial": ("MetalFX Spatial", "MetalFX Spatial"),
-        "fp8_tensorops": ("FP8 TensorOps", "FP8 TensorOps"),
+        "tensorops": ("TensorOps", "TensorOps"),
     }
     english, japanese = labels.get(value, (str(value), str(value)))
     return UI.ui_text(english, japanese)
 
 
 def _config_display_value(var, value):
-    return _upscale_backend_label(value) if var == "upscale_backend" else str(value)
+    if var == "upscale_backend":
+        aliases = {"lanczos": "ci_lanczos", "fp8_tensorops": "tensorops"}
+        return _upscale_backend_label(aliases.get(value, value))
+    return str(value)
 
 
 def _config_raw_value(var, value):
     if var != "upscale_backend":
         return value
+    aliases = {
+        "lanczos": "ci_lanczos",
+        "Lanczos": "ci_lanczos",
+        "fp8_tensorops": "tensorops",
+        "FP8 TensorOps": "tensorops",
+    }
+    if value in aliases:
+        return aliases[value]
     for candidate in cfg_vars[var]["values"]:
         if value == candidate or value == _upscale_backend_label(candidate):
             return candidate

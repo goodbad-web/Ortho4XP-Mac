@@ -65,7 +65,28 @@ MetalFX SpatialとCore Image Lanczosの2倍アップスケールをM5 Max上で�
 ./Utils/run/verify_metal.sh --compare-upscale --compare-runs 5 --keep-artifacts
 ```
 
-この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。数値の優劣は自動判定しない。MetalFX Spatialは本番設定で明示的に選択した場合だけ使用し、透明度を含む画像や非対応・実行失敗時はLanczosへフォールバックする。
+この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。バックエンドの正規記録名は`ci_lanczos`、`metalfx_spatial`、`tensorops`で、旧`lanczos`と`fp8_tensorops`は互換aliasとして受け付ける。MetalFX Spatialは本番設定で明示的に選択した場合だけ使用し、透明度を含む画像や非対応・実行失敗時はCore Image Lanczosへフォールバックする。
+
+精度ラダーはFP16基準、FP8、FP4、INT2の順に実行する。FP8が画質ゲートを通過しない限りFP4以降は実行せず、FP4が通過しない限りINT2も実行しない。既定ゲートは、共通参照画像に対するFP16比でPSNR低下0.25dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値、継ぎ目なしである。
+
+```sh
+./Utils/run/verify_metal.sh --precision-ladder \
+  --fp16-pack /path/to/fp16.fp8sr \
+  --fp8-pack /path/to/fp8.fp8sr \
+  --fp4-pack /path/to/fp4.fp8sr \
+  --int2-pack /path/to/int2.fp8sr \
+  --record-jsonl /private/tmp/ortho4xp-execution.jsonl \
+  --gpu-tools --keep-artifacts
+```
+
+FP16/FP4/INT2の決定的パックは次のように生成できる。FP8SR v1は従来どおり受け付け、非FP8 dtypeはv2パックとして扱う。
+
+```sh
+.venv/bin/python tools/fp8sr_pack.py --create-fixture /private/tmp/fp4sr --dtype MetalFloat4E2M1
+.venv/bin/python tools/fp8sr_pack.py --create-fixture /private/tmp/int2sr --dtype Int2
+```
+
+`--gpu-tools`を指定した場合だけ、`gpucapture`で`.gputrace`を作成し、`gpudebug --oneshot --json`でcompute dispatchを確認し、`metalperftrace collect/overview`の成果物を保存する。ツール不在、capturable process不在、Metal layerの記録なしは理由付き`SKIP`となる。TensorOps dispatchの存在はNeural Accelerator使用の証明ではない。
 
 この検証はMetalデバイス、Core ImageのMetalコンテキスト、ASHelperの直接変換、`--convert-batch-v3` の64件並列変換、DDSのヘッダ・Mip数・マスク透明度、色補正の作用、DDS書き込み失敗時の終了コードを確認する。`--keep-artifacts` を省略すると、成功時の生成物は終了時に削除される。失敗時は調査用に生成物を残し、出力された `kept_artifacts` を確認できる。Metal対応ホストでも実行プロセスのサンドボックスからデバイスが見えない場合があり、その場合は `metal_host_supported=true` と表示されるため、ホストのターミナルなど隔離されていないCLIから再実行する。MetalデバイスがないMacではCPU/fallbackの確認だけを行い、GPU固有の判定はスキップする。実データのタイル生成・GUI操作は既存の手動確認範囲であり、このランナーには含めない。
 
@@ -80,16 +101,16 @@ macOS 27、FP8 TensorOps対応Apple Silicon Macでは、ASHelperを再ビルド�
 
 ```sh
 ./Utils/run/build_ashelper.sh
-Utils/mac/ASHelper --fp8-tensorops-upscale \
+Utils/mac/ASHelper --tensorops-upscale \
   /private/tmp/ortho4xp-fp8-fixture \
   /private/tmp/ortho4xp-fp8-fixture/input.png \
   /private/tmp/ortho4xp-fp8-fixture/output.png
-Utils/mac/ASHelper --fp8-tensorops-upscale-batch \
+Utils/mac/ASHelper --tensorops-upscale-batch \
   /private/tmp/ortho4xp-fp8-fixture \
   /private/tmp/ortho4xp-fp8-fixture/input.png \
   /private/tmp/ortho4xp-fp8-fixture/batch-output.png
 ```
 
-`fp8_dispatch=ready`はFP8 E4M3重み、FP16活性値、FP16累積のTensorOpsパイプライン初期化、`fp8_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。Neural Acceleratorの確認はXcode GPU traceで別途行う。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認と、Xcode GPU traceの確認は未実行として分けて報告する。
+`tensorops_dispatch=ready`はTensorOpsパイプライン初期化、`tensorops_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。Neural Acceleratorの確認はGPU traceで別途行う。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認とGPU traceの確認は未実行として分けて報告する。
 
 構文確認、ビルド、限定的なスクリプト実行だけでは、実際のProvider応答、長時間のタイル生成、GUI操作、利用者データへの影響まで保証しない。未実行の範囲を最終報告に明記する。

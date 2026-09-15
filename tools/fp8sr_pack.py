@@ -25,6 +25,14 @@ EXPECTED_LAYERS = (
     ("conv2", 3, 32, 12),
 )
 ROW_STRIDE_BYTES = 128
+SUPPORTED_WEIGHT_DTYPES = (
+    "Float16",
+    "MetalFloat8E4M3",
+    "MetalFloat4E2M1",
+    "Int2",
+)
+LEGACY_VERSION = 1
+VARIANT_VERSION = 2
 
 
 def _load_manifest(pack: Path) -> dict:
@@ -59,16 +67,27 @@ def validate_pack(pack_path: str | Path) -> dict:
     manifest = _load_manifest(pack)
     exact_values = {
         "format": "FP8SR",
-        "version": 1,
         "upscale_factor": 2,
         "layout": "NHWC",
         "input_channels": 3,
         "output_channels": 3,
-        "weight_dtype": "MetalFloat8E4M3",
         "activation_dtype": "Float16",
         "accumulation_dtype": "Float16",
         "weight_row_stride_bytes": ROW_STRIDE_BYTES,
     }
+    if manifest.get("version") not in (LEGACY_VERSION, VARIANT_VERSION):
+        raise FP8SRPackError(
+            f"manifest.version must be {LEGACY_VERSION} or {VARIANT_VERSION}, "
+            f"got {manifest.get('version')!r}"
+        )
+    weight_dtype = manifest.get("weight_dtype")
+    if weight_dtype not in SUPPORTED_WEIGHT_DTYPES:
+        raise FP8SRPackError(
+            f"manifest.weight_dtype must be one of {SUPPORTED_WEIGHT_DTYPES!r}, "
+            f"got {weight_dtype!r}"
+        )
+    if manifest.get("version") == LEGACY_VERSION and weight_dtype != "MetalFloat8E4M3":
+        raise FP8SRPackError("version 1 packs must use MetalFloat8E4M3 weights")
     for key, expected in exact_values.items():
         if manifest.get(key) != expected:
             raise FP8SRPackError(
@@ -106,6 +125,14 @@ def validate_pack(pack_path: str | Path) -> dict:
             raise FP8SRPackError(
                 f"layer {name}: weights size is {actual}, expected {k_padded * ROW_STRIDE_BYTES}"
             )
+        weight_data = weight_path.read_bytes()
+        _validate_finite_weights(
+            weight_data,
+            k_padded,
+            out_padded,
+            str(weight_dtype),
+            name,
+        )
         if not bias_path.is_file() or bias_path.stat().st_size != out_padded * 2:
             actual = bias_path.stat().st_size if bias_path.is_file() else "missing"
             raise FP8SRPackError(
@@ -127,7 +154,13 @@ def validate_pack(pack_path: str | Path) -> dict:
                 "scale": float(scale),
             }
         )
-    return {"pack": pack, "manifest": manifest, "layers": normalized_layers}
+    return {
+        "pack": pack,
+        "manifest": manifest,
+        "version": int(manifest["version"]),
+        "weight_dtype": str(weight_dtype),
+        "layers": normalized_layers,
+    }
 
 
 def decode_fp8_e4m3(value: int) -> float:
@@ -156,12 +189,84 @@ def encode_fp8_e4m3(value: float) -> int:
     return min(_FP8_FINITE_VALUES, key=lambda pair: abs(pair[1] - value))[0]
 
 
+def decode_fp4_e2m1(value: int) -> float:
+    """Decode the packed Metal FP4 E2M1 value used by MSL."""
+    value &= 0x0F
+    sign = -1.0 if value & 0x08 else 1.0
+    exponent = (value >> 1) & 0x03
+    mantissa = value & 0x01
+    if exponent == 0:
+        return sign * mantissa * 0.5
+    return sign * (1.0 + mantissa * 0.5) * (2.0 ** (exponent - 1))
+
+
+_FP4_FINITE_VALUES = tuple(
+    (code, decode_fp4_e2m1(code)) for code in range(16)
+)
+
+
+def encode_fp4_e2m1(value: float) -> int:
+    if not math.isfinite(value):
+        raise ValueError("FP4 fixture values must be finite")
+    return min(_FP4_FINITE_VALUES, key=lambda pair: abs(pair[1] - value))[0]
+
+
+def decode_int2(value: int) -> int:
+    value &= 0x03
+    return value - 4 if value & 0x02 else value
+
+
+def encode_int2(value: float) -> int:
+    if not math.isfinite(value):
+        raise ValueError("INT2 fixture values must be finite")
+    return min(range(4), key=lambda code: abs(decode_int2(code) - value))
+
+
+def _weight_bytes_per_element(weight_dtype: str) -> float:
+    return {
+        "Float16": 2.0,
+        "MetalFloat8E4M3": 1.0,
+        "MetalFloat4E2M1": 0.5,
+        "Int2": 0.25,
+    }[weight_dtype]
+
+
+def _read_weight(weights: bytes, feature: int, output_channel: int, weight_dtype: str) -> float:
+    row = feature * ROW_STRIDE_BYTES
+    if weight_dtype == "Float16":
+        return struct.unpack_from("<e", weights, row + output_channel * 2)[0]
+    if weight_dtype == "MetalFloat8E4M3":
+        return decode_fp8_e4m3(weights[row + output_channel])
+    if weight_dtype == "MetalFloat4E2M1":
+        packed = weights[row + output_channel // 2]
+        return decode_fp4_e2m1(packed >> 4 if output_channel & 1 else packed)
+    packed = weights[row + output_channel // 4]
+    return float(decode_int2((packed >> ((output_channel % 4) * 2)) & 0x03))
+
+
+def _validate_finite_weights(
+    weights: bytes,
+    k_padded: int,
+    out_padded: int,
+    weight_dtype: str,
+    layer_name: str,
+) -> None:
+    for feature in range(k_padded):
+        for output_channel in range(out_padded):
+            value = _read_weight(weights, feature, output_channel, weight_dtype)
+            if not math.isfinite(value):
+                raise FP8SRPackError(
+                    f"layer {layer_name}: weights contain a non-finite value "
+                    f"at feature={feature}, output_channel={output_channel}"
+                )
+
+
 def _round_fp16(value: float) -> float:
     return struct.unpack("<e", struct.pack("<e", float(value)))[0]
 
 
 def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_path: str | Path) -> Path:
-    """Run the fixed FP8SR graph with FP16-rounded Python arithmetic.
+    """Run any supported FP8SR weight variant with FP16-rounded arithmetic.
 
     This is intentionally a small verification reference, not a production
     inference path. It makes the same RGB/NHWC, edge-clamped 3x3 graph and
@@ -170,6 +275,7 @@ def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_p
     from PIL import Image
 
     normalized = validate_pack(pack_path)
+    weight_dtype = normalized["weight_dtype"]
     with Image.open(input_path).convert("RGB") as source:
         width, height = source.size
         source_pixels = source.load()
@@ -204,8 +310,9 @@ def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_p
                             source_pixel = sample_y * width + sample_x
                             for input_channel in range(in_channels):
                                 activation = previous[source_pixel][input_channel]
-                                weight_code = weights[feature * ROW_STRIDE_BYTES + output_channel]
-                                weight = _round_fp16(decode_fp8_e4m3(weight_code))
+                                weight = _round_fp16(
+                                    _read_weight(weights, feature, output_channel, weight_dtype)
+                                )
                                 accumulator = _round_fp16(
                                     accumulator + _round_fp16(activation * weight)
                                 )
@@ -234,7 +341,14 @@ def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_p
     return destination
 
 
-def _write_layer(pack: Path, name: str, kernel: int, in_channels: int, out_channels: int) -> None:
+def _write_layer(
+    pack: Path,
+    name: str,
+    kernel: int,
+    in_channels: int,
+    out_channels: int,
+    weight_dtype: str,
+) -> None:
     k_padded = ((kernel * kernel * in_channels + 31) // 32) * 32
     out_padded = ((out_channels + 31) // 32) * 32
     weights = bytearray(k_padded * ROW_STRIDE_BYTES)
@@ -248,37 +362,68 @@ def _write_layer(pack: Path, name: str, kernel: int, in_channels: int, out_chann
                 value = 1.0
             elif name == "conv2" and input_channel == output_channel % in_channels:
                 value = 1.0
-            weights[(center + input_channel) * ROW_STRIDE_BYTES + output_channel] = encode_fp8_e4m3(value)
-    (pack / f"{name}.fp8").write_bytes(weights)
+            feature = center + input_channel
+            if weight_dtype == "Float16":
+                struct.pack_into("<e", weights, feature * ROW_STRIDE_BYTES + output_channel * 2, value)
+            elif weight_dtype == "MetalFloat8E4M3":
+                weights[feature * ROW_STRIDE_BYTES + output_channel] = encode_fp8_e4m3(value)
+            elif weight_dtype == "MetalFloat4E2M1":
+                code = encode_fp4_e2m1(value)
+                offset = feature * ROW_STRIDE_BYTES + output_channel // 2
+                shift = (output_channel % 2) * 4
+                weights[offset] |= code << shift
+            elif weight_dtype == "Int2":
+                code = encode_int2(value)
+                offset = feature * ROW_STRIDE_BYTES + output_channel // 4
+                shift = (output_channel % 4) * 2
+                weights[offset] |= code << shift
+    extension = {
+        "Float16": "f16w",
+        "MetalFloat8E4M3": "fp8",
+        "MetalFloat4E2M1": "fp4",
+        "Int2": "int2",
+    }[weight_dtype]
+    (pack / f"{name}.{extension}").write_bytes(weights)
     (pack / f"{name}.f16").write_bytes(b"".join(struct.pack("<e", 0.0) for _ in range(out_padded)))
 
 
-def create_fixture(pack_path: str | Path) -> Path:
+def create_fixture(
+    pack_path: str | Path,
+    weight_dtype: str = "MetalFloat8E4M3",
+) -> Path:
     """Create a deterministic, tiny FP8SR pack outside the repository."""
+    if weight_dtype not in SUPPORTED_WEIGHT_DTYPES:
+        raise FP8SRPackError(f"unsupported fixture dtype {weight_dtype!r}")
     pack = Path(pack_path).expanduser().resolve()
     pack.mkdir(parents=True, exist_ok=True)
     manifest = {
         "format": "FP8SR",
-        "version": 1,
+        "version": LEGACY_VERSION if weight_dtype == "MetalFloat8E4M3" else VARIANT_VERSION,
         "upscale_factor": 2,
         "layout": "NHWC",
         "input_channels": 3,
         "output_channels": 3,
-        "weight_dtype": "MetalFloat8E4M3",
+        "weight_dtype": weight_dtype,
         "activation_dtype": "Float16",
         "accumulation_dtype": "Float16",
         "weight_row_stride_bytes": ROW_STRIDE_BYTES,
         "layers": [],
     }
     for name, kernel, in_channels, out_channels in EXPECTED_LAYERS:
-        _write_layer(pack, name, kernel, in_channels, out_channels)
+        _write_layer(pack, name, kernel, in_channels, out_channels, weight_dtype)
+        extension = {
+            "Float16": "f16w",
+            "MetalFloat8E4M3": "fp8",
+            "MetalFloat4E2M1": "fp4",
+            "Int2": "int2",
+        }[weight_dtype]
         manifest["layers"].append(
             {
                 "name": name,
                 "kernel": kernel,
                 "in_channels": in_channels,
                 "out_channels": out_channels,
-                "weights": f"{name}.fp8",
+                "weights": f"{name}.{extension}",
                 "bias": f"{name}.f16",
                 "scale": 1.0,
             }
@@ -295,13 +440,19 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--validate", type=Path, metavar="PACK")
     group.add_argument("--create-fixture", type=Path, metavar="PACK")
+    parser.add_argument(
+        "--dtype",
+        choices=SUPPORTED_WEIGHT_DTYPES,
+        default="MetalFloat8E4M3",
+        help="weight dtype for --create-fixture (variant packs use version 2)",
+    )
     args = parser.parse_args()
     try:
         if args.validate:
             normalized = validate_pack(args.validate)
             print(f"FP8SR valid: {normalized['pack']}")
         else:
-            print(f"FP8SR fixture: {create_fixture(args.create_fixture)}")
+            print(f"FP8SR fixture: {create_fixture(args.create_fixture, args.dtype)}")
     except (FP8SRPackError, OSError, ValueError) as error:
         parser.error(str(error))
     return 0

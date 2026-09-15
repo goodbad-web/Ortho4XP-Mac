@@ -441,8 +441,8 @@ def _ashelper_metal_available(as_helper):
     return available
 
 
-def _ashelper_fp8_tensorops_available(as_helper):
-    """Probe the macOS 27 FP8 TensorOps capability before batch deferral."""
+def _ashelper_tensorops_available(as_helper):
+    """Probe the macOS 27 TensorOps capability before batch deferral."""
     try:
         result = subprocess.run(
             [as_helper, "--capabilities"],
@@ -453,17 +453,17 @@ def _ashelper_fp8_tensorops_available(as_helper):
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        UI.vprint(1, f"WARNING: Could not probe ASHelper FP8 capability: {error}")
+        UI.vprint(1, f"WARNING: Could not probe ASHelper TensorOps capability: {error}")
         return False
 
     available = (
         result.returncode == 0
-        and "fp8_tensorops_available=true" in (result.stdout or "").splitlines()
+        and "tensorops_available=true" in (result.stdout or "").splitlines()
     )
     if not available:
         UI.vprint(
             1,
-            "WARNING: ASHelper FP8 TensorOps is unavailable; using the requested fallback path.",
+            "WARNING: ASHelper TensorOps is unavailable; using the requested fallback path.",
         )
     return available
 
@@ -776,10 +776,10 @@ def _build_tile(tile, persist_config=True):
                 if gpu_converter_requested
                 else False
             )
-            fp8_tensorops_available = (
-                _ashelper_fp8_tensorops_available(as_helper)
+            tensorops_available = (
+                _ashelper_tensorops_available(as_helper)
                 if gpu_converter_requested
-                and requested_upscale_backend == "fp8_tensorops"
+                and requested_upscale_backend == "tensorops"
                 else False
             )
             gpu_batch_enabled = gpu_batch_requested and metal_available
@@ -825,7 +825,7 @@ def _build_tile(tile, persist_config=True):
                 _, _, _, _, provider_code = item
                 return IMG.can_defer_gpu_batch(provider_code)
 
-            def can_defer_to_fp8_batch(item):
+            def can_defer_to_tensorops_batch(item):
                 item_tile, _, _, item_zoomlevel, provider_code = item
                 if int(item_zoomlevel) >= 18:
                     return False
@@ -844,32 +844,32 @@ def _build_tile(tile, persist_config=True):
                 convert_list
                 and all(can_defer_to_gpu_batch(item) for item in convert_list)
             )
-            fp8_model_path = getattr(
+            tensorops_model_path = getattr(
                 tile, 'fp8_model_path', getattr(IMG, 'fp8_model_path', '')
             )
-            fp8_pack_configured = bool(
-                fp8_model_path
-                and os.path.isdir(fp8_model_path)
-                and os.path.isfile(os.path.join(fp8_model_path, "manifest.json"))
+            tensorops_pack_configured = bool(
+                tensorops_model_path
+                and os.path.isdir(tensorops_model_path)
+                and os.path.isfile(os.path.join(tensorops_model_path, "manifest.json"))
             )
-            defer_fp8_batch = bool(
+            defer_tensorops_batch = bool(
                 gpu_batch_enabled
-                and fp8_tensorops_available
-                and requested_upscale_backend == "fp8_tensorops"
-                and fp8_pack_configured
+                and tensorops_available
+                and requested_upscale_backend == "tensorops"
+                and tensorops_pack_configured
                 and convert_list
-                and all(can_defer_to_fp8_batch(item) for item in convert_list)
+                and all(can_defer_to_tensorops_batch(item) for item in convert_list)
             )
             defer_gpu_batch = bool(
                 gpu_batch_enabled
                 and batch_items_eligible
                 and (
-                    requested_upscale_backend != "fp8_tensorops"
-                    or defer_fp8_batch
+                    requested_upscale_backend != "tensorops"
+                    or defer_tensorops_batch
                 )
             )
             config_data['defer_gpu_batch'] = defer_gpu_batch
-            config_data['defer_fp8_batch'] = defer_fp8_batch
+            config_data['defer_fp8_batch'] = defer_tensorops_batch
 
             dds_error = IMG.dds_format_support_error(dds_converter, dds_format)
             if dds_error:
@@ -888,24 +888,24 @@ def _build_tile(tile, persist_config=True):
                 success_count = len(convert_list) if pool_success else 0
                 conversion_success = bool(pool_success)
 
-            # FP8SR image work is intentionally batched in one ASHelper
+            # TensorOps image work is intentionally batched in one ASHelper
             # process.  FP8SRRuntime caches the validated pack in that
             # process, so a large tile set does not reload the model for each
             # worker or each image. This narrow path accepts direct JPEG
             # inputs; supported color filters and masks are applied by the
             # existing DDS batch after FP8 inference.
-            if conversion_success and defer_fp8_batch:
-                UI.vprint(1, "-> Executing FP8 TensorOps upscale batch via ASHelper...")
-                fp8_batch_args = [fp8_model_path]
-                fp8_batch_outputs = []
-                fp8_batch_error = None
+            if conversion_success and defer_tensorops_batch:
+                UI.vprint(1, "-> Executing TensorOps upscale batch via ASHelper...")
+                tensorops_batch_args = [tensorops_model_path]
+                tensorops_batch_outputs = []
+                tensorops_batch_error = None
                 for item in convert_list:
                     item_tile, item_x, item_y, item_z, item_provider = item
                     out_file_name = FNAMES.dds_file_name_from_attributes(
                         item_x, item_y, item_z, item_provider
                     )
                     if item_provider not in IMG.providers_dict:
-                        fp8_batch_error = f"provider source unavailable for {out_file_name}"
+                        tensorops_batch_error = f"provider source unavailable for {out_file_name}"
                         break
                     jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
                         item_x, item_y, item_z, item_provider
@@ -918,13 +918,13 @@ def _build_tile(tile, persist_config=True):
                     )
                     jpeg_path = os.path.join(file_dir, jpeg_file_name)
                     if not IMG._jpeg_file_is_ready(jpeg_path):
-                        fp8_batch_error = f"input source not found for {out_file_name}"
+                        tensorops_batch_error = f"input source not found for {out_file_name}"
                         break
                     output_path = os.path.join(
                         UI.Ortho4XP_dir,
                         "tmp",
                         out_file_name.replace(
-                            ".dds", "_fp8_tensorops_upscaled.png"
+                            ".dds", "_tensorops_upscaled.png"
                         ),
                     )
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -932,14 +932,14 @@ def _build_tile(tile, persist_config=True):
                         os.remove(output_path)
                     except OSError:
                         pass
-                    fp8_batch_args.extend([jpeg_path, output_path])
-                    fp8_batch_outputs.append((jpeg_path, output_path))
+                    tensorops_batch_args.extend([jpeg_path, output_path])
+                    tensorops_batch_outputs.append((jpeg_path, output_path))
 
-                if fp8_batch_error is None and fp8_batch_outputs:
+                if tensorops_batch_error is None and tensorops_batch_outputs:
                     try:
                         fp8_result = subprocess.run(
-                            [as_helper, "--fp8-tensorops-upscale-batch"]
-                            + fp8_batch_args,
+                            [as_helper, "--tensorops-upscale-batch"]
+                            + tensorops_batch_args,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,
@@ -950,32 +950,32 @@ def _build_tile(tile, persist_config=True):
                             for line in fp8_result.stdout.splitlines():
                                 UI.vprint(output_level, "      " + line)
                         if fp8_result.returncode != 0:
-                            fp8_batch_error = (
-                                f"ASHelper returned {fp8_result.returncode}"
-                            )
+                                tensorops_batch_error = (
+                                    f"ASHelper returned {fp8_result.returncode}"
+                                )
                     except Exception as error:
-                        fp8_batch_error = f"ASHelper execution failed: {error}"
+                        tensorops_batch_error = f"ASHelper execution failed: {error}"
 
-                if fp8_batch_error is None:
-                    invalid_fp8_outputs = [
+                if tensorops_batch_error is None:
+                    invalid_tensorops_outputs = [
                         output_path
-                        for input_path, output_path in fp8_batch_outputs
+                        for input_path, output_path in tensorops_batch_outputs
                         if not IMG._valid_upscale_output(input_path, output_path)
                     ]
-                    if invalid_fp8_outputs:
-                        fp8_batch_error = (
-                            "invalid output: " + ", ".join(invalid_fp8_outputs)
+                    if invalid_tensorops_outputs:
+                        tensorops_batch_error = (
+                            "invalid output: " + ", ".join(invalid_tensorops_outputs)
                         )
 
-                if fp8_batch_error is not None:
-                    for _, output_path in fp8_batch_outputs:
+                if tensorops_batch_error is not None:
+                    for _, output_path in tensorops_batch_outputs:
                         try:
                             os.remove(output_path)
                         except OSError:
                             pass
                     UI.vprint(
                         1,
-                        f"WARNING: FP8 TensorOps batch failed ({fp8_batch_error}); "
+                        f"WARNING: TensorOps batch failed ({tensorops_batch_error}); "
                         "falling back to per-texture processing.",
                     )
                     fallback_progress = {
@@ -992,7 +992,7 @@ def _build_tile(tile, persist_config=True):
                     success_count = len(convert_list) if fallback_success else 0
                     conversion_success = bool(fallback_success)
                     defer_gpu_batch = False
-                    defer_fp8_batch = False
+                    defer_tensorops_batch = False
 
             # GPU Batch DDS Conversion integration for macOS
             if conversion_success and defer_gpu_batch:
@@ -1034,24 +1034,24 @@ def _build_tile(tile, persist_config=True):
                             ".dds", "_metalfx_spatial_upscaled.png"
                         ),
                     )
-                    fp8_upscaled_tmp = os.path.join(
+                    tensorops_upscaled_tmp = os.path.join(
                         UI.Ortho4XP_dir,
                         "tmp",
                         out_file_name.replace(
-                            ".dds", "_fp8_tensorops_upscaled.png"
+                        ".dds", "_tensorops_upscaled.png"
                         ),
                     )
-                    lanczos_upscaled_tmp = os.path.join(
+                    ci_lanczos_upscaled_tmp = os.path.join(
                         UI.Ortho4XP_dir,
                         "tmp",
-                        out_file_name.replace(".dds", "_lanczos_upscaled.png"),
+                        out_file_name.replace(".dds", "_ci_lanczos_upscaled.png"),
                     )
                     upscale_candidates = (
-                        [lanczos_upscaled_tmp]
-                        if upscale_backend == "lanczos"
-                        else [fp8_upscaled_tmp, lanczos_upscaled_tmp]
-                        if upscale_backend == "fp8_tensorops"
-                        else [metalfx_upscaled_tmp, lanczos_upscaled_tmp]
+                        [ci_lanczos_upscaled_tmp]
+                        if upscale_backend == "ci_lanczos"
+                        else [tensorops_upscaled_tmp, ci_lanczos_upscaled_tmp]
+                        if upscale_backend == "tensorops"
+                        else [metalfx_upscaled_tmp, ci_lanczos_upscaled_tmp]
                     )
                     tmp_png = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
                     
@@ -1083,8 +1083,8 @@ def _build_tile(tile, persist_config=True):
                     prepared_input_paths[item_index] = input_path
                     
                     fp8_batch_input = (
-                        upscale_backend == "fp8_tensorops"
-                        and input_path == fp8_upscaled_tmp
+                        upscale_backend == "tensorops"
+                        and input_path == tensorops_upscaled_tmp
                     )
                     mask_input = input_path == jpeg_path or fp8_batch_input
                     mask_path = "none"

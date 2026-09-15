@@ -2606,14 +2606,19 @@ def init_worker(config_data):
     is_worker_process = True
 
 
-UPSCALE_BACKENDS = ("none", "lanczos", "metalfx_spatial", "fp8_tensorops")
+UPSCALE_BACKENDS = ("none", "ci_lanczos", "metalfx_spatial", "tensorops")
+UPSCALE_BACKEND_ALIASES = {
+    "lanczos": "ci_lanczos",
+    "fp8_tensorops": "tensorops",
+}
 
 
 def normalize_upscale_backend(value):
+    value = UPSCALE_BACKEND_ALIASES.get(value, value)
     if value in UPSCALE_BACKENDS:
         return value
     if value is True or str(value).lower() == "true":
-        return "lanczos"
+        return "ci_lanczos"
     return "none"
 
 
@@ -2622,15 +2627,15 @@ def current_upscale_backend():
     # Keep direct callers that still set the pre-backend compatibility flag
     # working while all persisted configuration uses upscale_backend.
     if backend == "none" and getattr(UI, "use_lanczos_upscale", False):
-        return "lanczos"
+        return "ci_lanczos"
     return backend
 
 
 def upscale_output_path(input_path, backend):
     suffix = {
-        "lanczos": "_lanczos_upscaled.png",
+        "ci_lanczos": "_ci_lanczos_upscaled.png",
         "metalfx_spatial": "_metalfx_spatial_upscaled.png",
-        "fp8_tensorops": "_fp8_tensorops_upscaled.png",
+        "tensorops": "_tensorops_upscaled.png",
     }.get(backend)
     if suffix is None:
         return None
@@ -2652,14 +2657,15 @@ def _image_has_non_opaque_alpha(path):
 
 
 def _upscale_command(as_helper_cmd, backend, input_path, output_path, fp8_model_path=None):
-    if backend == "lanczos":
-        return [as_helper_cmd, "--lanczos-upscale", input_path, output_path]
+    backend = normalize_upscale_backend(backend)
+    if backend == "ci_lanczos":
+        return [as_helper_cmd, "--ci-lanczos-upscale", input_path, output_path]
     if backend == "metalfx_spatial":
         return [as_helper_cmd, "--metalfx-spatial-upscale", input_path, output_path]
-    if backend == "fp8_tensorops":
+    if backend == "tensorops":
         return [
             as_helper_cmd,
-            "--fp8-tensorops-upscale",
+            "--tensorops-upscale",
             fp8_model_path,
             input_path,
             output_path,
@@ -2701,7 +2707,7 @@ def _run_lanczos_fallback(input_path, output_path, as_helper_cmd):
     if as_helper_cmd:
         try:
             result = subprocess.run(
-                _upscale_command(as_helper_cmd, "lanczos", input_path, output_path),
+                _upscale_command(as_helper_cmd, "ci_lanczos", input_path, output_path),
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -2724,29 +2730,29 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
         return input_path, "none", None
     effective_backend = backend
     fallback_reason = None
-    if backend in ("metalfx_spatial", "fp8_tensorops") and _image_has_non_opaque_alpha(input_path):
-        effective_backend = "lanczos"
+    if backend in ("metalfx_spatial", "tensorops") and _image_has_non_opaque_alpha(input_path):
+        effective_backend = "ci_lanczos"
         fallback_reason = "alpha"
 
-    if backend == "fp8_tensorops" and fallback_reason is None and (
+    if backend == "tensorops" and fallback_reason is None and (
         not fp8_model_path
         or not os.path.isdir(fp8_model_path)
         or not os.path.isfile(os.path.join(fp8_model_path, "manifest.json"))
     ):
         fallback_reason = "fp8_model_unavailable"
-        effective_backend = "lanczos"
+        effective_backend = "ci_lanczos"
 
-    if not as_helper_cmd and effective_backend != "lanczos":
+    if not as_helper_cmd and effective_backend != "ci_lanczos":
         fallback_reason = fallback_reason or "ashelper_unavailable"
-        effective_backend = "lanczos"
+        effective_backend = "ci_lanczos"
 
     output_path = upscale_output_path(input_path, effective_backend)
     if output_path is None:
         return None, None, "invalid_backend"
     for candidate in (
-        upscale_output_path(input_path, "lanczos"),
+        upscale_output_path(input_path, "ci_lanczos"),
         upscale_output_path(input_path, "metalfx_spatial"),
-        upscale_output_path(input_path, "fp8_tensorops"),
+        upscale_output_path(input_path, "tensorops"),
     ):
         if candidate:
             try:
@@ -2756,7 +2762,7 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
 
     valid_output = False
     result = None
-    if effective_backend == "lanczos":
+    if effective_backend == "ci_lanczos":
         valid_output = _run_lanczos_fallback(input_path, output_path, as_helper_cmd)
     else:
         command = _upscale_command(
@@ -2787,17 +2793,17 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
     if valid_output:
         return output_path, effective_backend, fallback_reason
 
-    if backend in ("metalfx_spatial", "fp8_tensorops") and effective_backend in (
+    if backend in ("metalfx_spatial", "tensorops") and effective_backend in (
         "metalfx_spatial",
-        "fp8_tensorops",
+        "tensorops",
     ):
         exit_code = result.returncode if result is not None else "unavailable"
-        reason_backend = "metalfx" if backend == "metalfx_spatial" else backend
+        reason_backend = "metalfx" if backend == "metalfx_spatial" else "tensorops"
         fallback_reason = f"{reason_backend}_exit_{exit_code}"
-        output_path = upscale_output_path(input_path, "lanczos")
+        output_path = upscale_output_path(input_path, "ci_lanczos")
         valid_output = _run_lanczos_fallback(input_path, output_path, as_helper_cmd)
         if valid_output:
-            return output_path, "lanczos", fallback_reason
+            return output_path, "ci_lanczos", fallback_reason
 
     return None, None, fallback_reason or f"{effective_backend}_failed"
 
@@ -2949,16 +2955,16 @@ def convert_texture(
         and direct_color_filter_supported
         and prepared_file is None
     )
-    defer_fp8_batch = (
+    defer_tensorops_batch = (
         getattr(UI, "defer_fp8_batch", False)
         and is_worker
-        and upscale_backend == "fp8_tensorops"
+        and upscale_backend == "tensorops"
         and not is_combined
         and type == "dds"
         and direct_color_filter_supported
         and prepared_file is None
     )
-    if defer_fp8_batch or (defer_gpu_batch and not use_upscale):
+    if defer_tensorops_batch or (defer_gpu_batch and not use_upscale):
         return 1
         
     file_to_convert = (
