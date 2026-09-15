@@ -146,20 +146,6 @@ which is the compatibility reference; change `2.inputs.ckpt_name` to
 list does not override the checkpoint, so this workflow setting applies to all
 four jobs. The matching job list is `comfyui_building_controlnet_jobs.json`.
 
-```sh
-.venv/bin/python tools/comfyui_texture_batch.py \
-  --workflow tools/comfyui_building_controlnet_api.json \
-  --jobs tools/comfyui_building_controlnet_jobs.json \
-  --output-dir /tmp/ortho4xp-building-controlnet \
-  --guide-dir /tmp/ortho4xp-controlnet-inputs \
-  --input-dir /Users/hiroshi/ComfyUI-Shared/input
-```
-
-`--input-dir` must be the input directory printed by the running ComfyUI
-instance. The batch client copies the referenced guide files from
-`--guide-dir` there before submitting the first job; with `--dry-run`, it only
-validates that the guide files exist.
-
 The depth guide is intentionally an external input: this installation has no
 Depth Anything/MiDaS preprocessor node. Render it from the same Blender
 camera and geometry as the facade guide so the ControlNet does not alter the
@@ -171,6 +157,21 @@ tools/run_blender_with_metal_preflight.sh --background \
   --python tools/render_controlnet_guides.py -- \
   --blend "/Users/hiroshi/X-Plane/Custom Scenery/zzz_Ortho4XP_AI_Buildings_+34+133_uv_test/objects/building-families.blend" \
   --output /tmp/ortho4xp-controlnet-inputs
+```
+
+After the paired guides have been generated, run the batch client. `--input-dir`
+must be the input directory printed by the running ComfyUI instance. The batch
+client copies the referenced guide files from `--guide-dir` there before
+submitting the first job; with `--dry-run`, it only validates that the guide
+files exist.
+
+```sh
+.venv/bin/python tools/comfyui_texture_batch.py \
+  --workflow tools/comfyui_building_controlnet_api.json \
+  --jobs tools/comfyui_building_controlnet_jobs.json \
+  --output-dir /tmp/ortho4xp-building-controlnet \
+  --guide-dir /tmp/ortho4xp-controlnet-inputs \
+  --input-dir /Users/hiroshi/ComfyUI-Shared/input
 ```
 
 Do not use a generated texture as the depth guide.

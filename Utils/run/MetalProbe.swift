@@ -1,6 +1,7 @@
 import Foundation
 import CoreImage
 import Metal
+import MetalFX
 
 print("metal_probe_version=1")
 
@@ -8,6 +9,12 @@ guard let device = MTLCreateSystemDefaultDevice() else {
     print("metal_available=false")
     print("metal_device=unavailable")
     exit(0)
+}
+
+if #available(macOS 13.0, *) {
+    print("metalfx_spatial_available=\(MTLFXSpatialScalerDescriptor.supportsDevice(device))")
+} else {
+    print("metalfx_spatial_available=false")
 }
 
 print("metal_available=true")

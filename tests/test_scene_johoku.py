@@ -23,9 +23,22 @@ def test_astro_tower_has_public_height_and_elliptical_detail():
     assert max(vertex[1] for vertex in mesh.vertices) == 160.0
     assert len(mesh.faces) > 1_000
     assert len(mesh.vertices) < 20_000
-    first_face = mesh.faces[0]
+    # The box core is intentionally emitted first as a robust fallback; the
+    # first elliptical side follows its six faces.
+    first_face = mesh.faces[12]
     normal = johoku._normal(*(mesh.vertices[index] for index in first_face[:3]))
     assert normal[0] > 0.0
+
+
+def test_ellipse_caps_face_away_from_the_mesh():
+    mesh = johoku.MeshData()
+    johoku.add_ellipse_shell(mesh, 10.0, 6.0, 0.0, 4.0, 12)
+
+    bottom = johoku._normal(*(mesh.vertices[index] for index in mesh.faces[-2][:3]))
+    top = johoku._normal(*(mesh.vertices[index] for index in mesh.faces[-1][:3]))
+
+    assert bottom[1] < 0.0
+    assert top[1] > 0.0
 
 
 def test_obj8_lod_sections_have_disjoint_draw_ranges():
@@ -37,7 +50,8 @@ def test_obj8_lod_sections_have_disjoint_draw_ranges():
     text = johoku.obj8_lod_text(sections, "scene_johoku_facade.png")
 
     assert text.count("ATTR_LOD ") == 3
-    assert text.count("ATTR_no_cull") == 3
+    assert text.count("ATTR_shadow") == 1
+    assert "ATTR_no_cull" not in text
     assert text.count("TRIS ") == 3
     assert "TEXTURE scene_johoku_facade.png" in text
     commands = text[text.index("IDX "):]

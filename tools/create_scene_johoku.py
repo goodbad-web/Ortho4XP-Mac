@@ -150,8 +150,10 @@ def add_ellipse_shell(
 
     bottom = [_ellipse_point(rx, rz, y0, 2.0 * math.pi * i / segments, x=x, z=z) for i in range(segments)]
     top = [_ellipse_point(rx, rz, y1, 2.0 * math.pi * i / segments, x=x, z=z) for i in range(segments)]
-    mesh.add_face(tuple(reversed(bottom)), tuple((0.0, 0.0) for _ in bottom))
-    mesh.add_face(tuple(top), tuple((0.0, 0.72) for _ in top))
+    # The increasing-angle ring points downwards in OBJ8's right-handed
+    # coordinate system.  Reverse only the top cap so both caps face out.
+    mesh.add_face(tuple(bottom), tuple((0.0, 0.0) for _ in bottom))
+    mesh.add_face(tuple(reversed(top)), tuple((0.0, 0.72) for _ in top))
 
 
 def add_ellipse_band(
@@ -188,12 +190,12 @@ def build_astro_tower_mesh(detail: str = "near") -> MeshData:
     mesh = MeshData()
     base_height = 7.0
     body_top = 153.0
-    add_ellipse_shell(mesh, 29.0, 21.0, 0.0, body_top, segments)
     # Keep a proven box-core silhouette inside the elliptical shell.  This
     # makes the landmark robust across X-Plane render paths while the shell
     # and bands provide the rounded facade seen from near range.
     add_box(mesh, 52.0, body_top - base_height, 34.0, y=base_height)
     add_box(mesh, 62.0, base_height, 48.0, y=0.0)
+    add_ellipse_shell(mesh, 29.0, 21.0, 0.0, body_top, segments)
     if detail != "far":
         for floor in range(1, 46):
             y = base_height + (body_top - base_height) * floor / 45.0
@@ -242,9 +244,9 @@ def build_podium_mesh(detail: str = "near") -> MeshData:
         raise ValueError(f"unsupported detail: {detail}")
 
     mesh = MeshData()
-    add_ellipse_shell(mesh, 78.0, 42.0, 0.0, 7.0, segments)
+    add_ellipse_shell(mesh, 50.0, 30.0, 0.0, 7.0, segments)
     if detail != "far":
-        add_ellipse_band(mesh, 78.0, 42.0, 7.0, 0.35, segments)
+        add_ellipse_band(mesh, 50.0, 30.0, 7.0, 0.35, segments)
         add_box(mesh, 38.0, 3.0, 18.0, y=7.0, z=20.0)
     if detail == "near":
         add_box(mesh, 12.0, 2.5, 28.0, y=10.0, z=18.0)
@@ -300,7 +302,7 @@ def obj8_lod_text(sections: Iterable[LODSection], texture_name: str) -> str:
 
     lines = [
         "A", "800", "OBJ", "", f"TEXTURE {texture_name}",
-        "GLOBAL_specular 0.20", "",
+        "GLOBAL_specular 0.20", "ATTR_shadow", "",
         f"POINT_COUNTS {len(all_vertices)} 0 0 {len(all_indices)}",
     ]
     for (x, y, z), (nx, ny, nz), (u, v) in all_vertices:
@@ -308,7 +310,6 @@ def obj8_lod_text(sections: Iterable[LODSection], texture_name: str) -> str:
     lines.extend(f"IDX {index}" for index in all_indices)
     for near_m, far_m, index_offset, index_count in commands:
         lines.append(f"ATTR_LOD {near_m:.1f} {far_m:.1f}")
-        lines.append("ATTR_no_cull")
         lines.append(f"TRIS {index_offset} {index_count}")
     return "\n".join(lines) + "\n"
 

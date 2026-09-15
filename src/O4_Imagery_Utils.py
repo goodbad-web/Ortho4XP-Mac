@@ -2574,7 +2574,7 @@ def _prepare_combined_layer(
 ################################################################################
 # Support for multiprocessing initialization
 def init_worker(config_data):
-    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd
+    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd, upscale_backend
     global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
     global is_worker_process
     
@@ -2592,7 +2592,7 @@ def init_worker(config_data):
     UI.Ortho4XP_dir = config_data['Ortho4XP_dir']
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
-    UI.use_lanczos_upscale = config_data.get('use_lanczos_upscale', False)
+    upscale_backend = normalize_upscale_backend(config_data.get('upscale_backend', 'none'))
     UI.dds_converter = config_data.get('dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
     UI.dds_format = config_data.get('dds_format', getattr(UI, 'dds_format', 'BC3'))
     UI.use_gpu_acceleration = config_data.get('use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
@@ -2602,6 +2602,124 @@ def init_worker(config_data):
     UI.defer_gpu_batch = config_data.get('defer_gpu_batch', False)
     UI.preserve_batch_inputs = config_data.get('preserve_batch_inputs', False)
     is_worker_process = True
+
+
+UPSCALE_BACKENDS = ("none", "lanczos", "metalfx_spatial")
+
+
+def normalize_upscale_backend(value):
+    if value in UPSCALE_BACKENDS:
+        return value
+    if value is True or str(value).lower() == "true":
+        return "lanczos"
+    return "none"
+
+
+def current_upscale_backend():
+    backend = normalize_upscale_backend(globals().get("upscale_backend", "none"))
+    # Keep direct callers that still set the pre-backend compatibility flag
+    # working while all persisted configuration uses upscale_backend.
+    if backend == "none" and getattr(UI, "use_lanczos_upscale", False):
+        return "lanczos"
+    return backend
+
+
+def upscale_output_path(input_path, backend):
+    suffix = {
+        "lanczos": "_lanczos_upscaled.png",
+        "metalfx_spatial": "_metalfx_spatial_upscaled.png",
+    }.get(backend)
+    if suffix is None:
+        return None
+    return os.path.join(
+        UI.Ortho4XP_dir,
+        "tmp",
+        os.path.basename(os.path.splitext(input_path)[0]) + suffix,
+    )
+
+
+def _image_has_non_opaque_alpha(path):
+    try:
+        with Image.open(path) as image:
+            if "A" not in image.getbands() and "transparency" not in image.info:
+                return False
+            return image.convert("RGBA").getchannel("A").getextrema()[0] < 255
+    except Exception:
+        return False
+
+
+def _upscale_command(as_helper_cmd, backend, input_path, output_path):
+    command = "--lanczos-upscale" if backend == "lanczos" else "--metalfx-spatial-upscale"
+    return [as_helper_cmd, command, input_path, output_path]
+
+
+def run_upscale(input_path, backend, as_helper_cmd):
+    """Run the requested 2x backend and return (path, effective, reason)."""
+    backend = normalize_upscale_backend(backend)
+    if backend == "none":
+        return input_path, "none", None
+    if not as_helper_cmd:
+        return None, None, "ashelper_unavailable"
+
+    effective_backend = backend
+    fallback_reason = None
+    if backend == "metalfx_spatial" and _image_has_non_opaque_alpha(input_path):
+        effective_backend = "lanczos"
+        fallback_reason = "alpha"
+
+    output_path = upscale_output_path(input_path, effective_backend)
+    if output_path is None:
+        return None, None, "invalid_backend"
+    for candidate in (
+        upscale_output_path(input_path, "lanczos"),
+        upscale_output_path(input_path, "metalfx_spatial"),
+    ):
+        if candidate:
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+
+    result = subprocess.run(
+        _upscale_command(as_helper_cmd, effective_backend, input_path, output_path),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    valid_output = False
+    if result.returncode == 0 and os.path.isfile(output_path):
+        try:
+            with Image.open(output_path) as image:
+                with Image.open(input_path) as source:
+                    valid_output = image.size == (source.width * 2, source.height * 2)
+        except Exception:
+            valid_output = False
+
+    if valid_output:
+        return output_path, effective_backend, fallback_reason
+
+    if backend == "metalfx_spatial" and effective_backend == "metalfx_spatial":
+        fallback_reason = f"metalfx_exit_{result.returncode}"
+        output_path = upscale_output_path(input_path, "lanczos")
+        fallback_result = subprocess.run(
+            _upscale_command(as_helper_cmd, "lanczos", input_path, output_path),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if fallback_result.returncode == 0 and os.path.isfile(output_path):
+            try:
+                with Image.open(output_path) as image:
+                    with Image.open(input_path) as source:
+                        valid_output = image.size == (source.width * 2, source.height * 2)
+            except Exception:
+                valid_output = False
+        if valid_output:
+            return output_path, "lanczos", fallback_reason
+
+    return None, None, fallback_reason or f"{effective_backend}_exit_{result.returncode}"
 
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds", prepared_file=None
@@ -2734,7 +2852,8 @@ def convert_texture(
         (provider_code not in providers_dict)
         or not jpeg_ready
     )
-    use_upscale = getattr(UI, 'use_lanczos_upscale', False)
+    upscale_backend = current_upscale_backend()
+    use_upscale = upscale_backend != "none"
     is_worker = globals().get('is_worker_process', False)
     direct_color_filter_supported = True
     if not is_combined and provider_code in providers_dict:
@@ -2844,30 +2963,30 @@ def convert_texture(
         UI.vprint(1, f"   ERROR: orthophoto source unavailable for {out_file_name}")
         return 0
 
-    # Optional conventional 2x image upscaling using Core Image's Lanczos filter.
-    # A supplied prepared file already contains the preprocessing requested by
-    # the caller (including an earlier Lanczos upscale).  Do not upscale it a
-    # second time during the CPU fallback after a failed GPU batch.
-    if prepared_file is None and getattr(UI, 'use_lanczos_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
-        # Add pid to avoid conflicts during multiprocessing
-        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_lanczos_upscaled.png")
-        UI.vprint(2, "      Upscaling texture using Core Image Lanczos...")
-        upscale_result = subprocess.call(
-            [as_helper_cmd, "--lanczos-upscale", file_to_convert, upscaled_tmp],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
+    # Optional 2x upscaling. A supplied prepared file already contains the
+    # preprocessing requested by the caller; never upscale it a second time.
+    if prepared_file is None and use_upscale and os.path.exists(file_to_convert):
+        UI.vprint(2, f"      Upscaling texture using {upscale_backend}...")
+        upscaled_tmp, effective_backend, fallback_reason = run_upscale(
+            file_to_convert, upscale_backend, as_helper_cmd
         )
-        if upscale_result == 0 and os.path.isfile(upscaled_tmp):
+        if upscaled_tmp and effective_backend:
             file_to_convert = upscaled_tmp
             upscaled_file_to_delete = upscaled_tmp
+            if effective_backend != upscale_backend:
+                UI.vprint(
+                    1,
+                    f"      Upscale fallback: requested={upscale_backend} "
+                    f"effective={effective_backend} reason={fallback_reason}",
+                )
         else:
-            UI.vprint(1, f"      ERROR: Lanczos upscale failed for {file_to_convert}")
+            UI.vprint(
+                1,
+                f"      ERROR: {upscale_backend} upscale failed "
+                f"(reason={fallback_reason}) for {file_to_convert}",
+            )
             cleanup_conversion_temp_files()
             return 0
-    elif prepared_file is None and getattr(UI, 'use_lanczos_upscale', False):
-        UI.vprint(1, "      ERROR: Lanczos upscale is enabled but ASHelper is unavailable.")
-        cleanup_conversion_temp_files()
-        return 0
 
     # A deferred worker has completed all image preparation (including
     # optional upscaling) and leaves those inputs for the main-process batch.

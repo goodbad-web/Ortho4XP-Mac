@@ -6,6 +6,7 @@ import Vision
 import CoreImage
 import Metal
 import MetalKit
+import MetalFX
 
 struct DDSHeader {
     var magic: UInt32 = 0x20534444; var size: UInt32 = 124; var flags: UInt32 = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000 
@@ -634,6 +635,151 @@ func lanczosUpscale(inputPath: String, outputPath: String) -> Bool {
     return true
 }
 
+@available(macOS 13.0, *)
+func metalFXSpatialUpscale(inputPath: String, outputPath: String) -> Bool {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        reportError("ASHelper: MetalFX Spatial requires a Metal device.")
+        return false
+    }
+    guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+        reportError("ASHelper: MetalFX Spatial is not supported by '\(device.name)'.")
+        return false
+    }
+    let sourceURL = URL(fileURLWithPath: inputPath)
+    guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        reportError("ASHelper: Failed to load MetalFX Spatial input '\(inputPath)'.")
+        return false
+    }
+
+    let raw = getRawRGBA(cgImage: image)
+    guard raw.count == image.width * image.height * 4 else {
+        reportError("ASHelper: Failed to normalize MetalFX Spatial input '\(inputPath)'.")
+        return false
+    }
+    if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
+        reportError("ASHelper: MetalFX Spatial requires an opaque input image (alpha must be 255).")
+        return false
+    }
+
+    let descriptor = MTLFXSpatialScalerDescriptor()
+    descriptor.colorTextureFormat = .rgba8Unorm
+    descriptor.outputTextureFormat = .rgba8Unorm
+    descriptor.inputWidth = image.width
+    descriptor.inputHeight = image.height
+    descriptor.outputWidth = image.width * 2
+    descriptor.outputHeight = image.height * 2
+    descriptor.colorProcessingMode = .perceptual
+    guard let scaler = descriptor.makeSpatialScaler(device: device) else {
+        reportError("ASHelper: Failed to create MetalFX Spatial scaler.")
+        return false
+    }
+
+    let inputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: image.width,
+        height: image.height,
+        mipmapped: false
+    )
+    inputDescriptor.storageMode = .shared
+    inputDescriptor.usage = scaler.colorTextureUsage
+    guard let inputTexture = device.makeTexture(descriptor: inputDescriptor) else {
+        reportError("ASHelper: Failed to allocate MetalFX Spatial input texture.")
+        return false
+    }
+    raw.withUnsafeBytes { bytes in
+        inputTexture.replace(
+            region: MTLRegionMake2D(0, 0, image.width, image.height),
+            mipmapLevel: 0,
+            withBytes: bytes.baseAddress!,
+            bytesPerRow: image.width * 4
+        )
+    }
+
+    let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: image.width * 2,
+        height: image.height * 2,
+        mipmapped: false
+    )
+    outputDescriptor.storageMode = .private
+    outputDescriptor.usage = scaler.outputTextureUsage
+    guard let outputTexture = device.makeTexture(descriptor: outputDescriptor),
+          let queue = device.makeCommandQueue(),
+          let commandBuffer = queue.makeCommandBuffer(),
+          let readback = device.makeBuffer(
+              length: image.width * image.height * 16,
+              options: .storageModeShared
+          ) else {
+        reportError("ASHelper: Failed to allocate MetalFX Spatial output resources.")
+        return false
+    }
+
+    scaler.colorTexture = inputTexture
+    scaler.inputContentWidth = image.width
+    scaler.inputContentHeight = image.height
+    scaler.outputTexture = outputTexture
+    scaler.encode(commandBuffer: commandBuffer)
+    guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+        reportError("ASHelper: Failed to create MetalFX Spatial readback encoder.")
+        return false
+    }
+    blit.copy(
+        from: outputTexture,
+        sourceSlice: 0,
+        sourceLevel: 0,
+        sourceOrigin: MTLOriginMake(0, 0, 0),
+        sourceSize: MTLSizeMake(image.width * 2, image.height * 2, 1),
+        to: readback,
+        destinationOffset: 0,
+        destinationBytesPerRow: image.width * 2 * 4,
+        destinationBytesPerImage: image.width * image.height * 16
+    )
+    blit.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    guard commandBuffer.status == .completed else {
+        reportError(
+            "ASHelper: MetalFX Spatial command buffer failed: "
+                + (commandBuffer.error?.localizedDescription ?? "unknown error")
+        )
+        return false
+    }
+
+    guard let outputContext = CGContext(
+        data: readback.contents(),
+        width: image.width * 2,
+        height: image.height * 2,
+        bitsPerComponent: 8,
+        bytesPerRow: image.width * 2 * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let outputImage = outputContext.makeImage(),
+          let destination = CGImageDestinationCreateWithURL(
+              URL(fileURLWithPath: outputPath) as CFURL,
+              UTType.png.identifier as CFString,
+              1,
+              nil
+          ) else {
+        reportError("ASHelper: Failed to create MetalFX Spatial output '\(outputPath)'.")
+        return false
+    }
+    CGImageDestinationAddImage(destination, outputImage, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        reportError("ASHelper: Failed to write MetalFX Spatial output '\(outputPath)'.")
+        return false
+    }
+    return true
+}
+
+func metalFXSpatialAvailable() -> Bool {
+    guard #available(macOS 13.0, *),
+          let device = MTLCreateSystemDefaultDevice() else {
+        return false
+    }
+    return MTLFXSpatialScalerDescriptor.supportsDevice(device)
+}
+
 func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) -> Bool {
     guard format != "BC7" else {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
@@ -724,11 +870,21 @@ guard args.count >= 2 else { fail("ASHelper: missing command.") }
 if args[1] == "--capabilities" {
     guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
     print("metal_available=\(MetalCompressor.shared != nil)")
+    print("metalfx_spatial_available=\(metalFXSpatialAvailable())")
 }
 else if args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
     // --upscale remains as a compatibility alias for older scripts.
     guard args.count == 4 else { fail("ASHelper: --lanczos-upscale expects input and output paths.") }
     if !lanczosUpscale(inputPath: args[2], outputPath: args[3]) {
+        exit(1)
+    }
+}
+else if args[1] == "--metalfx-spatial-upscale" {
+    guard args.count == 4 else { fail("ASHelper: --metalfx-spatial-upscale expects input and output paths.") }
+    guard #available(macOS 13.0, *) else {
+        fail("ASHelper: MetalFX Spatial requires macOS 13 or newer.")
+    }
+    if !metalFXSpatialUpscale(inputPath: args[2], outputPath: args[3]) {
         exit(1)
     }
 }

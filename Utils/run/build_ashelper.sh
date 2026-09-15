@@ -28,7 +28,9 @@ xcrun swiftc \
     -framework Vision \
     -framework CoreImage \
     -framework Metal \
-    -framework MetalKit
+    -framework MetalKit \
+    -Xlinker -weak_framework \
+    -Xlinker MetalFX
 
 mv "${build_dir}/ASHelper" "${runtime_binary}"
 echo "Built ${runtime_binary}"

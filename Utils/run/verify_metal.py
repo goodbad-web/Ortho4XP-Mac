@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import shutil
@@ -12,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +110,158 @@ def make_fixtures(directory: Path) -> tuple[Path, Path, Path, Path, Path]:
     alpha_mask_path = directory / "low_resolution_alpha_mask.png"
     alpha_mask.save(alpha_mask_path, format="PNG")
     return source, mask_path, alpha_mask_path, source_4096, upscale_seed_2048
+
+
+def make_upscale_comparison_fixture(directory: Path, target_size: int) -> tuple[Path, Path]:
+    from PIL import Image, ImageDraw
+
+    master = Image.new("RGB", (target_size, target_size))
+    pixels = master.load()
+    for y in range(target_size):
+        for x in range(target_size):
+            pixels[x, y] = (
+                (x * 255) // max(1, target_size - 1),
+                (y * 255) // max(1, target_size - 1),
+                ((x * 3 + y * 5) * 255) // max(1, target_size * 8 - 8),
+            )
+    draw = ImageDraw.Draw(master)
+    line_width = max(1, target_size // 512)
+    draw.rectangle(
+        (target_size // 16, target_size // 16, target_size * 7 // 16, target_size * 7 // 16),
+        fill=(225, 35, 45),
+        outline=(255, 255, 255),
+        width=line_width,
+    )
+    draw.ellipse(
+        (target_size * 5 // 16, target_size // 8, target_size * 15 // 16, target_size * 5 // 8),
+        fill=(35, 185, 80),
+        outline=(10, 10, 10),
+        width=line_width,
+    )
+    draw.line(
+        (0, target_size * 3 // 4, target_size, target_size * 3 // 4),
+        fill=(250, 240, 30),
+        width=max(2, target_size // 128),
+    )
+    for x in range(target_size // 2, target_size, max(2, target_size // 64)):
+        draw.line((x, target_size * 5 // 8, x, target_size), fill=(30, 30, 30), width=line_width)
+
+    resampling = getattr(Image, "Resampling", Image)
+    source = master.resize((target_size // 2, target_size // 2), resampling.BOX)
+    source_path = directory / f"comparison_source_{target_size // 2}.png"
+    reference_path = directory / f"comparison_reference_{target_size}.png"
+    source.save(source_path, format="PNG")
+    master.save(reference_path, format="PNG")
+    return source_path, reference_path
+
+
+def image_quality_metrics(output_path: Path, reference_path: Path) -> dict[str, Any]:
+    from PIL import Image, ImageChops, ImageStat
+
+    with Image.open(output_path).convert("RGB") as output, Image.open(reference_path).convert("RGB") as reference:
+        if output.size != reference.size:
+            raise ValueError(f"size {output.size} != reference {reference.size}")
+        difference = ImageChops.difference(output, reference)
+        stats = ImageStat.Stat(difference)
+        mae_channels = [float(value) for value in stats.mean]
+        rms_channels = [float(value) for value in stats.rms]
+        mae = sum(mae_channels) / len(mae_channels)
+        rmse = math.sqrt(sum(value * value for value in rms_channels) / len(rms_channels))
+        psnr = float("inf") if rmse == 0 else 20.0 * math.log10(255.0 / rmse)
+        return {
+            "mae": mae,
+            "mae_rgb": mae_channels,
+            "rmse": rmse,
+            "rmse_rgb": rms_channels,
+            "psnr_db": psnr,
+        }
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("no timing samples")
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))
+    return ordered[index]
+
+
+def compare_upscale_backend(
+    helper: Path,
+    backend: str,
+    source: Path,
+    reference: Path,
+    output: Path,
+    runs: int,
+) -> dict[str, Any]:
+    command_name = (
+        "--lanczos-upscale" if backend == "lanczos" else "--metalfx-spatial-upscale"
+    )
+    warmup_output = output.with_name(output.stem + "_warmup.png")
+    warmup = subprocess.run(
+        [str(helper), command_name, str(source), str(warmup_output)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if warmup.returncode != 0 or not warmup_output.is_file():
+        return {
+            "status": "FAIL",
+            "backend": backend,
+            "warmup_exit": warmup.returncode,
+            "output": str(output),
+            "diagnostic": (warmup.stdout or "").strip(),
+        }
+
+    samples_ms: list[float] = []
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for _ in range(runs):
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
+        started = time.perf_counter()
+        last_result = subprocess.run(
+            [str(helper), command_name, str(source), str(output)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        samples_ms.append((time.perf_counter() - started) * 1000.0)
+        if last_result.returncode != 0 or not output.is_file():
+            return {
+                "status": "FAIL",
+                "backend": backend,
+                "warmup_exit": warmup.returncode,
+                "run_exit": last_result.returncode,
+                "output": str(output),
+                "diagnostic": (last_result.stdout or "").strip(),
+            }
+
+    try:
+        quality = image_quality_metrics(output, reference)
+    except ValueError as error:
+        return {
+            "status": "FAIL",
+            "backend": backend,
+            "output": str(output),
+            "error": str(error),
+        }
+    return {
+        "status": "PASS",
+        "backend": backend,
+        "output": str(output),
+        "runs": runs,
+        "timing_ms": {
+            "samples": samples_ms,
+            "median": percentile(samples_ms, 0.5),
+            "p95": percentile(samples_ms, 0.95),
+            "first_measured": samples_ms[0],
+            "scope": "ASHelper process plus image decode, upscale, readback, and PNG encode",
+        },
+        "quality": quality,
+    }
 
 
 def dds_info(path: Path) -> dict[str, Any]:
@@ -362,11 +516,15 @@ def main() -> int:
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--helper", type=Path, default=ROOT / "Utils/mac/ASHelper")
     parser.add_argument("--batch-count", type=int, default=64)
+    parser.add_argument("--compare-upscale", action="store_true")
+    parser.add_argument("--compare-runs", type=int, default=5)
     parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
 
     if args.batch_count < 1 or args.batch_count > 128:
         fail("--batch-count must be between 1 and 128")
+    if args.compare_runs < 1 or args.compare_runs > 20:
+        fail("--compare-runs must be between 1 and 20")
     if not args.helper.is_file() or not os.access(args.helper, os.X_OK):
         fail(f"ASHelper is not executable: {args.helper}")
 
@@ -376,6 +534,7 @@ def main() -> int:
         fail(f"Pillow is required; run ./install_mac.sh or set ORTHO4XP_PYTHON: {error}")
 
     metal_available, probe_output, host_metal_supported = parse_probe(args.probe)
+    metalfx_spatial_available = "metalfx_spatial_available=true" in probe_output.splitlines()
     artifact_dir = Path(tempfile.mkdtemp(prefix="ortho4xp-metal-"))
     print(f"artifacts={artifact_dir}")
     overall_ok = True
@@ -383,8 +542,10 @@ def main() -> int:
         "helper": str(args.helper),
         "metal_available": metal_available,
         "host_metal_supported": host_metal_supported,
+        "metalfx_spatial_available": metalfx_spatial_available,
         "probe": probe_output,
         "batch_count": args.batch_count,
+        "compare_runs": args.compare_runs,
         "cases": [],
     }
 
@@ -393,6 +554,79 @@ def main() -> int:
             artifact_dir
         )
         from PIL import Image
+
+        if args.compare_upscale:
+            comparison_report: dict[str, Any] = {}
+            if not metalfx_spatial_available:
+                comparison_report["status"] = "SKIP(metalfx_spatial_unavailable)"
+                print("upscale comparison=SKIP(metalfx_spatial_unavailable)")
+            else:
+                comparison_report["status"] = "PASS"
+                transparent_source = artifact_dir / "comparison_transparent_input.png"
+                transparent_output = artifact_dir / "comparison_transparent_output.png"
+                with Image.open(source).convert("RGBA") as alpha_image:
+                    alpha_image.putalpha(128)
+                    alpha_image.save(transparent_source, format="PNG")
+                alpha_rejection = subprocess.run(
+                    [
+                        str(args.helper),
+                        "--metalfx-spatial-upscale",
+                        str(transparent_source),
+                        str(transparent_output),
+                    ],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                alpha_status = (
+                    "PASS"
+                    if alpha_rejection.returncode != 0
+                    and "opaque input image" in (alpha_rejection.stdout or "")
+                    and not transparent_output.exists()
+                    else "FAIL"
+                )
+                comparison_report["transparent_input"] = {
+                    "status": alpha_status,
+                    "exit": alpha_rejection.returncode,
+                    "diagnostic": (alpha_rejection.stdout or "").strip(),
+                }
+                print(f"upscale comparison transparent input={alpha_status}")
+                if alpha_status != "PASS":
+                    comparison_report["status"] = "FAIL"
+                    overall_ok = False
+                for target_size in (1024, 4096):
+                    comparison_source, comparison_reference = make_upscale_comparison_fixture(
+                        artifact_dir, target_size
+                    )
+                    case_report: dict[str, Any] = {
+                        "source": str(comparison_source),
+                        "reference": str(comparison_reference),
+                    }
+                    for backend in ("lanczos", "metalfx_spatial"):
+                        backend_output = artifact_dir / (
+                            f"comparison_{backend}_{target_size}.png"
+                        )
+                        result = compare_upscale_backend(
+                            args.helper,
+                            backend,
+                            comparison_source,
+                            comparison_reference,
+                            backend_output,
+                            args.compare_runs,
+                        )
+                        case_report[backend] = result
+                        print(
+                            f"upscale comparison {target_size}px {backend}="
+                            f"{result['status']} "
+                            f"timing={json.dumps(result.get('timing_ms', {}), sort_keys=True)} "
+                            f"quality={json.dumps(result.get('quality', {}), sort_keys=True)}"
+                        )
+                        if result["status"] != "PASS":
+                            comparison_report["status"] = "FAIL"
+                            overall_ok = False
+                    comparison_report[str(target_size)] = case_report
+            report["upscale_comparison"] = comparison_report
 
         upscale_cases = [
             ("1024px upscale fixture", source, artifact_dir / "source_upscaled.png", (1024, 1024)),

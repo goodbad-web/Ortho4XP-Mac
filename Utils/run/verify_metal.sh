@@ -22,7 +22,8 @@ xcrun swiftc \
     -framework Foundation \
     -framework CoreGraphics \
     -framework CoreImage \
-    -framework Metal
+    -framework Metal \
+    -framework MetalFX
 
 python_bin="${ORTHO4XP_PYTHON:-${repo_root}/.venv/bin/python}"
 if [[ ! -x "${python_bin}" ]]; then

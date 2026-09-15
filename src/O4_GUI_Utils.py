@@ -802,7 +802,7 @@ class Ortho4XP_GUI(tk.Tk):
         configured_dds_converter = getattr(UI, "dds_converter", "nvcompress")
         needs_ashelper = OsX and (
             configured_dds_converter == "TextureConverter"
-            or getattr(IMG, "use_lanczos_upscale", False)
+            or getattr(IMG, "upscale_backend", "none") != "none"
             or getattr(UI, "use_gpu_acceleration", False)
         )
 
@@ -817,7 +817,7 @@ class Ortho4XP_GUI(tk.Tk):
         if OsX:
             tools["ASHelper"] = (
                 os.path.join(FNAMES.Utils_dir, "mac", "ASHelper"),
-                "bundled ASHelper (for Apple Silicon conversion/Lanczos upscale)",
+                "bundled ASHelper (for Apple Silicon conversion/upscaling)",
             )
             if configured_dds_converter == "magick":
                 tools["magick"] = ("magick", "ImageMagick (configured DDS converter)")

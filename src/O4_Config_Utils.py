@@ -119,20 +119,28 @@ a particular server.",
         "default": True,
         "hint": "Use Apple Silicon GPU (Metal) for DDS texture conversion. Dramatically reduces CPU load and increases speed on M1/M2/M3 Mac.",
     },
+    "upscale_backend": {
+        "module": "IMG",
+        "type": str,
+        "default": "none",
+        "values": ("none", "lanczos", "metalfx_spatial"),
+        "short_name": "Upscale Backend",
+        "short_name_japanese": "アップスケール方式",
+        "hint": "Select the optional 2x orthophoto upscaling backend. Lanczos is a conventional Core Image filter; MetalFX Spatial is an Apple GPU scaler and is only used when explicitly selected.\n\n日本語: オルソフォトの2倍拡大バックエンドを選択します。Lanczosは通常のCore Imageフィルタ、MetalFX SpatialはApple GPUのスケーラです。明示的に選択した場合だけ使用します。透明度を含む画像はLanczosへフォールバックします。",
+    },
+    # Kept only so existing global and tile config files can be migrated. They
+    # are intentionally not included in any visible config-variable list.
     "use_lanczos_upscale": {
         "module": "IMG",
         "type": bool,
         "default": False,
-        "short_name": "Lanczos Upscale",
-        "hint": "Use Core Image's Lanczos filter for 2x texture upscaling through ASHelper. This is a conventional image filter, not AI upscaling or Neural Engine inference.\n\n日本語: ASHelper経由でCore ImageのLanczosフィルタを使い、テクスチャを2倍に拡大します。AI超解像やNeural Engine推論ではありません。",
+        "hint": "Deprecated compatibility key. Use upscale_backend=lanczos for the existing Core Image Lanczos filter.",
     },
-    # Kept only so existing global and tile config files can be migrated. It
-    # is intentionally not included in any visible config-variable list.
     "use_neural_upscale": {
         "module": "IMG",
         "type": bool,
         "default": False,
-        "hint": "Deprecated compatibility key. Use use_lanczos_upscale for the existing Lanczos image filter; no Neural Engine backend is implemented.",
+        "hint": "Deprecated compatibility key. Use upscale_backend=lanczos for the existing Core Image Lanczos filter; this key never enabled Neural Engine inference.",
     },
     "use_gpu_for_masks": {
         "module": "UI",
@@ -456,8 +464,58 @@ too low to grab these details.",
 }
 
 legacy_cfg_aliases = {
-    "use_neural_upscale": "use_lanczos_upscale",
+    "use_lanczos_upscale": "upscale_backend",
+    "use_neural_upscale": "upscale_backend",
 }
+
+
+def _legacy_upscale_backend(values):
+    """Convert old boolean upscale keys, preferring the newer legacy key."""
+    def as_bool(value):
+        return value if isinstance(value, bool) else str(value).lower() == "true"
+
+    if "use_lanczos_upscale" in values:
+        return "lanczos" if as_bool(values["use_lanczos_upscale"]) else "none"
+    if "use_neural_upscale" in values:
+        return "lanczos" if as_bool(values["use_neural_upscale"]) else "none"
+    return None
+
+
+def _upscale_backend_label(value):
+    labels = {
+        "none": ("None", "なし"),
+        "lanczos": ("Lanczos", "Lanczos"),
+        "metalfx_spatial": ("MetalFX Spatial", "MetalFX Spatial"),
+    }
+    english, japanese = labels.get(value, (str(value), str(value)))
+    return UI.ui_text(english, japanese)
+
+
+def _config_display_value(var, value):
+    return _upscale_backend_label(value) if var == "upscale_backend" else str(value)
+
+
+def _config_raw_value(var, value):
+    if var != "upscale_backend":
+        return value
+    for candidate in cfg_vars[var]["values"]:
+        if value == candidate or value == _upscale_backend_label(candidate):
+            return candidate
+    return value
+
+
+def _config_widget_values(var):
+    if cfg_vars[var]["type"] == bool:
+        return [True, False]
+    return [_config_display_value(var, value) for value in cfg_vars[var]["values"]]
+
+
+def _config_short_name(var):
+    info = cfg_vars[var]
+    return UI.ui_text(
+        info.get("short_name", var),
+        info.get("short_name_japanese", info.get("short_name", var)),
+    )
 
 list_app_vars = [
     "verbosity",
@@ -524,7 +582,7 @@ list_dsf_vars = [
     "cover_extent",
     "cover_zl",
     "dsf_node_budget",
-    "use_lanczos_upscale",
+    "upscale_backend",
     "use_gpu_acceleration",
     "use_gpu_for_color_filters",
     "dds_converter",
@@ -609,6 +667,8 @@ try:
                     val = cfg_vars[var]["type"](value)
                 except:
                     continue
+            if "values" in cfg_vars[var] and val not in cfg_vars[var]["values"]:
+                continue
 
             if var in legacy_cfg_aliases:
                 legacy_config_values[var] = val
@@ -631,9 +691,10 @@ try:
 except:
     print("No global config file found. Reverting to default values.")
 
-for legacy_var, current_var in legacy_cfg_aliases.items():
-    if legacy_var in legacy_config_values and current_var not in configured_vars:
-        setattr(IMG, current_var, legacy_config_values[legacy_var])
+if "upscale_backend" not in configured_vars:
+    legacy_backend = _legacy_upscale_backend(legacy_config_values)
+    if legacy_backend is not None:
+        setattr(IMG, "upscale_backend", legacy_backend)
 
 
 ################################################################################
@@ -730,6 +791,8 @@ class Tile:
                             val = cfg_vars[var]["type"](value)
                         except:
                             continue
+                    if "values" in cfg_vars[var] and val not in cfg_vars[var]["values"]:
+                        continue
                     if var in legacy_cfg_aliases:
                         legacy_config_values[var] = val
                         continue
@@ -747,9 +810,10 @@ class Tile:
                     else:
                         UI.vprint(2, e)
                         pass
-            for legacy_var, current_var in legacy_cfg_aliases.items():
-                if legacy_var in legacy_config_values and current_var not in configured_vars:
-                    setattr(self, current_var, legacy_config_values[legacy_var])
+            if "upscale_backend" not in configured_vars:
+                legacy_backend = _legacy_upscale_backend(legacy_config_values)
+                if legacy_backend is not None:
+                    setattr(self, "upscale_backend", legacy_backend)
             f.close()
             return 1
         except:
@@ -880,11 +944,7 @@ class Ortho4XP_Config(tk.Toplevel):
             )
             row = 1
             for item in sub_list:
-                text = (
-                    item
-                    if "short_name" not in cfg_vars[item]
-                    else cfg_vars[item]["short_name"]
-                )
+                text = _config_short_name(item)
                 ttk.Button(
                     self.frame_cfg,
                     text=text,
@@ -896,11 +956,7 @@ class Ortho4XP_Config(tk.Toplevel):
                     row=row, column=col, padx=2, pady=2, sticky=E + W + N + S
                 )
                 if cfg_vars[item]["type"] == bool or "values" in cfg_vars[item]:
-                    values = (
-                        [True, False]
-                        if cfg_vars[item]["type"] == bool
-                        else [str(x) for x in cfg_vars[item]["values"]]
-                    )
+                    values = _config_widget_values(item)
                     self.entry_[item] = ttk.Combobox(
                         self.frame_cfg,
                         values=values,
@@ -1007,11 +1063,7 @@ class Ortho4XP_Config(tk.Toplevel):
         for item in gui_app_vars_short:
             col = 2 * (j // l)
             row = this_row + j % l
-            text = (
-                item
-                if "short_name" not in cfg_vars[item]
-                else cfg_vars[item]["short_name"]
-            )
+            text = _config_short_name(item)
             ttk.Button(
                 self.frame_cfg,
                 text=text,
@@ -1021,11 +1073,7 @@ class Ortho4XP_Config(tk.Toplevel):
                 ),
             ).grid(row=row, column=col, padx=2, pady=2, sticky=E + W + N + S)
             if cfg_vars[item]["type"] == bool or "values" in cfg_vars[item]:
-                values = (
-                    ["True", "False"]
-                    if cfg_vars[item]["type"] == bool
-                    else [str(x) for x in cfg_vars[item]["values"]]
-                )
+                values = _config_widget_values(item)
                 self.entry_[item] = ttk.Combobox(
                     self.frame_cfg,
                     values=values,
@@ -1147,7 +1195,7 @@ class Ortho4XP_Config(tk.Toplevel):
                 if "module" in cfg_vars[var]
                 else var
             )
-            self.v_[var].set(str(eval(target)))
+            self.v_[var].set(_config_display_value(var, str(eval(target))))
 
     def choose_dem(self):
         tmp = filedialog.askopenfilename(
@@ -1238,7 +1286,7 @@ class Ortho4XP_Config(tk.Toplevel):
                 if var in legacy_cfg_aliases:
                     legacy_config_values[var] = value
                     continue
-                self.v_[var].set(value)
+                self.v_[var].set(_config_display_value(var, value))
                 configured_vars.add(var)
             except Exception as e:
                 # compatibility with zone_list config files from version <= 1.20
@@ -1251,9 +1299,10 @@ class Ortho4XP_Config(tk.Toplevel):
                 else:
                     UI.vprint(2, e)
                     pass
-        for legacy_var, current_var in legacy_cfg_aliases.items():
-            if legacy_var in legacy_config_values and current_var not in configured_vars:
-                self.v_[current_var].set(legacy_config_values[legacy_var])
+        if "upscale_backend" not in configured_vars:
+            legacy_backend = _legacy_upscale_backend(legacy_config_values)
+            if legacy_backend is not None:
+                self.v_["upscale_backend"].set(_config_display_value("upscale_backend", legacy_backend))
         if not self.v_["zone_list"].get():
             self.v_["zone_list"].set(str(zone_list))
         f.close()
@@ -1279,7 +1328,7 @@ class Ortho4XP_Config(tk.Toplevel):
             self.popup("ERROR", "Cannot write into " + str(build_dir))
             return 0
         for var in list_tile_vars:
-            f.write(var + "=" + self.v_[var].get() + "\n")
+            f.write(var + "=" + str(_config_raw_value(var, self.v_[var].get())) + "\n")
         f.close()
         return
 
@@ -1306,13 +1355,14 @@ class Ortho4XP_Config(tk.Toplevel):
                 if var in legacy_cfg_aliases:
                     legacy_config_values[var] = value
                     continue
-                self.v_[var].set(value)
+                self.v_[var].set(_config_display_value(var, value))
                 configured_vars.add(var)
             except:
                 pass
-        for legacy_var, current_var in legacy_cfg_aliases.items():
-            if legacy_var in legacy_config_values and current_var not in configured_vars:
-                self.v_[current_var].set(legacy_config_values[legacy_var])
+        if "upscale_backend" not in configured_vars:
+            legacy_backend = _legacy_upscale_backend(legacy_config_values)
+            if legacy_backend is not None:
+                self.v_["upscale_backend"].set(_config_display_value("upscale_backend", legacy_backend))
         f.close()
         return
 
@@ -1324,7 +1374,7 @@ class Ortho4XP_Config(tk.Toplevel):
                 os.replace(new_cfg, old_cfg)
             f = open(new_cfg, "w")
             for var in list_global_cfg:
-                f.write(var + "=" + self.v_[var].get() + "\n")
+                f.write(var + "=" + str(_config_raw_value(var, self.v_[var].get())) + "\n")
             f.close()
         except:
             UI.lvprint(1, "Could not write global config.")
@@ -1353,13 +1403,15 @@ class Ortho4XP_Config(tk.Toplevel):
                 except:
                     current_val = None
 
-                value_str = self.v_[var].get()
+                value_str = _config_raw_value(var, self.v_[var].get())
                 if cfg_vars[var]["type"] == bool:
                     val = (value_str.lower() == "true")
                 elif cfg_vars[var]["type"] == list:
                     val = eval(value_str)
                 else:
                     val = cfg_vars[var]["type"](value_str)
+                if "values" in cfg_vars[var] and val not in cfg_vars[var]["values"]:
+                    raise ValueError("invalid configuration value")
                 
                 if var in restart_required_vars and current_val != val:
                     restart_needed = True

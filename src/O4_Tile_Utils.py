@@ -769,7 +769,9 @@ def _build_tile(tile, persist_config=True):
                 'Ortho4XP_dir': UI.Ortho4XP_dir,
                 'verbosity': UI.verbosity,
                 'cleaning_level': UI.cleaning_level,
-                'use_lanczos_upscale': getattr(tile, 'use_lanczos_upscale', False),
+                'upscale_backend': IMG.normalize_upscale_backend(
+                    getattr(tile, 'upscale_backend', 'none')
+                ),
                 'dds_converter': getattr(tile, 'dds_converter', dds_converter),
                 'dds_format': getattr(tile, 'dds_format', dds_format),
                 'use_gpu_acceleration': effective_gpu,
@@ -841,7 +843,26 @@ def _build_tile(tile, persist_config=True):
                     out_file_name = FNAMES.dds_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
                     out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
                     png_file_name = out_file_name.replace("dds", "png")
-                    upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", out_file_name.replace(".dds", "_lanczos_upscaled.png"))
+                    upscale_backend = IMG.normalize_upscale_backend(
+                        getattr(tile, "upscale_backend", "none")
+                    )
+                    metalfx_upscaled_tmp = os.path.join(
+                        UI.Ortho4XP_dir,
+                        "tmp",
+                        out_file_name.replace(
+                            ".dds", "_metalfx_spatial_upscaled.png"
+                        ),
+                    )
+                    lanczos_upscaled_tmp = os.path.join(
+                        UI.Ortho4XP_dir,
+                        "tmp",
+                        out_file_name.replace(".dds", "_lanczos_upscaled.png"),
+                    )
+                    upscale_candidates = (
+                        [lanczos_upscaled_tmp]
+                        if upscale_backend == "lanczos"
+                        else [metalfx_upscaled_tmp, lanczos_upscaled_tmp]
+                    )
                     tmp_png = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
                     
                     if provider_code in IMG.providers_dict:
@@ -851,10 +872,14 @@ def _build_tile(tile, persist_config=True):
                     else:
                         jpeg_path = None
                     
-                    if getattr(tile, "use_lanczos_upscale", False) and os.path.exists(upscaled_tmp):
-                        input_path = upscaled_tmp
-                        temp_files_to_delete.append(upscaled_tmp)
-                    elif getattr(tile, "use_lanczos_upscale", False) and os.path.exists(tmp_png):
+                    if upscale_backend != "none" and any(
+                        os.path.exists(path) for path in upscale_candidates
+                    ):
+                        input_path = next(
+                            path for path in upscale_candidates if os.path.exists(path)
+                        )
+                        temp_files_to_delete.append(input_path)
+                    elif upscale_backend == "none" and os.path.exists(tmp_png):
                         input_path = tmp_png
                         temp_files_to_delete.append(tmp_png)
                     elif jpeg_path and IMG._jpeg_file_is_ready(jpeg_path):

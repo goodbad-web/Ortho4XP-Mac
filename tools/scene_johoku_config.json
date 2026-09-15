@@ -14,16 +14,16 @@
     "coordinate_source": "user-provided Google Earth reference coordinate; verify footprint in X-Plane"
   },
   "west_star": {
-    "lat": 35.2160844,
-    "lon": 136.9118989,
+    "lat": 35.2157800,
+    "lon": 136.9119800,
     "heading": 90.0,
     "floors": 11,
     "height_m": 31.0,
     "coordinate_source": "initial west-side offset from user-provided reference; verify"
   },
   "east_star": {
-    "lat": 35.2160844,
-    "lon": 136.9134789,
+    "lat": 35.2157800,
+    "lon": 136.9134000,
     "heading": 90.0,
     "floors": 11,
     "height_m": 31.0,
