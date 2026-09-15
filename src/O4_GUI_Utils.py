@@ -802,7 +802,7 @@ class Ortho4XP_GUI(tk.Tk):
         configured_dds_converter = getattr(UI, "dds_converter", "nvcompress")
         needs_ashelper = OsX and (
             configured_dds_converter == "TextureConverter"
-            or getattr(UI, "use_lanczos_upscale", False)
+            or getattr(IMG, "use_lanczos_upscale", False)
             or getattr(UI, "use_gpu_acceleration", False)
         )
 
