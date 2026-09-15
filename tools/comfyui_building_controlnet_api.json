@@ -1,0 +1,169 @@
+{
+  "2": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "sd_xl_base_1.0.safetensors"
+    }
+  },
+  "3": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "building_facade_guide.png"
+    }
+  },
+  "4": {
+    "class_type": "Canny",
+    "inputs": {
+      "image": [
+        "3",
+        0
+      ],
+      "low_threshold": 0.25,
+      "high_threshold": 0.70
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "building_depth_guide.png"
+    }
+  },
+  "7": {
+    "class_type": "ControlNetLoader",
+    "inputs": {
+      "control_net_name": "controlnet-canny-sdxl-1.0-fp16.safetensors"
+    }
+  },
+  "9": {
+    "class_type": "ControlNetLoader",
+    "inputs": {
+      "control_net_name": "controlnet-depth-sdxl-1.0-fp16.safetensors"
+    }
+  },
+  "10": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "photorealistic Japanese building facade, straight-on orthographic game texture, physically plausible windows, balconies, concrete and painted wall materials, clean repeated structure, neutral daylight, no perspective distortion, no text, no logo, no people, no cars",
+      "clip": [
+        "2",
+        1
+      ]
+    }
+  },
+  "11": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "warped facade, crooked windows, melted geometry, duplicated floors, perspective view, unreadable text, logo, people, cars, trees, sky, horizon, dramatic lighting, blur, low resolution",
+      "clip": [
+        "2",
+        1
+      ]
+    }
+  },
+  "12": {
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive": [
+        "10",
+        0
+      ],
+      "negative": [
+        "11",
+        0
+      ],
+      "control_net": [
+        "7",
+        0
+      ],
+      "image": [
+        "4",
+        0
+      ],
+      "strength": 0.60,
+      "start_percent": 0.0,
+      "end_percent": 0.85
+    }
+  },
+  "13": {
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive": [
+        "12",
+        0
+      ],
+      "negative": [
+        "12",
+        1
+      ],
+      "control_net": [
+        "9",
+        0
+      ],
+      "image": [
+        "5",
+        0
+      ],
+      "strength": 0.45,
+      "start_percent": 0.0,
+      "end_percent": 0.75
+    }
+  },
+  "14": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    }
+  },
+  "6": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 3401,
+      "steps": 8,
+      "cfg": 4.5,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "model": [
+        "2",
+        0
+      ],
+      "positive": [
+        "13",
+        0
+      ],
+      "negative": [
+        "13",
+        1
+      ],
+      "latent_image": [
+        "14",
+        0
+      ]
+    }
+  },
+  "15": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "6",
+        0
+      ],
+      "vae": [
+        "2",
+        2
+      ]
+    }
+  },
+  "8": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "jp_building_controlnet",
+      "images": [
+        "15",
+        0
+      ]
+    }
+  }
+}

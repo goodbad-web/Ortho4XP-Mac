@@ -1,0 +1,42 @@
+[
+  {
+    "name": "jp_house_controlnet",
+    "seed": 3401,
+    "overrides": {
+      "3.image": "building_facade_house.png",
+      "5.image": "building_depth_house.png",
+      "10.text": "photorealistic Japanese detached house facade, straight-on orthographic game texture, neutral plaster, dark tile accents, realistic windows and door, clean repeated structure, no perspective distortion, no roof, no text, no logo, no people, no cars",
+      "2.ckpt_name": "sd_xl_base_1.0.safetensors"
+    }
+  },
+  {
+    "name": "jp_apartment_controlnet",
+    "seed": 3402,
+    "overrides": {
+      "3.image": "building_facade_apartment.png",
+      "5.image": "building_depth_apartment.png",
+      "10.text": "photorealistic Japanese apartment facade, straight-on orthographic game texture, concrete, balconies, regular windows, plausible railings and facade joints, clean repeated structure, no perspective distortion, no roof, no text, no logo, no people, no cars",
+      "2.ckpt_name": "sd_xl_base_1.0.safetensors"
+    }
+  },
+  {
+    "name": "jp_commercial_controlnet",
+    "seed": 3403,
+    "overrides": {
+      "3.image": "building_facade_commercial.png",
+      "5.image": "building_depth_commercial.png",
+      "10.text": "photorealistic Japanese small commercial building facade, straight-on orthographic game texture, shopfront glass, neutral panels, realistic entrances and windows, no readable signage, clean repeated structure, no perspective distortion, no roof, no logo, no people, no cars",
+      "2.ckpt_name": "sd_xl_base_1.0.safetensors"
+    }
+  },
+  {
+    "name": "jp_industrial_controlnet",
+    "seed": 3404,
+    "overrides": {
+      "3.image": "building_facade_industrial.png",
+      "5.image": "building_depth_industrial.png",
+      "10.text": "photorealistic Japanese warehouse facade, straight-on orthographic game texture, corrugated metal, concrete, loading doors and industrial windows, clean repeated structure, no perspective distortion, no roof, no text, no logo, no people, no cars",
+      "2.ckpt_name": "sd_xl_base_1.0.safetensors"
+    }
+  }
+]

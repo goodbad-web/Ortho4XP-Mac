@@ -136,6 +136,37 @@ offset separate.  Verify the WEST footprint in a map or X-Plane before adding
 an exclusion rectangle.  The facade atlas is self-owned and can be replaced
 by `jp_*` ComfyUI output without changing the DSF or tower geometry.
 
+For a geometry-guided facade pass, use
+`comfyui_building_controlnet_api.json` with the batch client and provide a
+facade guide plus a Blender-rendered grayscale depth guide for each job. The
+workflow applies the built-in Canny preprocessor and then the SDXL Canny and
+Depth ControlNets. The default checkpoint is `sd_xl_base_1.0.safetensors`,
+which is the compatibility reference; change `2.ckpt_name` to
+`SDXL/sd_xl_turbo_1.0_fp16.safetensors` for a fast comparison run. The
+matching job list is `comfyui_building_controlnet_jobs.json`:
+
+```sh
+.venv/bin/python tools/comfyui_texture_batch.py \
+  --workflow tools/comfyui_building_controlnet_api.json \
+  --jobs tools/comfyui_building_controlnet_jobs.json \
+  --output-dir /tmp/ortho4xp-building-controlnet
+```
+
+The depth guide is intentionally an external input: this installation has no
+Depth Anything/MiDaS preprocessor node. Render it from the same Blender
+camera and geometry as the facade guide so the ControlNet does not alter the
+building footprint. The checked-in Blender helper renders paired guides for
+the four reusable categories:
+
+```sh
+tools/run_blender_with_metal_preflight.sh --background \
+  --python tools/render_controlnet_guides.py -- \
+  --blend "/Users/hiroshi/X-Plane/Custom Scenery/zzz_Ortho4XP_AI_Buildings_+34+133_uv_test/objects/building-families.blend" \
+  --output /tmp/ortho4xp-controlnet-inputs
+```
+
+Do not use a generated texture as the depth guide.
+
 To create an inspectable Blender scene, run the same script through Blender
 with `--blend-output`.  Blender is used only at generation time; X-Plane loads
 the resulting OBJ8/DDS files and does not run ComfyUI during flight.
