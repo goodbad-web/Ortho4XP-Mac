@@ -36,6 +36,9 @@ VARIANTS = {
     "commercial": "jp_commercial_medium_mid",
     "industrial": "jp_industrial_medium_mid",
 }
+DEPTH_CAMERA_OUTPUT = "View Z Depth"
+DEPTH_NEAR_VALUE = 1.0
+DEPTH_FAR_VALUE = 0.0
 
 
 def _script_argv(argv: list[str] | None) -> list[str]:
@@ -104,7 +107,7 @@ def _render_facade(scene: object, path: Path) -> None:
 
 
 def _render_depth(scene: object, target: object, path: Path, original_materials: list[object]) -> None:
-    """Render view distance as a portable 8-bit depth guide PNG."""
+    """Render a near-white, camera-axis depth guide as an 8-bit PNG."""
     material = bpy.data.materials.new("ControlNetGuideDepthMaterial")
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -114,13 +117,14 @@ def _render_depth(scene: object, target: object, path: Path, original_materials:
     map_range = nodes.new("ShaderNodeMapRange")
     map_range.inputs["From Min"].default_value = 0.0
     map_range.inputs["From Max"].default_value = max(target.dimensions) * 4.0
-    map_range.inputs["To Min"].default_value = 0.0
-    map_range.inputs["To Max"].default_value = 1.0
+    # ControlNet depth convention: shallow/near is white and deep/far is black.
+    map_range.inputs["To Min"].default_value = DEPTH_NEAR_VALUE
+    map_range.inputs["To Max"].default_value = DEPTH_FAR_VALUE
     if hasattr(map_range, "clamp"):
         map_range.clamp = True
     emission = nodes.new("ShaderNodeEmission")
     output = nodes.new("ShaderNodeOutputMaterial")
-    links.new(camera_data.outputs["View Distance"], map_range.inputs["Value"])
+    links.new(camera_data.outputs[DEPTH_CAMERA_OUTPUT], map_range.inputs["Value"])
     links.new(map_range.outputs["Result"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
     target.data.materials.clear()

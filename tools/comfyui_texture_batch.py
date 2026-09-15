@@ -20,10 +20,11 @@ import argparse
 import copy
 import json
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
@@ -61,6 +62,55 @@ def apply_job(
     if filename_node is not None and job.get("name"):
         set_node_input(result, f"{filename_node}.{filename_input}", str(job["name"]))
     return result
+
+
+def _input_sources(workflows: Iterable[dict[str, Any]], guide_dir: Path) -> list[tuple[str, Path]]:
+    """Resolve the bare LoadImage filenames used by workflows."""
+    guide_dir = guide_dir.expanduser()
+    if not guide_dir.is_dir():
+        raise FileNotFoundError(f"guide directory not found: {guide_dir}")
+
+    names: set[str] = set()
+    for workflow in workflows:
+        for node in workflow.values():
+            if not isinstance(node, dict) or node.get("class_type") != "LoadImage":
+                continue
+            inputs = node.get("inputs")
+            image = inputs.get("image") if isinstance(inputs, dict) else None
+            if not isinstance(image, str) or not image:
+                continue
+            if Path(image).name != image or "/" in image or "\\" in image:
+                raise ValueError(f"input staging only supports bare image filenames: {image}")
+            names.add(image)
+
+    sources = [(name, guide_dir / name) for name in sorted(names)]
+    missing = [str(path) for _, path in sources if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"guide images not found: {', '.join(missing)}")
+    return sources
+
+
+def validate_input_images(workflows: Iterable[dict[str, Any]], guide_dir: Path) -> None:
+    """Validate guide files without changing the ComfyUI input directory."""
+    _input_sources(workflows, guide_dir)
+
+
+def stage_input_images(
+    workflows: Iterable[dict[str, Any]],
+    guide_dir: Path,
+    input_dir: Path,
+) -> list[Path]:
+    """Copy workflow LoadImage files into ComfyUI's configured input directory."""
+    sources = _input_sources(workflows, guide_dir)
+    input_dir = input_dir.expanduser()
+    input_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[Path] = []
+    for name, source in sources:
+        destination = input_dir / name
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+        staged.append(destination)
+    return staged
 
 
 def _json_request(url: str, payload: dict[str, Any] | None = None, timeout: float = 30.0) -> Any:
@@ -167,19 +217,37 @@ def run_jobs(
     filename_node: str | None,
     timeout_seconds: float,
     dry_run: bool,
+    guide_dir: Path | None = None,
+    input_dir: Path | None = None,
 ) -> int:
+    if (guide_dir is None) != (input_dir is None):
+        raise ValueError("--guide-dir and --input-dir must be supplied together")
+
     workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
     jobs = load_jobs(jobs_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     client_id = str(uuid.uuid4())
-    for job in jobs:
-        name = _safe_name(str(job["name"]))
-        job_workflow = apply_job(
-            workflow,
-            job,
-            seed_node=seed_node,
-            filename_node=filename_node,
+    prepared_jobs = [
+        (
+            _safe_name(str(job["name"])),
+            apply_job(
+                workflow,
+                job,
+                seed_node=seed_node,
+                filename_node=filename_node,
+            ),
         )
+        for job in jobs
+    ]
+    if guide_dir is not None and input_dir is not None:
+        workflows = (job_workflow for _, job_workflow in prepared_jobs)
+        if dry_run:
+            validate_input_images(workflows, guide_dir)
+        else:
+            for path in stage_input_images(workflows, guide_dir, input_dir):
+                print(f"staged {path}")
+
+    for name, job_workflow in prepared_jobs:
         if dry_run:
             (output_dir / f"{name}.workflow.json").write_text(
                 json.dumps(job_workflow, indent=2, ensure_ascii=False) + "\n",
@@ -203,9 +271,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default="http://127.0.0.1:8188")
     parser.add_argument("--seed-node", default="6", help="workflow node ID containing the seed; use empty to disable")
     parser.add_argument("--filename-node", default="8", help="SaveImage node ID; use empty to disable")
+    parser.add_argument(
+        "--guide-dir",
+        type=Path,
+        help="directory containing local LoadImage files to stage before submission",
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        help="ComfyUI's configured input directory for staged LoadImage files",
+    )
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if (args.guide_dir is None) != (args.input_dir is None):
+        parser.error("--guide-dir and --input-dir must be supplied together")
     return run_jobs(
         args.workflow,
         args.jobs,
@@ -215,6 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         filename_node=args.filename_node or None,
         timeout_seconds=args.timeout,
         dry_run=args.dry_run,
+        guide_dir=args.guide_dir,
+        input_dir=args.input_dir,
     )
 
 

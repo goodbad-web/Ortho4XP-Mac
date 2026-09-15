@@ -19,6 +19,7 @@ def _load(name: str, path: Path):
 ROOT = Path(__file__).parents[1]
 blender_assets = _load("blender_generate_assets", ROOT / "tools" / "blender_generate_assets.py")
 comfy_batch = _load("comfyui_texture_batch", ROOT / "tools" / "comfyui_texture_batch.py")
+controlnet_guides = _load("render_controlnet_guides", ROOT / "tools" / "render_controlnet_guides.py")
 
 
 def test_blender_asset_mesh_has_roof_and_valid_obj8():
@@ -88,6 +89,31 @@ def test_comfy_job_changes_seed_prompt_and_filename_without_mutating_base():
     assert result["3"]["inputs"]["text"] == "house facade"
     assert workflow["6"]["inputs"]["seed"] == 1
     assert workflow["8"]["inputs"]["filename_prefix"] == "base"
+
+
+def test_comfy_batch_stages_loadimage_files_into_input_directory(tmp_path):
+    guide_dir = tmp_path / "guides"
+    input_dir = tmp_path / "comfy-input"
+    guide_dir.mkdir()
+    guide = guide_dir / "building_facade_house.png"
+    guide.write_bytes(b"guide")
+    workflow = {
+        "3": {
+            "class_type": "LoadImage",
+            "inputs": {"image": guide.name},
+        }
+    }
+
+    staged = comfy_batch.stage_input_images([workflow], guide_dir, input_dir)
+
+    assert staged == [input_dir / guide.name]
+    assert staged[0].read_bytes() == b"guide"
+
+
+def test_controlnet_depth_contract_uses_camera_axis_and_near_white_polarity():
+    assert controlnet_guides.DEPTH_CAMERA_OUTPUT == "View Z Depth"
+    assert controlnet_guides.DEPTH_NEAR_VALUE == 1.0
+    assert controlnet_guides.DEPTH_FAR_VALUE == 0.0
 
 
 def test_comfy_jobs_reject_path_traversal(tmp_path):

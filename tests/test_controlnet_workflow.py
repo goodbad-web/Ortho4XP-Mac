@@ -34,4 +34,4 @@ def test_controlnet_jobs_keep_facade_and_depth_guides_paired():
         depth = overrides["5.image"]
         assert facade.startswith("building_facade_")
         assert depth == facade.replace("building_facade_", "building_depth_")
-        assert overrides["2.ckpt_name"] == "sd_xl_base_1.0.safetensors"
+        assert "2.ckpt_name" not in overrides

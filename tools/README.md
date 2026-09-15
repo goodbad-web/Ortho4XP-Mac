@@ -141,16 +141,24 @@ For a geometry-guided facade pass, use
 facade guide plus a Blender-rendered grayscale depth guide for each job. The
 workflow applies the built-in Canny preprocessor and then the SDXL Canny and
 Depth ControlNets. The default checkpoint is `sd_xl_base_1.0.safetensors`,
-which is the compatibility reference; change `2.ckpt_name` to
-`SDXL/sd_xl_turbo_1.0_fp16.safetensors` for a fast comparison run. The
-matching job list is `comfyui_building_controlnet_jobs.json`:
+which is the compatibility reference; change `2.inputs.ckpt_name` to
+`SDXL/sd_xl_turbo_1.0_fp16.safetensors` for a fast comparison run. The job
+list does not override the checkpoint, so this workflow setting applies to all
+four jobs. The matching job list is `comfyui_building_controlnet_jobs.json`.
 
 ```sh
 .venv/bin/python tools/comfyui_texture_batch.py \
   --workflow tools/comfyui_building_controlnet_api.json \
   --jobs tools/comfyui_building_controlnet_jobs.json \
-  --output-dir /tmp/ortho4xp-building-controlnet
+  --output-dir /tmp/ortho4xp-building-controlnet \
+  --guide-dir /tmp/ortho4xp-controlnet-inputs \
+  --input-dir /Users/hiroshi/ComfyUI-Shared/input
 ```
+
+`--input-dir` must be the input directory printed by the running ComfyUI
+instance. The batch client copies the referenced guide files from
+`--guide-dir` there before submitting the first job; with `--dry-run`, it only
+validates that the guide files exist.
 
 The depth guide is intentionally an external input: this installation has no
 Depth Anything/MiDaS preprocessor node. Render it from the same Blender
