@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import subprocess
+import locale
 
 def is_dark_mode():
     if sys.platform != "darwin": return False
@@ -30,6 +31,17 @@ log = True
 write_build_log = False
 build_log_buffer = []
 is_building_all = False
+
+
+def ui_text(english, japanese):
+    """Return English by default and Japanese for Japanese locales."""
+    language = (
+        os.environ.get("ORTHO4XP_LANG")
+        or os.environ.get("LC_ALL")
+        or os.environ.get("LANG")
+        or (locale.getlocale()[0] or "")
+    )
+    return japanese if language.lower().startswith("ja") else english
 
 # System resource limits adjustment
 try:

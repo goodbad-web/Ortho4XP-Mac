@@ -767,17 +767,32 @@ class Tile:
                 "Ortho4XP_" + FNAMES.short_latlon(self.lat, self.lon) + ".cfg",
             )
         config_file_bak = config_file + ".bak"
+        config_file_tmp = config_file + ".tmp"
+        moved_existing = False
         try:
-            os.replace(config_file, config_file_bak)
-        except:
-            pass
-        try:
-            f = open(config_file, "w")
-            for var in list_tile_vars:
-                f.write(var + "=" + str(eval("self." + var)) + "\n")
-            f.close()
+            config_dir = os.path.dirname(config_file)
+            if config_dir:
+                os.makedirs(config_dir, exist_ok=True)
+            with open(config_file_tmp, "w", encoding="utf-8") as f:
+                for var in list_tile_vars:
+                    f.write(var + "=" + str(eval("self." + var)) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.isfile(config_file):
+                os.replace(config_file, config_file_bak)
+                moved_existing = True
+            os.replace(config_file_tmp, config_file)
             return 1
         except Exception as e:
+            try:
+                os.remove(config_file_tmp)
+            except OSError:
+                pass
+            if moved_existing and not os.path.exists(config_file):
+                try:
+                    os.replace(config_file_bak, config_file)
+                except OSError:
+                    pass
             UI.vprint(2, e)
             UI.lvprint(
                 0,

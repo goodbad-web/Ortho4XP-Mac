@@ -4,7 +4,7 @@ from math import floor
 
 
 DEFAULT_DSF_NODE_BUDGET = 1_000_000
-MAX_AUTO_REDUCE_ATTEMPTS = 3
+MAX_AUTO_REDUCE_ATTEMPTS = 1
 MIN_LEVELLED_SEGMENTS = 25_000
 
 
@@ -27,14 +27,16 @@ def normalize_budget(value, default=DEFAULT_DSF_NODE_BUDGET):
 
 
 def retry_settings(base_settings, attempt, mesh_zl):
-    """Return cumulative settings for one automatic reduction attempt.
+    """Return settings for the baseline or the single reduced attempt.
 
-    ``attempt`` is zero for the baseline and one through three for the
-    configured reduction attempts. Values are always derived from the original
-    baseline so repeated retries do not compound floating point rounding.
+    The reduction is intentionally calculated from the original baseline in
+    one step.  This avoids the previous sequence where four complete pipelines
+    were run and each later attempt accumulated changes from earlier attempts.
     """
     if attempt < 0 or attempt > MAX_AUTO_REDUCE_ATTEMPTS:
-        raise ValueError("attempt must be between 0 and 3")
+        raise ValueError(
+            "attempt must be between 0 and {}".format(MAX_AUTO_REDUCE_ATTEMPTS)
+        )
 
     settings = {}
     if attempt >= 1:
@@ -42,12 +44,10 @@ def retry_settings(base_settings, attempt, mesh_zl):
             MIN_LEVELLED_SEGMENTS,
             floor(float(base_settings["max_levelled_segs"]) * 0.5),
         )
-    if attempt >= 2:
         settings["water_simplification"] = max(
             2.0,
             float(base_settings["water_simplification"]) * 2.0,
         )
-    if attempt >= 3:
         settings["cover_zl"] = max(
             int(mesh_zl),
             int(base_settings["cover_zl"]) - 1,

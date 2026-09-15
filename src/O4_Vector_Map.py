@@ -589,14 +589,80 @@ def include_water(vector_map, tile):
     (water_area, sea_equiv_area) = OSM.OSM_to_MultiPolygon(
         water_layer, tile.lat, tile.lon, filter_large_lakes
     )
+
+    def index_water_polygons(area, area_name):
+        """Index one water geometry while preserving the failure cause."""
+        try:
+            indexed = VECT.MultiPolygon_to_Indexed_Polygons(
+                area, merge_overlappings=tile.clean_bad_geometries
+            )
+        except Exception as error:
+            UI.logprint(
+                "ERROR: Water polygon indexing failed for",
+                area_name,
+                "on tile",
+                FNAMES.short_latlon(tile.lat, tile.lon),
+                ":",
+                repr(error),
+            )
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Water polygon processing failed for {}: {}".format(
+                        area_name, error
+                    ),
+                    "エラー: {} の水面ポリゴン処理に失敗しました: {}".format(
+                        area_name, error
+                    ),
+                ),
+            )
+            return None
+        if UI.red_flag:
+            UI.logprint(
+                "Water polygon indexing cancelled for",
+                area_name,
+                "on tile",
+                FNAMES.short_latlon(tile.lat, tile.lon),
+            )
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "Water polygon processing was cancelled for {}.".format(
+                        area_name
+                    ),
+                    "{} の水面ポリゴン処理をキャンセルしました。".format(
+                        area_name
+                    ),
+                ),
+            )
+            return None
+        if indexed == 0:
+            UI.logprint(
+                "ERROR: Water polygon indexing returned no result for",
+                area_name,
+                "on tile",
+                FNAMES.short_latlon(tile.lat, tile.lon),
+            )
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Water polygon processing returned no result for {}.".format(
+                        area_name
+                    ),
+                    "エラー: {} の水面ポリゴン処理から結果が返りませんでした。".format(
+                        area_name
+                    ),
+                ),
+            )
+            return None
+        return indexed
+
     if not water_area.is_empty:
         UI.vprint(1, "      Cleaning it.")
-        try:
-            (idx_water, dico_water) = VECT.MultiPolygon_to_Indexed_Polygons(
-                water_area, merge_overlappings=tile.clean_bad_geometries
-            )
-        except:
+        indexed_water = index_water_polygons(water_area, "inland water")
+        if indexed_water is None:
             return 0
+        (idx_water, dico_water) = indexed_water
         UI.vprint(
             2, "      Number of water Multipolygons : " + str(len(dico_water))
         )
@@ -613,12 +679,10 @@ def include_water(vector_map, tile):
         UI.vprint(
             1, "      Separate treatment for larger pieces requiring masks."
         )
-        try:
-            (idx_water, dico_water) = VECT.MultiPolygon_to_Indexed_Polygons(
-                sea_equiv_area, merge_overlappings=tile.clean_bad_geometries
-            )
-        except:
+        indexed_sea = index_water_polygons(sea_equiv_area, "sea equivalent water")
+        if indexed_sea is None:
             return 0
+        (idx_water, dico_water) = indexed_sea
         UI.vprint(
             2, "      Number of water Multipolygons : " + str(len(dico_water))
         )

@@ -18,7 +18,7 @@ from O4_DSF_Budget import (  # noqa: E402
 )
 
 
-def test_retry_settings_are_cumulative_and_derived_from_baseline():
+def test_retry_settings_apply_all_reductions_from_baseline_in_one_attempt():
     base = {
         "max_levelled_segs": 100000,
         "water_simplification": 1.0,
@@ -28,17 +28,19 @@ def test_retry_settings_are_cumulative_and_derived_from_baseline():
     }
 
     assert retry_settings(base, 0, 16) == {}
-    assert retry_settings(base, 1, 16) == {"max_levelled_segs": 50000}
-    assert retry_settings(base, 2, 16) == {
-        "max_levelled_segs": 50000,
-        "water_simplification": 2.0,
-    }
-    actual = retry_settings(base, 3, 16)
+    actual = retry_settings(base, 1, 16)
     assert actual["max_levelled_segs"] == 50000
     assert actual["water_simplification"] == 2.0
     assert actual["cover_zl"] == 17
     assert math.isclose(actual["curvature_tol"], 3.75)
     assert math.isclose(actual["limit_tris"], 0.64)
+
+    try:
+        retry_settings(base, 2, 16)
+    except ValueError as error:
+        assert "between 0 and 1" in str(error)
+    else:
+        raise AssertionError("a second automatic reduction must be rejected")
 
 
 def test_retry_settings_keep_mesh_zoom_as_lower_bound():

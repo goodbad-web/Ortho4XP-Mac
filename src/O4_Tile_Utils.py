@@ -3,8 +3,12 @@ import sys
 import subprocess
 import time
 import shutil
+import json
 import queue
 import threading
+import tempfile
+import re
+import traceback
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 import O4_Imagery_Utils as IMG
@@ -21,6 +25,392 @@ max_convert_slots = 8
 max_download_slots = 8
 skip_downloads = False
 skip_converts = False
+
+
+_BUILD_TRANSACTION_MARKER = ".Ortho4XP_build_recovery.json"
+_LEGACY_MASK_PATTERN = re.compile(r"^-?\d+_-?\d+\.png$")
+_DISTANCE_MASK_PATTERN = re.compile(r"^-?\d+_-?\d+_dist\.png$")
+_MASK_TEXTURE_PATTERN = re.compile(r"^-?\d+_-?\d+_.+_ZL\d+\.png$")
+_DDS_TEXTURE_PATTERN = re.compile(r"^-?\d+_-?\d+_.+\.dds$")
+_AUTO_REDUCE_SETTING_NAMES = (
+    "max_levelled_segs",
+    "water_simplification",
+    "cover_zl",
+    "curvature_tol",
+    "limit_tris",
+)
+
+
+def _is_generated_dds_name(name):
+    """Recognize DDS names produced from an orthogrid texture tile."""
+    for suffix in (".gpu.tmp.dds", ".tmp.dds"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)] + ".dds"
+            break
+    return bool(_DDS_TEXTURE_PATTERN.match(name))
+
+
+def _is_generated_mask_name(name):
+    """Recognize legacy, distance, and per-texture mask output names."""
+    return bool(
+        _LEGACY_MASK_PATTERN.match(name)
+        or _DISTANCE_MASK_PATTERN.match(name)
+        or _MASK_TEXTURE_PATTERN.match(name)
+    )
+
+
+def _is_generated_terrain_name(name):
+    """Recognize terrain files derived from generated orthogrid textures."""
+    if not name.endswith(".ter"):
+        return False
+    stem = name[:-4]
+    for suffix in ("_water_overlay", "_sea_overlay", "_water", "_sea", "_overlay", ""):
+        if suffix and not stem.endswith(suffix):
+            continue
+        texture_stem = stem[: -len(suffix)] if suffix else stem
+        if _is_generated_dds_name(texture_stem + ".dds"):
+            return True
+    return False
+
+
+class _BuildTransaction:
+    """Keep each full-pipeline attempt recoverable without copying tile data.
+
+    The pipeline writes to the canonical tile paths.  This transaction moves
+    only known Ortho4XP outputs to a sibling staging directory, so an attempt
+    can run from a clean output set and a later failure cannot mix its files
+    with a previous successful attempt.  Moves stay on the same filesystem
+    and therefore do not duplicate multi-gigabyte DDS assets.
+    """
+
+    def __init__(self, tile):
+        self.build_dir = os.path.abspath(tile.build_dir)
+        self.mask_dir = os.path.abspath(FNAMES.mask_dir(tile.lat, tile.lon))
+        self.grouped = bool(getattr(tile, "grouped", False))
+        self.parent_dir = os.path.dirname(self.build_dir) or os.curdir
+        os.makedirs(self.build_dir, exist_ok=True)
+        os.makedirs(self.parent_dir, exist_ok=True)
+        self.root = tempfile.mkdtemp(
+            prefix=".o4xp-build-transaction-", dir=self.parent_dir
+        )
+        self.marker_path = os.path.join(
+            self.build_dir, _BUILD_TRANSACTION_MARKER
+        )
+        self.tile_lat = int(tile.lat)
+        self.tile_lon = int(tile.lon)
+        self._write_marker("active", None, None)
+        self._move_current_to("initial")
+        self._write_marker("active", None, None)
+
+    def _write_marker(
+        self,
+        state,
+        best_snapshot,
+        best_settings=None,
+        target_snapshot=None,
+    ):
+        marker = {
+            "version": 1,
+            "state": state,
+            "transaction_root": self.root,
+            "build_dir": self.build_dir,
+            "mask_dir": self.mask_dir,
+            "grouped": self.grouped,
+            "lat": self.tile_lat,
+            "lon": self.tile_lon,
+            "best_snapshot": best_snapshot,
+            "best_settings": best_settings,
+            "best_config": getattr(self, "best_config", None),
+            "target_snapshot": target_snapshot,
+        }
+        marker_tmp = self.marker_path + ".tmp"
+        with open(marker_tmp, "w", encoding="utf-8") as stream:
+            json.dump(marker, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(marker_tmp, self.marker_path)
+
+    def set_best_snapshot(self, snapshot_name, settings=None, config=None):
+        self.best_config = config
+        self._write_marker(
+            "active",
+            snapshot_name,
+            dict(settings) if settings is not None else None,
+        )
+
+    def _tile_output_paths(self):
+        paths = []
+        if not os.path.isdir(self.build_dir):
+            return paths
+
+        data_prefix = "Data" + FNAMES.short_latlon(
+            self.tile_lat, self.tile_lon
+        )
+        for name in os.listdir(self.build_dir):
+            path = os.path.join(self.build_dir, name)
+            if os.path.isfile(path) and name.startswith(data_prefix):
+                paths.append(("tile", path))
+
+        dsf_base = os.path.join(
+            self.build_dir,
+            "Earth nav data",
+            FNAMES.long_latlon(self.tile_lat, self.tile_lon) + ".dsf",
+        )
+        for path in (dsf_base, dsf_base + ".bak", dsf_base + ".tmp"):
+            if os.path.isfile(path):
+                paths.append(("tile", path))
+
+        terrain_dir = os.path.join(self.build_dir, "terrain")
+        if os.path.isdir(terrain_dir):
+            for dir_path, _, names in os.walk(terrain_dir):
+                for name in names:
+                    if _is_generated_terrain_name(name):
+                        path = os.path.join(dir_path, name)
+                        if os.path.isfile(path):
+                            paths.append(("shared" if self.grouped else "tile", path))
+
+        textures_dir = os.path.join(self.build_dir, "textures")
+        if os.path.isdir(textures_dir):
+            for name in os.listdir(textures_dir):
+                path = os.path.join(textures_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                is_texture = _is_generated_dds_name(name)
+                is_mask = _is_generated_mask_name(name)
+                is_water_transition = name == "water_transition.png"
+                if is_texture or is_mask or is_water_transition:
+                    paths.append(("shared" if self.grouped else "tile", path))
+        return paths
+
+    def _mask_output_paths(self):
+        paths = []
+        if not os.path.isdir(self.mask_dir):
+            return paths
+        for dir_path, _, names in os.walk(self.mask_dir):
+            for name in names:
+                if not _is_generated_mask_name(name):
+                    continue
+                path = os.path.join(dir_path, name)
+                if os.path.isfile(path):
+                    paths.append(("mask", path))
+        return paths
+
+    def _current_output_paths(self):
+        return self._tile_output_paths() + self._mask_output_paths()
+
+    def _move_current_to(self, snapshot_name):
+        snapshot_root = os.path.join(self.root, snapshot_name)
+        for kind, source_path in self._current_output_paths():
+            source_root = self.mask_dir if kind == "mask" else self.build_dir
+            relative_path = os.path.relpath(source_path, source_root)
+            destination_path = os.path.join(
+                snapshot_root, kind, relative_path
+            )
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            os.replace(source_path, destination_path)
+
+    def capture_candidate(self, attempt):
+        snapshot_name = "candidate-{}".format(attempt)
+        self._move_current_to(snapshot_name)
+        return snapshot_name
+
+    def discard_current(self, label):
+        self._move_current_to("discarded-{}".format(label))
+
+    def prepare_attempt(self):
+        """Restore shared grouped assets before the next clean attempt."""
+        if not self.grouped:
+            return
+        source_root = os.path.join(self.root, "initial", "shared")
+        if not os.path.isdir(source_root):
+            return
+        for dir_path, _, names in os.walk(source_root):
+            for name in names:
+                source_path = os.path.join(dir_path, name)
+                relative_path = os.path.relpath(source_path, source_root)
+                destination_path = os.path.join(
+                    self.build_dir, relative_path
+                )
+                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                os.replace(source_path, destination_path)
+
+    def restore_snapshot(self, snapshot_name):
+        self.discard_current("before-restore")
+        self.restore_snapshot_files(snapshot_name)
+
+    def restore_snapshot_files(self, snapshot_name):
+        """Move the remaining files of a snapshot into canonical paths.
+
+        This operation is intentionally idempotent: a recovery run can finish
+        a restore after a process stopped between two file moves.
+        """
+        snapshot_root = os.path.join(self.root, snapshot_name)
+        for kind, destination_root in (
+            ("tile", self.build_dir),
+            ("shared", self.build_dir),
+            ("mask", self.mask_dir),
+        ):
+            source_root = os.path.join(snapshot_root, kind)
+            if not os.path.isdir(source_root):
+                continue
+            for dir_path, _, names in os.walk(source_root):
+                for name in names:
+                    source_path = os.path.join(dir_path, name)
+                    relative_path = os.path.relpath(source_path, source_root)
+                    destination_path = os.path.join(
+                        destination_root, relative_path
+                    )
+                    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                    os.replace(source_path, destination_path)
+
+    def snapshot_has_files(self, snapshot_name):
+        snapshot_root = os.path.join(self.root, snapshot_name)
+        for _, _, names in os.walk(snapshot_root):
+            if names:
+                return True
+        return False
+
+    def cleanup(self):
+        shutil.rmtree(self.root)
+        try:
+            os.remove(self.marker_path)
+        except OSError:
+            pass
+        try:
+            os.remove(self.marker_path + ".tmp")
+        except OSError:
+            pass
+
+
+def _transaction_marker_path(tile):
+    return os.path.join(
+        os.path.abspath(tile.build_dir), _BUILD_TRANSACTION_MARKER
+    )
+
+
+def _recover_build_transaction(tile):
+    """Restore a left-over full-pipeline transaction after a hard stop."""
+    marker_path = _transaction_marker_path(tile)
+    if not os.path.isfile(marker_path):
+        return True
+    try:
+        with open(marker_path, "r", encoding="utf-8") as stream:
+            marker = json.load(stream)
+        root = os.path.abspath(marker["transaction_root"])
+        build_dir = os.path.abspath(tile.build_dir)
+        mask_dir = os.path.abspath(FNAMES.mask_dir(tile.lat, tile.lon))
+        parent_dir = os.path.dirname(build_dir) or os.curdir
+        if (
+            os.path.dirname(root) != os.path.abspath(parent_dir)
+            or not os.path.basename(root).startswith(".o4xp-build-transaction-")
+            or marker.get("build_dir") != build_dir
+            or marker.get("mask_dir") != mask_dir
+            or int(marker.get("lat")) != int(tile.lat)
+            or int(marker.get("lon")) != int(tile.lon)
+        ):
+            raise ValueError("recovery marker does not match the current tile")
+        if not os.path.isdir(root):
+            os.remove(marker_path)
+            return True
+
+        transaction = _BuildTransaction.__new__(_BuildTransaction)
+        transaction.build_dir = build_dir
+        transaction.mask_dir = mask_dir
+        transaction.grouped = bool(marker.get("grouped", False))
+        transaction.parent_dir = os.path.abspath(parent_dir)
+        transaction.root = root
+        transaction.marker_path = marker_path
+        transaction.tile_lat = int(tile.lat)
+        transaction.tile_lon = int(tile.lon)
+        transaction.best_config = marker.get("best_config")
+        state = marker.get("state", "active")
+        best_snapshot = marker.get("best_snapshot")
+        best_settings = marker.get("best_settings")
+        best_config = marker.get("best_config")
+        target_snapshot = marker.get("target_snapshot")
+
+        if state == "discarding":
+            target_snapshot = target_snapshot or best_snapshot or "initial"
+            transaction.discard_current("before-restore")
+            transaction._write_marker(
+                "restoring",
+                best_snapshot,
+                best_settings,
+                target_snapshot,
+            )
+            state = "restoring"
+
+        if state == "restoring":
+            target_snapshot = target_snapshot or best_snapshot or "initial"
+            transaction.restore_snapshot_files(target_snapshot)
+            if target_snapshot == "initial":
+                best_settings = None
+                best_config = None
+            else:
+                state = "config-pending"
+
+        elif state == "config-pending":
+            if best_snapshot and transaction.snapshot_has_files(best_snapshot):
+                transaction.restore_snapshot_files(best_snapshot)
+        else:
+            snapshot_name = best_snapshot or "initial"
+            transaction._write_marker(
+                "discarding",
+                best_snapshot,
+                best_settings,
+                snapshot_name,
+            )
+            transaction.discard_current("before-restore")
+            transaction._write_marker(
+                "restoring",
+                best_snapshot,
+                best_settings,
+                snapshot_name,
+            )
+            transaction.restore_snapshot_files(snapshot_name)
+            if snapshot_name == "initial":
+                best_settings = None
+                best_config = None
+
+        try:
+            from O4_Config_Utils import list_tile_vars
+            config_names = set(list_tile_vars)
+        except (ImportError, AttributeError):
+            config_names = set(_AUTO_REDUCE_SETTING_NAMES)
+        if best_config:
+            for name, value in best_config.items():
+                if name in config_names:
+                    setattr(tile, name, value)
+        if best_settings:
+            for name, value in best_settings.items():
+                if name in _AUTO_REDUCE_SETTING_NAMES:
+                    setattr(tile, name, value)
+        if best_config or best_settings:
+            if not tile.write_to_config():
+                raise OSError("could not persist recovered tile configuration")
+        transaction.cleanup()
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "Recovered an interrupted tile build transaction.",
+                "中断したタイルビルドの復元処理を完了しました。",
+            ),
+        )
+        return True
+    except Exception as error:
+        UI.logprint("ERROR: Could not recover tile build transaction:", repr(error))
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "ERROR: Could not recover the previous tile build safely: {}".format(
+                    error
+                ),
+                "エラー: 前回のタイルビルドを安全に復元できません: {}".format(
+                    error
+                ),
+            ),
+        )
+        return False
 
 
 def _ashelper_metal_available(as_helper):
@@ -259,17 +649,23 @@ def _build_tile(tile, persist_config=True):
             os.makedirs(os.path.join(tile.build_dir, "textures"))
         if UI.cleaning_level > 1 and not tile.grouped:
             for f in os.listdir(os.path.join(tile.build_dir, "textures")):
-                if f[-4:] != ".png":
+                if not _MASK_TEXTURE_PATTERN.search(f):
                     continue
                 try:
                     os.remove(os.path.join(tile.build_dir, "textures", f))
-                except:
+                except OSError:
                     pass
         if not tile.grouped:
-            try:
-                shutil.rmtree(os.path.join(tile.build_dir, "terrain"))
-            except:
-                pass
+            terrain_dir = os.path.join(tile.build_dir, "terrain")
+            if os.path.isdir(terrain_dir):
+                for dir_path, _, names in os.walk(terrain_dir):
+                    for name in names:
+                        if not name.endswith(".ter"):
+                            continue
+                        try:
+                            os.remove(os.path.join(dir_path, name))
+                        except OSError:
+                            pass
         if not os.path.isdir(os.path.join(tile.build_dir, "terrain")):
             os.makedirs(os.path.join(tile.build_dir, "terrain"))
     except Exception as e:
@@ -735,7 +1131,71 @@ def _build_tile(tile, persist_config=True):
     return 1
 
 ################################################################################
+def _report_pipeline_failure(tile, stage_name, error=None, traceback_text=None):
+    cancelled = bool(UI.red_flag)
+    failure = {
+        "stage": stage_name,
+        "cancelled": cancelled,
+        "error": repr(error) if error is not None else None,
+    }
+    tile.last_pipeline_failure = failure
+    if error is not None:
+        UI.logprint(
+            "ERROR: Pipeline stage",
+            stage_name,
+            "raised:",
+            repr(error),
+            "\n",
+            traceback_text or repr(error),
+        )
+
+    if cancelled:
+        message = UI.ui_text(
+            "ERROR: Tile build cancelled during {}.".format(stage_name),
+            "エラー: {} の実行中にタイルビルドをキャンセルしました。".format(
+                stage_name
+            ),
+        )
+    elif error is not None:
+        message = UI.ui_text(
+            "ERROR: {} stage failed: {}".format(stage_name, error),
+            "エラー: {} ステージに失敗しました: {}".format(stage_name, error),
+        )
+    else:
+        message = UI.ui_text(
+            "ERROR: {} stage failed.".format(stage_name),
+            "エラー: {} ステージに失敗しました。".format(stage_name),
+        )
+    UI.vprint(0, message)
+    UI.exit_message_and_bottom_line(message)
+
+
+def _report_metrics_failure(tile):
+    failure = {
+        "stage": "DSF metrics",
+        "cancelled": bool(UI.red_flag),
+        "error": "missing or structurally invalid DSF metrics",
+    }
+    tile.last_pipeline_failure = failure
+    message = UI.ui_text(
+        "ERROR: DSF metrics were missing or structurally invalid after a successful build.",
+        "エラー: ビルド成功後のDSFメトリクスがないか、構造的に不正です。",
+    )
+    UI.logprint(message)
+    UI.vprint(0, message)
+    UI.exit_message_and_bottom_line(message)
+
+
+################################################################################
 def _start_full_pipeline(tile, include_overlays):
+    if not _recover_build_transaction(tile):
+        UI.exit_message_and_bottom_line(
+            UI.ui_text(
+                "ERROR: The previous tile build could not be recovered.",
+                "エラー: 前回のタイルビルドを復元できませんでした。",
+            )
+        )
+        return 0
     UI.is_building_all = True
     UI.initialize_build_log(tile.build_dir, tile)
     try:
@@ -744,6 +1204,7 @@ def _start_full_pipeline(tile, include_overlays):
         UI.is_building_all = False
         UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
+
 
 def build_all(tile):
     return _start_full_pipeline(tile, include_overlays=True)
@@ -759,12 +1220,25 @@ def _run_pipeline_once(tile):
         ("vector data", VMAP.build_poly_file),
         ("mesh", MESH.build_mesh),
         ("water masks", MASK.build_masks),
-        ("imagery/DSF", lambda current_tile: build_tile(current_tile, persist_config=False)),
+        (
+            "imagery/DSF",
+            lambda current_tile: build_tile(current_tile, persist_config=False),
+        ),
     )
+    tile.last_pipeline_failure = None
     for stage_name, stage in stages:
-        if not stage(tile) or UI.red_flag:
-            UI.vprint(0, "ERROR: {} stage failed.".format(stage_name))
-            UI.exit_message_and_bottom_line("")
+        stage_error = None
+        stage_traceback = None
+        try:
+            stage_succeeded = bool(stage(tile))
+        except Exception as error:
+            stage_succeeded = False
+            stage_error = error
+            stage_traceback = traceback.format_exc()
+        if not stage_succeeded or UI.red_flag:
+            _report_pipeline_failure(
+                tile, stage_name, stage_error, stage_traceback
+            )
             return 0
     return 1
 
@@ -776,6 +1250,19 @@ def _snapshot_auto_reduce_settings(tile):
         "cover_zl": int(tile.cover_zl),
         "curvature_tol": float(tile.curvature_tol),
         "limit_tris": float(tile.limit_tris),
+    }
+
+
+def _snapshot_tile_config_settings(tile):
+    """Capture config values needed to finish recovery after a restart."""
+    try:
+        from O4_Config_Utils import list_tile_vars
+    except (ImportError, AttributeError):
+        list_tile_vars = _AUTO_REDUCE_SETTING_NAMES
+    return {
+        name: getattr(tile, name)
+        for name in list_tile_vars
+        if hasattr(tile, name)
     }
 
 
@@ -798,76 +1285,346 @@ def _build_all(tile, include_overlays=True):
     budget = DSF_BUDGET.normalize_budget(
         getattr(tile, "dsf_node_budget", DSF_BUDGET.DEFAULT_DSF_NODE_BUDGET)
     )
-    final_attempt = 0
+    transaction = None
+    best_candidate = None
 
-    for attempt in range(DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS + 1):
-        final_attempt = attempt
-        if attempt:
-            updates = _apply_auto_reduce_attempt(tile, base_settings, attempt)
+    def restore_snapshot(snapshot_name):
+        if transaction is None:
+            return True
+        try:
+            best_settings = (
+                best_candidate["settings"] if best_candidate is not None else None
+            )
+            transaction.best_config = (
+                best_candidate.get("config")
+                if best_candidate is not None
+                else None
+            )
+            transaction._write_marker(
+                "discarding",
+                best_candidate["snapshot"] if best_candidate is not None else None,
+                best_settings,
+                snapshot_name,
+            )
+            transaction.discard_current("before-restore")
+            transaction._write_marker(
+                "restoring",
+                best_candidate["snapshot"] if best_candidate is not None else None,
+                best_settings,
+                snapshot_name,
+            )
+            transaction.restore_snapshot_files(snapshot_name)
+            return True
+        except Exception as error:
+            UI.logprint(
+                "ERROR: Could not finalize tile transaction:",
+                repr(error),
+                "\n",
+                traceback.format_exc(),
+            )
             UI.vprint(
                 0,
-                "[Auto-Reduce] Full pipeline attempt {}/{}; "
-                "updated settings: {}".format(
-                    attempt,
-                    DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS,
-                    ", ".join(
-                        "{}={}".format(name, value)
-                        for name, value in updates.items()
+                UI.ui_text(
+                    "ERROR: Could not restore the tile output safely: {}".format(
+                        error
                     ),
+                    "エラー: タイル出力を安全に復元できません: {}".format(error),
                 ),
             )
-        else:
-            UI.vprint(0, "[Auto-Reduce] Full pipeline baseline attempt.")
+            return False
 
-        if not _run_pipeline_once(tile):
+    def restore_and_cleanup(snapshot_name):
+        if not restore_snapshot(snapshot_name):
+            return False
+        try:
+            transaction.cleanup()
+            return True
+        except Exception as error:
+            UI.logprint("ERROR: Could not remove tile transaction staging:", repr(error))
+            UI.vprint(0, "ERROR: Could not remove tile transaction staging:", error)
+            return False
+
+    try:
+        transaction = _BuildTransaction(tile)
+        for attempt in range(DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS + 1):
+            transaction.discard_current("before-attempt-{}".format(attempt))
+            transaction.prepare_attempt()
+            if attempt:
+                updates = _apply_auto_reduce_attempt(tile, base_settings, attempt)
+                UI.vprint(
+                    0,
+                    "[Auto-Reduce] Full pipeline attempt {}/{}; "
+                    "updated settings: {}".format(
+                        attempt,
+                        DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS,
+                        ", ".join(
+                            "{}={}".format(name, value)
+                            for name, value in updates.items()
+                        ),
+                    ),
+                )
+            else:
+                _restore_auto_reduce_settings(tile, base_settings)
+                UI.vprint(0, "[Auto-Reduce] Full pipeline baseline attempt.")
+
+            if not _run_pipeline_once(tile):
+                failure = getattr(tile, "last_pipeline_failure", {})
+                if best_candidate is None or failure.get("cancelled"):
+                    _restore_auto_reduce_settings(tile, base_settings)
+                    restore_and_cleanup(
+                        best_candidate["snapshot"]
+                        if best_candidate is not None
+                        else "initial"
+                    )
+                    return 0
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Reduced pipeline failed; retaining the last successful tile state.",
+                        "警告: 削減後の全工程に失敗したため、最後に成功したタイル状態を保持します。",
+                    ),
+                )
+                _restore_auto_reduce_settings(tile, best_candidate["settings"])
+                break
+
+            metrics = getattr(tile, "last_dsf_metrics", None)
+            metrics_valid = bool(
+                metrics
+                and hasattr(metrics, "get")
+                and metrics.get("structurally_valid", False)
+            )
+            try:
+                point_count = int(metrics["point_count"])
+                metrics_valid = metrics_valid and point_count >= 0
+            except (KeyError, TypeError, ValueError):
+                metrics_valid = False
+                point_count = 0
+            if not metrics_valid:
+                _report_metrics_failure(tile)
+                if best_candidate is None:
+                    _restore_auto_reduce_settings(tile, base_settings)
+                    restore_and_cleanup("initial")
+                    return 0
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Reduced pipeline produced invalid DSF metrics; retaining the last successful tile state.",
+                        "警告: 削減後のDSFメトリクスが不正なため、最後に成功したタイル状態を保持します。",
+                    ),
+                )
+                _restore_auto_reduce_settings(tile, best_candidate["settings"])
+                break
+
+            metrics = dict(metrics)
+            metrics["point_count"] = point_count
+            candidate = {
+                "attempt": attempt,
+                "metrics": metrics,
+                "settings": _snapshot_auto_reduce_settings(tile),
+                "config": _snapshot_tile_config_settings(tile),
+                "snapshot": transaction.capture_candidate(attempt),
+            }
+            if (
+                best_candidate is None
+                or metrics["point_count"] < best_candidate["metrics"]["point_count"]
+            ):
+                best_candidate = candidate
+                transaction.set_best_snapshot(
+                    candidate["snapshot"],
+                    candidate["settings"],
+                    candidate["config"],
+                )
+                UI.vprint(
+                    1,
+                    "[Auto-Reduce] Candidate from attempt {} is the current best.".format(
+                        attempt
+                    ),
+                )
+
+            UI.vprint(
+                0,
+                "[Auto-Reduce] Attempt {} produced {:,} DSF point instances "
+                "(budget {:,}).".format(
+                    attempt,
+                    metrics["point_count"],
+                    budget,
+                ),
+            )
+            budget_exceeded = bool(
+                metrics.get("budget_exceeded", metrics["point_count"] > budget)
+            )
+            if not budget_exceeded:
+                break
+            if attempt >= DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS:
+                break
+            UI.vprint(0, "[Auto-Reduce] Rebuilding all stages to reduce DSF density.")
+
+        if best_candidate is None:
             _restore_auto_reduce_settings(tile, base_settings)
+            restore_and_cleanup("initial")
             return 0
 
-        metrics = getattr(tile, "last_dsf_metrics", None)
-        if not metrics or not metrics.get("structurally_valid", False):
-            UI.vprint(0, "ERROR: DSF metrics were not available after a successful build.")
+        _restore_auto_reduce_settings(tile, best_candidate["settings"])
+        if not restore_snapshot(best_candidate["snapshot"]):
             _restore_auto_reduce_settings(tile, base_settings)
             return 0
+        transaction._write_marker(
+            "config-pending",
+            best_candidate["snapshot"],
+            best_candidate["settings"],
+        )
+        tile.last_dsf_metrics = dict(best_candidate["metrics"])
 
+        if best_candidate["metrics"].get(
+            "budget_exceeded", best_candidate["metrics"]["point_count"] > budget
+        ):
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "WARNING: DSF point budget remains exceeded after the reduced "
+                    "attempt; keeping the structurally valid best build.",
+                    "警告: 削減後もDSFポイント予算を超過しています。構造的に有効な最良ビルドを保持します。",
+                ),
+            )
+
+        if not tile.write_to_config():
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Could not save final tile configuration; restoring the previous tile state.",
+                    "エラー: 最終タイル設定を保存できないため、以前のタイル状態に戻します。",
+                ),
+            )
+            _restore_auto_reduce_settings(tile, base_settings)
+            restore_and_cleanup("initial")
+            return 0
         UI.vprint(
-            0,
-            "[Auto-Reduce] Attempt {} produced {:,} DSF point instances "
-            "(budget {:,}).".format(
-                attempt,
-                metrics["point_count"],
-                budget,
+            1,
+            "[Auto-Reduce] Saved settings from selected full-pipeline attempt {} to tile config.".format(
+                best_candidate["attempt"]
             ),
         )
-        if not metrics.get("budget_exceeded", False):
-            break
-        if attempt >= DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS:
-            UI.vprint(
-                0,
-                "WARNING: DSF point budget remains exceeded after {} "
-                "automatic reductions; keeping the structurally valid final build.".format(
-                    DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS
+        try:
+            transaction.cleanup()
+        except Exception as error:
+            UI.logprint("WARNING: Could not remove tile transaction staging:", repr(error))
+            UI.vprint(1, "WARNING: Tile transaction staging remains for recovery:", error)
+
+    except Exception as error:
+        UI.logprint(
+            "ERROR: Full tile pipeline failed unexpectedly:",
+            repr(error),
+            "\n",
+            traceback.format_exc(),
+        )
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "ERROR: Full tile pipeline failed unexpectedly: {}".format(error),
+                "エラー: タイル全工程で予期しない失敗が発生しました: {}".format(
+                    error
                 ),
+            ),
+        )
+        recovered_settings = base_settings
+        if transaction is not None:
+            try:
+                if best_candidate is not None:
+                    _restore_auto_reduce_settings(tile, best_candidate["settings"])
+                    if restore_snapshot(best_candidate["snapshot"]):
+                        transaction._write_marker(
+                            "config-pending",
+                            best_candidate["snapshot"],
+                            best_candidate["settings"],
+                        )
+                        if tile.write_to_config():
+                            recovered_settings = best_candidate["settings"]
+                        else:
+                            UI.vprint(
+                                0,
+                                UI.ui_text(
+                                    "ERROR: Could not save the recovered tile configuration; restoring the pre-build state.",
+                                    "エラー: 復元したタイル設定を保存できないため、ビルド前の状態に戻します。",
+                                ),
+                            )
+                            restore_and_cleanup("initial")
+                    else:
+                        restore_and_cleanup("initial")
+                else:
+                    restore_and_cleanup("initial")
+            except Exception as recovery_error:
+                UI.logprint(
+                    "ERROR: Automatic recovery after unexpected pipeline failure failed:",
+                    repr(recovery_error),
+                )
+                try:
+                    restore_and_cleanup("initial")
+                except Exception as rollback_error:
+                    UI.logprint(
+                        "ERROR: Rollback to the pre-build tile state also failed:",
+                        repr(rollback_error),
+                    )
+        _restore_auto_reduce_settings(tile, recovered_settings)
+        UI.exit_message_and_bottom_line(
+            UI.ui_text(
+                "ERROR: Tile build failed.",
+                "エラー: タイルビルドに失敗しました。",
             )
-            break
-        UI.vprint(0, "[Auto-Reduce] Rebuilding all stages to reduce DSF density.")
-
-    if not tile.write_to_config():
-        UI.vprint(0, "ERROR: Could not save final tile configuration.")
+        )
         return 0
-    UI.vprint(
-        1,
-        "[Auto-Reduce] Saved settings from final full-pipeline attempt {} to tile config.".format(
-            final_attempt
-        ),
-    )
 
+    UI.is_working = 0
     if include_overlays and getattr(tile, "build_overlays_in_all_in_one", False):
         UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
         if not OVL.build_overlay(tile.lat, tile.lon) or UI.red_flag:
-            UI.exit_message_and_bottom_line("")
+            _report_pipeline_failure(tile, "overlay extraction")
             return 0
-    UI.is_working = 0
     return 1
+
+################################################################################
+def _run_batch_stage(tile, stage_name, stage):
+    stage_error = None
+    try:
+        succeeded = bool(stage(tile))
+    except Exception as error:
+        succeeded = False
+        stage_error = error
+        UI.logprint(
+            "ERROR: Batch stage",
+            stage_name,
+            "raised for",
+            FNAMES.short_latlon(tile.lat, tile.lon),
+            ":",
+            repr(error),
+            "\n",
+            traceback.format_exc(),
+        )
+    if succeeded and not UI.red_flag:
+        return True
+    if UI.red_flag:
+        UI.exit_message_and_bottom_line(
+            UI.ui_text(
+                "ERROR: Batch build cancelled during {}.".format(stage_name),
+                "エラー: {} の実行中にバッチビルドをキャンセルしました。".format(
+                    stage_name
+                ),
+            )
+        )
+        return None
+
+    detail = ": {}".format(stage_error) if stage_error is not None else "."
+    message = UI.ui_text(
+        "ERROR: {} stage failed for tile {}; continuing with the next tile{}".format(
+            stage_name, FNAMES.short_latlon(tile.lat, tile.lon), detail
+        ),
+        "エラー: タイル {} の{}ステージに失敗しました。次のタイルへ進みます{}".format(
+            FNAMES.short_latlon(tile.lat, tile.lon), stage_name, detail
+        ),
+    )
+    UI.lvprint(0, message)
+    UI.is_working = 0
+    return False
+
 
 ################################################################################
 def build_tile_list(
@@ -880,9 +1637,18 @@ def build_tile_list(
     UI.lvprint(
         0, "Batch build launched for a number of", len(list_lat_lon), "tiles."
     )
+    batch_failed = False
     k = 0
     for (lat, lon) in list_lat_lon:
         k += 1
+        if UI.red_flag:
+            UI.exit_message_and_bottom_line(
+                UI.ui_text(
+                    "ERROR: Batch build cancelled before the next tile.",
+                    "エラー: 次のタイルへ進む前にバッチビルドをキャンセルしました。",
+                )
+            )
+            return 0
         UI.vprint(
             1,
             "Dealing with tile ",
@@ -898,38 +1664,119 @@ def build_tile_list(
         )
         tile.dem = None
         if do_ptc:
-            if not tile.read_from_config():
-                UI.exit_message_and_bottom_line()
-                return 0
+            try:
+                config_loaded = bool(tile.read_from_config())
+            except Exception as error:
+                batch_failed = True
+                UI.logprint(
+                    "ERROR: Could not read per-tile config for",
+                    FNAMES.short_latlon(lat, lon),
+                    ":",
+                    repr(error),
+                    "\n",
+                    traceback.format_exc(),
+                )
+                UI.lvprint(
+                    0,
+                    UI.ui_text(
+                        "CFG error: Could not read settings for tile {}; skipping it: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                        "CFGエラー: タイル {} の設定を読み込めないためスキップします: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                    ),
+                )
+                continue
+            if not config_loaded:
+                batch_failed = True
+                UI.lvprint(
+                    0,
+                    UI.ui_text(
+                        "CFG error: Skipping tile {} because no per-tile config was found.".format(
+                            FNAMES.short_latlon(lat, lon)
+                        ),
+                        "CFGエラー: タイル {} のタイル別設定がないためスキップします。".format(
+                            FNAMES.short_latlon(lat, lon)
+                        ),
+                    ),
+                )
+                continue
+
         if do_osm or do_mesh or do_dsf:
-            tile.make_dirs()
+            try:
+                tile.make_dirs()
+            except Exception as error:
+                batch_failed = True
+                UI.lvprint(
+                    0,
+                    UI.ui_text(
+                        "ERROR: Could not prepare tile {}; continuing with the next tile: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                        "エラー: タイル {} の準備に失敗しました。次のタイルへ進みます: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                    ),
+                )
+                UI.is_working = 0
+                continue
+
+        stages = []
         if do_osm:
-            if not VMAP.build_poly_file(tile) or UI.red_flag:
-                UI.exit_message_and_bottom_line()
-                return 0
+            stages.append(("vector data", VMAP.build_poly_file))
         if do_mesh:
-            if not MESH.build_mesh(tile) or UI.red_flag:
-                UI.exit_message_and_bottom_line()
-                return 0
+            stages.append(("mesh", MESH.build_mesh))
         if do_mask:
-            if not MASK.build_masks(tile) or UI.red_flag:
-                UI.exit_message_and_bottom_line()
-                return 0
+            stages.append(("water masks", MASK.build_masks))
         if do_dsf:
-            if not build_tile(tile) or UI.red_flag:
-                UI.exit_message_and_bottom_line()
-                return 0
-        if do_ovl:
-            if not OVL.build_overlay(lat, lon) or UI.red_flag:
-                UI.exit_message_and_bottom_line()
-                return 0
-        try:
-            UI.gui.earth_window.canvas.delete(
-                UI.gui.earth_window.dico_tiles_todo[(lat, lon)]
+            stages.append(
+                (
+                    "imagery/DSF",
+                    lambda current_tile: build_tile(current_tile),
+                )
             )
-            UI.gui.earth_window.dico_tiles_todo.pop((lat, lon), None)
-        except:
-            pass
+        if do_ovl:
+            stages.append(
+                (
+                    "overlay extraction",
+                    lambda current_tile: OVL.build_overlay(
+                        current_tile.lat, current_tile.lon
+                    ),
+                )
+            )
+
+        tile_succeeded = True
+        for stage_name, stage in stages:
+            stage_result = _run_batch_stage(tile, stage_name, stage)
+            if stage_result is None:
+                return 0
+            if not stage_result:
+                batch_failed = True
+                tile_succeeded = False
+                break
+
+        if tile_succeeded:
+            try:
+                UI.gui.earth_window.canvas.delete(
+                    UI.gui.earth_window.dico_tiles_todo[(lat, lon)]
+                )
+                UI.gui.earth_window.dico_tiles_todo.pop((lat, lon), None)
+            except Exception:
+                pass
+    if batch_failed:
+        UI.lvprint(
+            0,
+            UI.ui_text(
+                "Batch process completed in {} with skipped or failed tiles.".format(
+                    UI.nicer_timer(time.time() - timer)
+                ),
+                "{} にバッチ処理が完了しましたが、スキップまたは失敗したタイルがあります。".format(
+                    UI.nicer_timer(time.time() - timer)
+                ),
+            ),
+        )
+        return 0
     UI.lvprint(
         0, "Batch process completed in", UI.nicer_timer(time.time() - timer)
     )
@@ -945,11 +1792,11 @@ def remove_unwanted_textures(tile):
         base_name = f[:-4].replace("_water", "").replace("_sea", "").replace("_overlay", "")
         texture_list.append(base_name + ".dds")
     for f in os.listdir(os.path.join(tile.build_dir, "textures")):
-        if f[-4:] != ".dds":
+        if not _is_generated_dds_name(f):
             continue
         if f not in texture_list:
             print("Removing obsolete texture", f)
             try:
                 os.remove(os.path.join(tile.build_dir, "textures", f))
-            except:
+            except OSError:
                 pass

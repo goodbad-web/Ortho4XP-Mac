@@ -673,6 +673,16 @@ def OSM_query_to_OSM_layer(
     return 1
 
 ################################################################################
+def _overpass_query_label(query):
+    """Return a compact label suitable for retry diagnostics."""
+    if isinstance(query, (list, tuple)):
+        label = " | ".join(str(item) for item in query)
+    else:
+        label = str(query)
+    label = " ".join(label.split())
+    return label if len(label) <= 160 else label[:157] + "..."
+
+
 def get_overpass_data(query, bbox, server_code=None):
     preferred_server = server_code or overpass_server_choice
     server_order = ["DE", "LZ", "CH", "FR", "KU"]
@@ -698,6 +708,7 @@ def get_overpass_data(query, bbox, server_code=None):
     full_query = "[timeout:300];(" + overpass_query + ");(._;>>;);out meta;"
     headers = {"User-Agent": "Ortho4XP"}
     session = requests.Session()
+    query_label = _overpass_query_label(query)
 
     for tentative in range(max_osm_tentatives):
         attempted_servers = set()
@@ -706,6 +717,15 @@ def get_overpass_data(query, bbox, server_code=None):
                 continue
             attempted_servers.add(true_server_code)
             base_url = overpass_servers[true_server_code]
+            attempt_number = tentative + 1
+            UI.logprint(
+                "[OSM] query=",
+                query_label,
+                "attempt=",
+                attempt_number,
+                "server=",
+                true_server_code,
+            )
             UI.vprint(3, "Sending POST request to", base_url)
             try:
                 # POST keeps large vector queries out of URL length limits.
@@ -726,6 +746,24 @@ def get_overpass_data(query, bbox, server_code=None):
                         elif len(content) <= 1000 and b"error" in content_lower:
                             reason = "server error payload"
                         else:
+                            UI.logprint(
+                                "[OSM] query=",
+                                query_label,
+                                "success_server=",
+                                true_server_code,
+                                "attempt=",
+                                attempt_number,
+                                "status=200",
+                            )
+                            UI.vprint(
+                                2,
+                                "        OSM query succeeded on server",
+                                true_server_code,
+                                "(attempt",
+                                attempt_number,
+                                "):",
+                                query_label,
+                            )
                             return content
                     except ElementTree.ParseError:
                         reason = "malformed XML response"
@@ -743,12 +781,35 @@ def get_overpass_data(query, bbox, server_code=None):
                     reason,
                     ").",
                 )
+                UI.logprint(
+                    "[OSM] query=",
+                    query_label,
+                    "attempt=",
+                    attempt_number,
+                    "server=",
+                    true_server_code,
+                    "status=",
+                    getattr(response, "status_code", "unknown"),
+                    "reason=",
+                    reason,
+                )
                 if response.status_code != 200:
                     try:
                         UI.vprint(2, "        Server message:", response.text[:200])
                     except Exception:
                         pass
             except requests.RequestException as error:
+                UI.logprint(
+                    "[OSM] query=",
+                    query_label,
+                    "attempt=",
+                    attempt_number,
+                    "server=",
+                    true_server_code,
+                    "status=request-error",
+                    "error=",
+                    error,
+                )
                 UI.vprint(
                     1,
                     "        OSM server",
@@ -757,6 +818,17 @@ def get_overpass_data(query, bbox, server_code=None):
                     error,
                 )
             except Exception as error:
+                UI.logprint(
+                    "[OSM] query=",
+                    query_label,
+                    "attempt=",
+                    attempt_number,
+                    "server=",
+                    true_server_code,
+                    "status=unexpected-error",
+                    "error=",
+                    error,
+                )
                 UI.vprint(
                     1,
                     "        OSM server",
