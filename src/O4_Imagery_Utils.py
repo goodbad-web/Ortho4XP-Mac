@@ -205,7 +205,7 @@ if "dar" in sys.platform:
         )
         use_texture_converter = False
     
-    # Apple Silicon Helper for Neural Engine / Media Engine
+    # Apple Silicon Helper for Metal image processing and media utilities.
     as_helper_cmd = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
     if not os.path.exists(as_helper_cmd):
         as_helper_cmd = None
@@ -2592,7 +2592,7 @@ def init_worker(config_data):
     UI.Ortho4XP_dir = config_data['Ortho4XP_dir']
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
-    UI.use_neural_upscale = config_data.get('use_neural_upscale', False)
+    UI.use_lanczos_upscale = config_data.get('use_lanczos_upscale', False)
     UI.dds_converter = config_data.get('dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
     UI.dds_format = config_data.get('dds_format', getattr(UI, 'dds_format', 'BC3'))
     UI.use_gpu_acceleration = config_data.get('use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
@@ -2734,7 +2734,7 @@ def convert_texture(
         (provider_code not in providers_dict)
         or not jpeg_ready
     )
-    use_upscale = getattr(UI, 'use_neural_upscale', False)
+    use_upscale = getattr(UI, 'use_lanczos_upscale', False)
     is_worker = globals().get('is_worker_process', False)
     direct_color_filter_supported = True
     if not is_combined and provider_code in providers_dict:
@@ -2844,16 +2844,16 @@ def convert_texture(
         UI.vprint(1, f"   ERROR: orthophoto source unavailable for {out_file_name}")
         return 0
 
-    # Optional AI Upscale using Neural Engine
+    # Optional conventional 2x image upscaling using Core Image's Lanczos filter.
     # A supplied prepared file already contains the preprocessing requested by
-    # the caller (including an earlier neural upscale).  Do not upscale it a
+    # the caller (including an earlier Lanczos upscale).  Do not upscale it a
     # second time during the CPU fallback after a failed GPU batch.
-    if prepared_file is None and getattr(UI, 'use_neural_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
+    if prepared_file is None and getattr(UI, 'use_lanczos_upscale', False) and as_helper_cmd and os.path.exists(file_to_convert):
         # Add pid to avoid conflicts during multiprocessing
-        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_upscaled.png")
-        UI.vprint(2, "      Upscaling texture using Apple Silicon Neural Engine...")
+        upscaled_tmp = os.path.join(UI.Ortho4XP_dir, "tmp", os.path.basename(os.path.splitext(file_to_convert)[0]) + "_lanczos_upscaled.png")
+        UI.vprint(2, "      Upscaling texture using Core Image Lanczos...")
         upscale_result = subprocess.call(
-            [as_helper_cmd, "--upscale", file_to_convert, upscaled_tmp],
+            [as_helper_cmd, "--lanczos-upscale", file_to_convert, upscaled_tmp],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
@@ -2861,11 +2861,11 @@ def convert_texture(
             file_to_convert = upscaled_tmp
             upscaled_file_to_delete = upscaled_tmp
         else:
-            UI.vprint(1, f"      ERROR: Neural upscale failed for {file_to_convert}")
+            UI.vprint(1, f"      ERROR: Lanczos upscale failed for {file_to_convert}")
             cleanup_conversion_temp_files()
             return 0
-    elif prepared_file is None and getattr(UI, 'use_neural_upscale', False):
-        UI.vprint(1, "      ERROR: Neural upscale is enabled but ASHelper is unavailable.")
+    elif prepared_file is None and getattr(UI, 'use_lanczos_upscale', False):
+        UI.vprint(1, "      ERROR: Lanczos upscale is enabled but ASHelper is unavailable.")
         cleanup_conversion_temp_files()
         return 0
 

@@ -488,7 +488,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
     old_root = ui.Ortho4XP_dir
     old_dds_converter = getattr(ui, "dds_converter", None)
     old_dds_format = getattr(ui, "dds_format", None)
-    old_use_neural_upscale = getattr(ui, "use_neural_upscale", False)
+    old_use_lanczos_upscale = getattr(ui, "use_lanczos_upscale", False)
     old_sleep = img.time.sleep
     try:
         img.dds_convert_cmd = str(fake_converter)
@@ -498,7 +498,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
         ui.Ortho4XP_dir = str(tmp)
         ui.dds_converter = "nvcompress"
         ui.dds_format = "BC3"
-        ui.use_neural_upscale = True
+        ui.use_lanczos_upscale = True
         img.time.sleep = lambda _: None
         result = img.convert_texture(
             Tile(), 0, 0, 12, "TEST", prepared_file=str(source)
@@ -548,7 +548,7 @@ def test_missing_dds_output(tmp: Path, modules: dict[str, object]) -> None:
         img.local_combined_providers_dict = old_combined
         img.as_helper_cmd = old_as_helper
         ui.Ortho4XP_dir = old_root
-        ui.use_neural_upscale = old_use_neural_upscale
+        ui.use_lanczos_upscale = old_use_lanczos_upscale
         img.time.sleep = old_sleep
         if old_dds_converter is None:
             try:

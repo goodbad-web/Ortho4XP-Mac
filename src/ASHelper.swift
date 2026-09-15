@@ -606,15 +606,15 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     return writeDDS(out, to: outputPath)
 }
 
-func upscale(inputPath: String, outputPath: String) -> Bool {
+func lanczosUpscale(inputPath: String, outputPath: String) -> Bool {
     let url = URL(fileURLWithPath: inputPath)
     guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else {
-        reportError("ASHelper: Failed to load image or create upscale filter for '\(inputPath)'.")
+        reportError("ASHelper: Failed to load image or create Lanczos upscale filter for '\(inputPath)'.")
         return false
     }
     f.setValue(ci, forKey: kCIInputImageKey); f.setValue(2.0, forKey: kCIInputScaleKey)
     guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else {
-        reportError("ASHelper: Failed to render upscaled image '\(inputPath)'.")
+        reportError("ASHelper: Failed to render Lanczos-upscaled image '\(inputPath)'.")
         return false
     }
     guard let dest = CGImageDestinationCreateWithURL(
@@ -623,12 +623,12 @@ func upscale(inputPath: String, outputPath: String) -> Bool {
         1,
         nil
     ) else {
-        reportError("ASHelper: Failed to create upscaled image output '\(outputPath)'.")
+        reportError("ASHelper: Failed to create Lanczos-upscaled image output '\(outputPath)'.")
         return false
     }
     CGImageDestinationAddImage(dest, cg, nil)
     guard CGImageDestinationFinalize(dest) else {
-        reportError("ASHelper: Failed to write upscaled image '\(outputPath)'.")
+        reportError("ASHelper: Failed to write Lanczos-upscaled image '\(outputPath)'.")
         return false
     }
     return true
@@ -725,9 +725,10 @@ if args[1] == "--capabilities" {
     guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
     print("metal_available=\(MetalCompressor.shared != nil)")
 }
-else if args[1] == "--upscale" {
-    guard args.count == 4 else { fail("ASHelper: --upscale expects input and output paths.") }
-    if !upscale(inputPath: args[2], outputPath: args[3]) {
+else if args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
+    // --upscale remains as a compatibility alias for older scripts.
+    guard args.count == 4 else { fail("ASHelper: --lanczos-upscale expects input and output paths.") }
+    if !lanczosUpscale(inputPath: args[2], outputPath: args[3]) {
         exit(1)
     }
 }

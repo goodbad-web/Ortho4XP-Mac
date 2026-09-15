@@ -116,3 +116,68 @@ generation can be added later when a fully seamless material is required.
 The generator also has `--obj8-only` for environments that already have the
 texture files but do not have Blender installed; that path does not claim to
 produce a `.blend` file.
+
+## MEGA CITY TOWERS landmark package
+
+For a lightweight landmark overlay of Yao's MEGA CITY TOWERS, use the
+dedicated procedural generator.  It creates separate WEST, EAST, and shared
+podium OBJ8 objects for tile `+34+135`, each with near/mid/far LOD sections:
+
+```sh
+.venv/bin/python tools/create_megacity_towers.py \
+  --output /tmp/zz_MegaCityTowers_+34+135 \
+  --config tools/megacity_towers_config.json \
+  --dsftool Utils/mac/DSFTool \
+  --nvcompress Utils/mac/nvcompress
+```
+
+The config keeps the EAST public map reference and the provisional WEST
+offset separate.  Verify the WEST footprint in a map or X-Plane before adding
+an exclusion rectangle.  The facade atlas is self-owned and can be replaced
+by `jp_*` ComfyUI output without changing the DSF or tower geometry.
+
+To create an inspectable Blender scene, run the same script through Blender
+with `--blend-output`.  Blender is used only at generation time; X-Plane loads
+the resulting OBJ8/DDS files and does not run ComfyUI during flight.
+
+On macOS, invoke Blender through the Metal preflight wrapper so a locked or
+headless session is reported clearly instead of triggering Blender's early
+Metal crash:
+
+```sh
+tools/run_blender_with_metal_preflight.sh \
+  --background \
+  --python tools/create_megacity_towers.py \
+  -- \
+  --output /tmp/zz_MegaCityTowers_+34+135 \
+  --config tools/megacity_towers_config.json \
+  --dsftool Utils/mac/DSFTool \
+  --nvcompress Utils/mac/nvcompress \
+  --blend-output /tmp/zz_MegaCityTowers_+34+135/megacity-towers.blend
+```
+
+Set `OR4XP_BLENDER_BIN` when using another Blender installation.  The probe
+does not change Blender preferences or the installed application.
+
+## The Scene Johoku landmark package
+
+For a lightweight procedural landmark overlay of The Scene Johoku in Nagoya's
+Kita ward, use the dedicated generator.  It creates an elliptical 160 m Astro
+Tower and two approximately 31 m Star buildings, each with near/mid/far LOD
+sections:
+
+```sh
+.venv/bin/python tools/create_scene_johoku.py \
+  --output /tmp/zz_TheSceneJohoku_+35+136 \
+  --config tools/scene_johoku_config.json \
+  --nvcompress Utils/mac/nvcompress
+```
+
+The initial Astro Tower coordinate in the JSON follows the supplied Google
+Earth reference image, with small east/west offsets for the Star buildings.
+Check the three footprints in X-Plane before adding any exclusion rectangle.
+The package contains four separate OBJ8 objects: the Astro Tower, two Star
+buildings, and a shared low podium.  The model uses a self-owned generic residential
+facade atlas, so it does not copy photographs or logos.  Blender is optional;
+use `--blend-output` through `run_blender_with_metal_preflight.sh` when an
+inspectable `.blend` scene is useful.

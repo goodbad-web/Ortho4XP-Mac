@@ -119,11 +119,20 @@ a particular server.",
         "default": True,
         "hint": "Use Apple Silicon GPU (Metal) for DDS texture conversion. Dramatically reduces CPU load and increases speed on M1/M2/M3 Mac.",
     },
+    "use_lanczos_upscale": {
+        "module": "IMG",
+        "type": bool,
+        "default": False,
+        "short_name": "Lanczos Upscale",
+        "hint": "Use Core Image's Lanczos filter for 2x texture upscaling through ASHelper. This is a conventional image filter, not AI upscaling or Neural Engine inference.\n\n日本語: ASHelper経由でCore ImageのLanczosフィルタを使い、テクスチャを2倍に拡大します。AI超解像やNeural Engine推論ではありません。",
+    },
+    # Kept only so existing global and tile config files can be migrated. It
+    # is intentionally not included in any visible config-variable list.
     "use_neural_upscale": {
         "module": "IMG",
         "type": bool,
         "default": False,
-        "hint": "Use Apple Silicon Neural Engine (Vision/CoreML) for texture upscaling. Requires macOS 12.0+.",
+        "hint": "Deprecated compatibility key. Use use_lanczos_upscale for the existing Lanczos image filter; no Neural Engine backend is implemented.",
     },
     "use_gpu_for_masks": {
         "module": "UI",
@@ -446,6 +455,10 @@ too low to grab these details.",
     },
 }
 
+legacy_cfg_aliases = {
+    "use_neural_upscale": "use_lanczos_upscale",
+}
+
 list_app_vars = [
     "verbosity",
     "cleaning_level",
@@ -511,7 +524,7 @@ list_dsf_vars = [
     "cover_extent",
     "cover_zl",
     "dsf_node_budget",
-    "use_neural_upscale",
+    "use_lanczos_upscale",
     "use_gpu_acceleration",
     "use_gpu_for_color_filters",
     "dds_converter",
@@ -563,6 +576,8 @@ for var in cfg_vars:
         globals()[var] = val
 ################################################################################
 # Update from Global Ortho4XP.cfg
+legacy_config_values = {}
+configured_vars = set()
 try:
     f = open(os.path.join(FNAMES.Ortho4XP_dir, "Ortho4XP.cfg"), "r")
     for line in f.readlines():
@@ -594,6 +609,10 @@ try:
                     val = cfg_vars[var]["type"](value)
                 except:
                     continue
+
+            if var in legacy_cfg_aliases:
+                legacy_config_values[var] = val
+                continue
             
             if "module" in cfg_vars[var]:
                 module_name = cfg_vars[var]["module"]
@@ -604,12 +623,17 @@ try:
                 elif module_name == "OVL": setattr(OVL, var, val)
             else:
                 globals()[var] = val
+            configured_vars.add(var)
             UI.vprint(2, "   Config variable", var, "set to", val)
         except:
             pass
     f.close()
 except:
     print("No global config file found. Reverting to default values.")
+
+for legacy_var, current_var in legacy_cfg_aliases.items():
+    if legacy_var in legacy_config_values and current_var not in configured_vars:
+        setattr(IMG, current_var, legacy_config_values[legacy_var])
 
 
 ################################################################################
@@ -679,6 +703,8 @@ class Tile:
                     return 0
         try:
             f = open(config_file, "r")
+            legacy_config_values = {}
+            configured_vars = set()
             for line in f.readlines():
                 line = line.strip()
                 if not line:
@@ -704,7 +730,11 @@ class Tile:
                             val = cfg_vars[var]["type"](value)
                         except:
                             continue
+                    if var in legacy_cfg_aliases:
+                        legacy_config_values[var] = val
+                        continue
                     setattr(self, var, val)
+                    configured_vars.add(var)
                 except Exception as e:
                     # compatibility with zone_list config files from 
                     # version <= 1.20
@@ -717,6 +747,9 @@ class Tile:
                     else:
                         UI.vprint(2, e)
                         pass
+            for legacy_var, current_var in legacy_cfg_aliases.items():
+                if legacy_var in legacy_config_values and current_var not in configured_vars:
+                    setattr(self, current_var, legacy_config_values[legacy_var])
             f.close()
             return 1
         except:
@@ -1172,6 +1205,8 @@ class Ortho4XP_Config(tk.Toplevel):
             except:
                 self.popup("ERROR", "No config file found in " + str(build_dir))
                 return 0
+        legacy_config_values = {}
+        configured_vars = set()
         for line in f.readlines():
             line = line.strip()
             if not line:
@@ -1185,7 +1220,11 @@ class Ortho4XP_Config(tk.Toplevel):
                     value = value[1:]
                 if value and value[-1] in ('"', "'"):
                     value = value[:-1]
+                if var in legacy_cfg_aliases:
+                    legacy_config_values[var] = value
+                    continue
                 self.v_[var].set(value)
+                configured_vars.add(var)
             except Exception as e:
                 # compatibility with zone_list config files from version <= 1.20
                 if "zone_list.append" in line:
@@ -1197,6 +1236,9 @@ class Ortho4XP_Config(tk.Toplevel):
                 else:
                     UI.vprint(2, e)
                     pass
+        for legacy_var, current_var in legacy_cfg_aliases.items():
+            if legacy_var in legacy_config_values and current_var not in configured_vars:
+                self.v_[current_var].set(legacy_config_values[legacy_var])
         if not self.v_["zone_list"].get():
             self.v_["zone_list"].set(str(zone_list))
         f.close()
@@ -1231,6 +1273,8 @@ class Ortho4XP_Config(tk.Toplevel):
             f = open(os.path.join(FNAMES.Ortho4XP_dir, "Ortho4XP.cfg"), "r")
         except:
             return 0
+        legacy_config_values = {}
+        configured_vars = set()
         for line in f.readlines():
             line = line.strip()
             if not line:
@@ -1244,9 +1288,16 @@ class Ortho4XP_Config(tk.Toplevel):
                     value = value[1:]
                 if value and value[-1] in ('"', "'"):
                     value = value[:-1]
+                if var in legacy_cfg_aliases:
+                    legacy_config_values[var] = value
+                    continue
                 self.v_[var].set(value)
+                configured_vars.add(var)
             except:
                 pass
+        for legacy_var, current_var in legacy_cfg_aliases.items():
+            if legacy_var in legacy_config_values and current_var not in configured_vars:
+                self.v_[current_var].set(legacy_config_values[legacy_var])
         f.close()
         return
 

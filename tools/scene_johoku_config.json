@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "The Scene Johoku",
+  "tile": {
+    "lat": 35,
+    "lon": 136
+  },
+  "astro": {
+    "lat": 35.2163944,
+    "lon": 136.9126889,
+    "heading": 0.0,
+    "floors": 45,
+    "height_m": 160.0,
+    "coordinate_source": "user-provided Google Earth reference coordinate; verify footprint in X-Plane"
+  },
+  "west_star": {
+    "lat": 35.2160844,
+    "lon": 136.9118989,
+    "heading": 90.0,
+    "floors": 11,
+    "height_m": 31.0,
+    "coordinate_source": "initial west-side offset from user-provided reference; verify"
+  },
+  "east_star": {
+    "lat": 35.2160844,
+    "lon": 136.9134789,
+    "heading": 90.0,
+    "floors": 11,
+    "height_m": 31.0,
+    "coordinate_source": "initial east-side offset from user-provided reference; verify"
+  }
+}

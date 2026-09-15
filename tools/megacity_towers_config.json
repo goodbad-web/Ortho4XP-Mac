@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "MEGA CITY TOWERS",
+  "tile": {
+    "lat": 34,
+    "lon": 135
+  },
+  "east": {
+    "lat": 34.62113,
+    "lon": 135.585712,
+    "heading": 0.0,
+    "floors": 41,
+    "height_m": 143.8,
+    "coordinate_source": "public property map reference"
+  },
+  "west": {
+    "lat": 34.62113,
+    "lon": 135.58485,
+    "heading": 0.0,
+    "floors": 40,
+    "height_m": 143.8,
+    "coordinate_source": "initial west-side offset; verify against the footprint in X-Plane"
+  },
+  "podium": {
+    "height_m": 12.0,
+    "coordinate_source": "midpoint of east and west anchors"
+  }
+}

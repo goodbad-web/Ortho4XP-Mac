@@ -409,7 +409,7 @@ def main() -> int:
                 label,
                 [
                     str(args.helper),
-                    "--upscale",
+                    "--lanczos-upscale",
                     str(upscale_input),
                     str(upscale_output),
                 ],
