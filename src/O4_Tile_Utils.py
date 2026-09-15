@@ -481,7 +481,15 @@ def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
         # preprocessing. Only reuse files that already contain that work.
         if prepared_file:
             item_tile, item_x, item_y, item_z, item_provider = item
-            if item_provider in IMG.providers_dict:
+            # TensorOps batch output contains only the upscale.  The normal
+            # GPU batch applies masks and color filters afterwards, so this
+            # intermediate must not be reused by the CPU fallback when that
+            # later batch fails.
+            if IMG.normalize_upscale_backend(
+                getattr(item_tile, "upscale_backend", "none")
+            ) == "tensorops":
+                prepared_file = None
+            if prepared_file and item_provider in IMG.providers_dict:
                 direct_jpeg = os.path.join(
                     FNAMES.jpeg_file_dir_from_attributes(
                         item_tile.lat,

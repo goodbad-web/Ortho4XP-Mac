@@ -1033,9 +1033,74 @@ func metalFXSpatialAvailable() -> Bool {
 func fp8TensorOpsAvailable() -> Bool {
     guard #available(macOS 27.0, *),
           let device = MTLCreateSystemDefaultDevice(),
-          device.makeMTL4CommandQueue() != nil else {
+          device.makeMTL4CommandQueue() != nil,
+          device.makeCommandAllocator() != nil,
+          device.makeSharedEvent() != nil,
+          let compiler = try? device.makeCompiler(descriptor: MTL4CompilerDescriptor()) else {
         return false
     }
+
+    let compileOptions = MTLCompileOptions()
+    compileOptions.languageVersion = .version4_1
+    guard let library = try? device.makeLibrary(
+        source: fp8TensorOpsSource,
+        options: compileOptions
+    ) else {
+        return false
+    }
+
+    func makePipeline(_ name: String) -> MTLComputePipelineState? {
+        let functionDescriptor = MTL4LibraryFunctionDescriptor()
+        functionDescriptor.library = library
+        functionDescriptor.name = name
+        let pipelineDescriptor = MTL4ComputePipelineDescriptor()
+        pipelineDescriptor.computeFunctionDescriptor = functionDescriptor
+        return try? compiler.makeComputePipelineState(descriptor: pipelineDescriptor)
+    }
+
+    let requiredPipelines = [
+        "fp8sr_im2col_image",
+        "fp8sr_im2col_features",
+        "fp8sr_matmul",
+        "fp8sr_postprocess",
+        "fp8sr_pixel_shuffle",
+    ]
+    guard requiredPipelines.allSatisfy({ makePipeline($0) != nil }) else {
+        return false
+    }
+
+    let argumentDescriptor = MTL4ArgumentTableDescriptor()
+    argumentDescriptor.maxBufferBindCount = 4
+    argumentDescriptor.maxTextureBindCount = 1
+    guard (try? device.makeArgumentTable(descriptor: argumentDescriptor)) != nil else {
+        return false
+    }
+
+    let residencyDescriptor = MTLResidencySetDescriptor()
+    residencyDescriptor.initialCapacity = 1
+    guard let residencySet = try? device.makeResidencySet(descriptor: residencyDescriptor),
+          let probeBuffer = device.makeBuffer(
+              length: 32 * 128,
+              options: .storageModeShared
+          ) else {
+        return false
+    }
+    let tensorDescriptor = MTLTensorDescriptor()
+    tensorDescriptor.dimensions = MTLTensorExtents([32, 32])!
+    tensorDescriptor.strides = MTLTensorExtents([1, 128])!
+    tensorDescriptor.dataType = MTLTensorDataType(rawValue: 142)!
+    tensorDescriptor.usage = .compute
+    tensorDescriptor.storageMode = .shared
+    let attachments = MTLTensorBufferAttachments()
+    attachments.setBuffer(probeBuffer, offset: 0, for: .data)
+    guard (try? device.makeTensor(
+        descriptor: tensorDescriptor,
+        attachments: attachments
+    )) != nil else {
+        return false
+    }
+    residencySet.addAllocation(probeBuffer)
+    residencySet.commit()
     return true
 }
 
