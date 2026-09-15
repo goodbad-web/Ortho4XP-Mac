@@ -69,4 +69,27 @@ MetalFX SpatialとCore Image Lanczosの2倍アップスケールをM5 Max上で�
 
 この検証はMetalデバイス、Core ImageのMetalコンテキスト、ASHelperの直接変換、`--convert-batch-v3` の64件並列変換、DDSのヘッダ・Mip数・マスク透明度、色補正の作用、DDS書き込み失敗時の終了コードを確認する。`--keep-artifacts` を省略すると、成功時の生成物は終了時に削除される。失敗時は調査用に生成物を残し、出力された `kept_artifacts` を確認できる。Metal対応ホストでも実行プロセスのサンドボックスからデバイスが見えない場合があり、その場合は `metal_host_supported=true` と表示されるため、ホストのターミナルなど隔離されていないCLIから再実行する。MetalデバイスがないMacではCPU/fallbackの確認だけを行い、GPU固有の判定はスキップする。実データのタイル生成・GUI操作は既存の手動確認範囲であり、このランナーには含めない。
 
+FP8 TensorOpsの固定契約と外部モデルパックは、[FP8SRパック仕様](fp8sr-pack.md)に従う。パックの形式検証と決定的フィクスチャ生成は次で行う。
+
+```sh
+.venv/bin/python tools/fp8sr_pack.py --validate /path/to/model.fp8sr
+.venv/bin/python tools/fp8sr_pack.py --create-fixture /private/tmp/ortho4xp-fp8-fixture
+```
+
+macOS 27、FP8 TensorOps対応Apple Silicon Macでは、ASHelperを再ビルドした後に単画像・batchの実行を確認する。次のコマンドは入力8x8のフィクスチャから16x16 PNGを生成する。
+
+```sh
+./Utils/run/build_ashelper.sh
+Utils/mac/ASHelper --fp8-tensorops-upscale \
+  /private/tmp/ortho4xp-fp8-fixture \
+  /private/tmp/ortho4xp-fp8-fixture/input.png \
+  /private/tmp/ortho4xp-fp8-fixture/output.png
+Utils/mac/ASHelper --fp8-tensorops-upscale-batch \
+  /private/tmp/ortho4xp-fp8-fixture \
+  /private/tmp/ortho4xp-fp8-fixture/input.png \
+  /private/tmp/ortho4xp-fp8-fixture/batch-output.png
+```
+
+`fp8_dispatch=ready`はFP8 E4M3重み、FP16活性値、FP16累積のTensorOpsパイプライン初期化、`fp8_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。Neural Acceleratorの確認はXcode GPU traceで別途行う。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認と、Xcode GPU traceの確認は未実行として分けて報告する。
+
 構文確認、ビルド、限定的なスクリプト実行だけでは、実際のProvider応答、長時間のタイル生成、GUI操作、利用者データへの影響まで保証しない。未実行の範囲を最終報告に明記する。

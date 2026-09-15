@@ -127,6 +127,166 @@ kernel void compressTexture(texture2d<float, access::read> input [[texture(0)]],
 }
 """
 
+// FP8SR is deliberately kept as a small, fixed graph.  The source is
+// compiled only on macOS 27+ and is never loaded by the normal DDS path.
+// Activations and accumulators remain Float16; only the model weights are
+// MetalFloat8E4M3 tensors.
+let fp8TensorOpsSource = """
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp;
+
+struct FP8SRIm2ColParams {
+    uint width;
+    uint height;
+    uint sourceChannels;
+    uint sourceStride;
+    uint targetK;
+    uint kernelSize;
+};
+
+struct FP8SRPostParams {
+    uint pixelCount;
+    uint channels;
+    float scale;
+};
+
+struct FP8SRMatmulParams {
+    uint m;
+    uint n;
+    uint k;
+};
+
+struct FP8SRPixelParams {
+    uint width;
+    uint height;
+    uint pixelCount;
+    uint channels;
+};
+
+kernel void fp8sr_im2col_image(
+    texture2d<float, access::read> source [[texture(0)]],
+    device half *destination [[buffer(1)]],
+    constant FP8SRIm2ColParams &params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint pixelCount = params.width * params.height;
+    uint total = pixelCount * params.targetK;
+    if (gid >= total) return;
+    uint pixel = gid / params.targetK;
+    uint feature = gid % params.targetK;
+    if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
+        destination[gid] = half(0.0h);
+        return;
+    }
+    uint inputChannel = feature % params.sourceChannels;
+    uint kernelIndex = feature / params.sourceChannels;
+    int x = int(pixel % params.width) + int(kernelIndex % params.kernelSize) - int(params.kernelSize / 2);
+    int y = int(pixel / params.width) + int(kernelIndex / params.kernelSize) - int(params.kernelSize / 2);
+    x = clamp(x, 0, int(params.width) - 1);
+    y = clamp(y, 0, int(params.height) - 1);
+    float4 value = source.read(uint2(x, y));
+    destination[gid] = half(inputChannel == 0 ? value.r : (inputChannel == 1 ? value.g : value.b));
+}
+
+kernel void fp8sr_im2col_features(
+    device const half *source [[buffer(0)]],
+    device half *destination [[buffer(1)]],
+    constant FP8SRIm2ColParams &params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint pixelCount = params.width * params.height;
+    uint total = pixelCount * params.targetK;
+    if (gid >= total) return;
+    uint pixel = gid / params.targetK;
+    uint feature = gid % params.targetK;
+    if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
+        destination[gid] = half(0.0h);
+        return;
+    }
+    uint inputChannel = feature % params.sourceChannels;
+    uint kernelIndex = feature / params.sourceChannels;
+    int x = int(pixel % params.width) + int(kernelIndex % params.kernelSize) - int(params.kernelSize / 2);
+    int y = int(pixel / params.width) + int(kernelIndex / params.kernelSize) - int(params.kernelSize / 2);
+    x = clamp(x, 0, int(params.width) - 1);
+    y = clamp(y, 0, int(params.height) - 1);
+    uint sourcePixel = uint(y) * params.width + uint(x);
+    // TensorOps output tensors use [channels, pixels] extents, where the
+    // innermost dimension is the channel.  Keep the intermediate buffer in
+    // that physical pixel-major layout for the next im2col pass.
+    destination[gid] = source[sourcePixel * params.sourceStride + inputChannel];
+}
+
+kernel void fp8sr_matmul(
+    device half *activationBuffer [[buffer(0)]],
+    device uchar *weightBuffer [[buffer(1)]],
+    device half *outputBuffer [[buffer(2)]],
+    constant FP8SRMatmulParams &params [[buffer(3)]],
+    uint2 threadgroupID [[threadgroup_position_in_grid]]) {
+    constexpr auto descriptor = tensor_ops::matmul2d_descriptor(
+        64, 32, 32, false, false, false,
+        tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    tensor_ops::matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
+        activationBuffer,
+        dextents<int, 2>{int(params.k), int(params.m)},
+        array<int, 2>{1, int(params.k)});
+    auto weights = tensor<device metal_fp8_e4m3_format, dextents<int, 2>, tensor_inline>(
+        weightBuffer,
+        dextents<int, 2>{int(params.n), int(params.k)},
+        array<int, 2>{1, 128});
+    auto output = tensor<device half, dextents<int, 2>, tensor_inline>(
+        outputBuffer,
+        dextents<int, 2>{int(params.n), int(params.m)},
+        array<int, 2>{1, int(params.n)});
+    for (uint k = 0; k < params.k; k += 32) {
+        auto activationChunk = activation.slice(k, threadgroupID.y * 64);
+        auto weightChunk = weights.slice(threadgroupID.x * 32, k);
+        auto outputTile = output.slice(threadgroupID.x * 32, threadgroupID.y * 64);
+        operation.run(activationChunk, weightChunk, outputTile);
+    }
+}
+
+kernel void fp8sr_postprocess(
+    device half *values [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    constant FP8SRPostParams &params [[buffer(2)]],
+    device atomic_uint *error [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = params.pixelCount * params.channels;
+    if (gid >= total) return;
+    uint channel = gid % params.channels;
+    float value = float(values[gid]) * params.scale + float(bias[channel]);
+    if (!isfinite(value)) {
+        atomic_store_explicit(error, 1u, memory_order_relaxed);
+        value = 0.0f;
+    }
+    values[gid] = half(max(value, 0.0f));
+}
+
+kernel void fp8sr_pixel_shuffle(
+    device const half *values [[buffer(0)]],
+    device uchar *destination [[buffer(1)]],
+    constant FP8SRPixelParams &params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.pixelCount) return;
+    uint x = gid % params.width;
+    uint y = gid / params.width;
+    for (uint dy = 0; dy < 2; ++dy) {
+        for (uint dx = 0; dx < 2; ++dx) {
+            uint outX = x * 2 + dx;
+            uint outY = y * 2 + dy;
+            uint outOffset = (outY * params.width * 2 + outX) * 4;
+            uint subpixel = (dy * 2 + dx) * 3;
+            for (uint channel = 0; channel < 3; ++channel) {
+                float value = clamp(float(values[gid * params.channels + subpixel + channel]), 0.0f, 1.0f);
+                destination[outOffset + channel] = uchar(round(value * 255.0f));
+            }
+            destination[outOffset + 3] = 255;
+        }
+    }
+}
+"""
+
 class MetalCompressor {
     static let shared: MetalCompressor? = MetalCompressor()
     
@@ -780,6 +940,722 @@ func metalFXSpatialAvailable() -> Bool {
     return MTLFXSpatialScalerDescriptor.supportsDevice(device)
 }
 
+func fp8TensorOpsAvailable() -> Bool {
+    guard #available(macOS 27.0, *),
+          let device = MTLCreateSystemDefaultDevice(),
+          device.makeMTL4CommandQueue() != nil else {
+        return false
+    }
+    return true
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRManifest: Decodable {
+    let format: String
+    let version: Int
+    let upscaleFactor: Int
+    let layout: String
+    let inputChannels: Int
+    let outputChannels: Int
+    let weightDType: String
+    let activationDType: String
+    let accumulationDType: String
+    let weightRowStrideBytes: Int
+    let layers: [FP8SRManifestLayer]
+
+    enum CodingKeys: String, CodingKey {
+        case format, version, layout, layers
+        case upscaleFactor = "upscale_factor"
+        case inputChannels = "input_channels"
+        case outputChannels = "output_channels"
+        case weightDType = "weight_dtype"
+        case activationDType = "activation_dtype"
+        case accumulationDType = "accumulation_dtype"
+        case weightRowStrideBytes = "weight_row_stride_bytes"
+    }
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRManifestLayer: Decodable {
+    let name: String
+    let kernel: Int
+    let inChannels: Int
+    let outChannels: Int
+    let weights: String
+    let bias: String
+    let scale: Float
+
+    enum CodingKeys: String, CodingKey {
+        case name, kernel, weights, bias, scale
+        case inChannels = "in_channels"
+        case outChannels = "out_channels"
+    }
+}
+
+@available(macOS 27.0, *)
+private enum FP8SRError: Error, CustomStringConvertible {
+    case invalid(String)
+    case unavailable(String)
+    case execution(String)
+
+    var description: String {
+        switch self {
+        case .invalid(let message): return "invalid_layout_\(message)"
+        case .unavailable(let message): return message
+        case .execution(let message): return message
+        }
+    }
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRIm2ColParams {
+    var width: UInt32
+    var height: UInt32
+    var sourceChannels: UInt32
+    var sourceStride: UInt32
+    var targetK: UInt32
+    var kernelSize: UInt32
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRPostParams {
+    var pixelCount: UInt32
+    var channels: UInt32
+    var scale: Float
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRMatmulParams {
+    var m: UInt32
+    var n: UInt32
+    var k: UInt32
+}
+
+@available(macOS 27.0, *)
+private struct FP8SRPixelParams {
+    var width: UInt32
+    var height: UInt32
+    var pixelCount: UInt32
+    var channels: UInt32
+}
+
+@available(macOS 27.0, *)
+private final class FP8SRRuntime {
+    private struct Layer {
+        let manifest: FP8SRManifestLayer
+        let weights: MTLTensor
+        let weightBuffer: MTLBuffer
+        let bias: MTLBuffer
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cache: [String: FP8SRRuntime] = [:]
+
+    private let device: MTLDevice
+    private let commandQueue: MTL4CommandQueue
+    private let commandAllocator: MTL4CommandAllocator
+    private let completionEvent: MTLSharedEvent
+    private let argumentTable: MTL4ArgumentTable
+    private let residencySet: MTLResidencySet
+    private let imageIm2ColPipeline: MTLComputePipelineState
+    private let featureIm2ColPipeline: MTLComputePipelineState
+    private let matmulPipeline: MTLComputePipelineState
+    private let postprocessPipeline: MTLComputePipelineState
+    private let pixelShufflePipeline: MTLComputePipelineState
+    private let layers: [Layer]
+    private var transientBuffers: [MTLBuffer] = []
+    private var nextCompletionValue: UInt64 = 1
+
+    static func cached(packPath: String) throws -> FP8SRRuntime {
+        let key = URL(fileURLWithPath: packPath).standardizedFileURL.path
+        cacheLock.lock()
+        if let runtime = cache[key] {
+            cacheLock.unlock()
+            return runtime
+        }
+        cacheLock.unlock()
+
+        let runtime = try FP8SRRuntime(packPath: key)
+        cacheLock.lock()
+        cache[key] = runtime
+        cacheLock.unlock()
+        return runtime
+    }
+
+    private init(packPath: String) throws {
+        guard FileManager.default.fileExists(atPath: packPath) else {
+            throw FP8SRError.unavailable("fp8_model_unavailable")
+        }
+        let packURL = URL(fileURLWithPath: packPath).resolvingSymlinksInPath().standardizedFileURL
+        let manifestURL = packURL.appendingPathComponent("manifest.json")
+        guard let manifestData = try? Data(contentsOf: manifestURL) else {
+            throw FP8SRError.unavailable("fp8_manifest_unavailable")
+        }
+        let manifest: FP8SRManifest
+        do {
+            manifest = try JSONDecoder().decode(FP8SRManifest.self, from: manifestData)
+        } catch {
+            throw FP8SRError.invalid("manifest_decode")
+        }
+        try FP8SRRuntime.validate(manifest: manifest, packURL: packURL)
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw FP8SRError.unavailable("metal_unavailable")
+        }
+        self.device = device
+        guard let commandQueue = device.makeMTL4CommandQueue(),
+              let commandAllocator = device.makeCommandAllocator(),
+              let completionEvent = device.makeSharedEvent() else {
+            throw FP8SRError.unavailable("metal4_unavailable")
+        }
+        self.commandQueue = commandQueue
+        self.commandAllocator = commandAllocator
+        self.completionEvent = completionEvent
+
+        let compileOptions = MTLCompileOptions()
+        compileOptions.languageVersion = .version4_1
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: fp8TensorOpsSource, options: compileOptions)
+        } catch {
+            reportError("ASHelper: FP8 TensorOps shader compile detail=\(error)")
+            throw FP8SRError.unavailable("fp8_shader_compile")
+        }
+        let compiler: MTL4Compiler
+        do {
+            compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+        } catch {
+            throw FP8SRError.unavailable("metal4_compiler_unavailable")
+        }
+
+        func makePipeline(_ name: String) throws -> MTLComputePipelineState {
+            let functionDescriptor = MTL4LibraryFunctionDescriptor()
+            functionDescriptor.library = library
+            functionDescriptor.name = name
+            let pipelineDescriptor = MTL4ComputePipelineDescriptor()
+            pipelineDescriptor.computeFunctionDescriptor = functionDescriptor
+            return try compiler.makeComputePipelineState(descriptor: pipelineDescriptor)
+        }
+        do {
+            self.imageIm2ColPipeline = try makePipeline("fp8sr_im2col_image")
+            self.featureIm2ColPipeline = try makePipeline("fp8sr_im2col_features")
+            self.matmulPipeline = try makePipeline("fp8sr_matmul")
+            self.postprocessPipeline = try makePipeline("fp8sr_postprocess")
+            self.pixelShufflePipeline = try makePipeline("fp8sr_pixel_shuffle")
+        } catch {
+            reportError("ASHelper: FP8 TensorOps pipeline compile detail=\(error)")
+            throw FP8SRError.unavailable("fp8_pipeline_compile")
+        }
+
+        let argumentDescriptor = MTL4ArgumentTableDescriptor()
+        argumentDescriptor.maxBufferBindCount = 4
+        argumentDescriptor.maxTextureBindCount = 1
+        do {
+            self.argumentTable = try device.makeArgumentTable(descriptor: argumentDescriptor)
+        } catch {
+            throw FP8SRError.unavailable("metal4_argument_table")
+        }
+        let residencyDescriptor = MTLResidencySetDescriptor()
+        residencyDescriptor.initialCapacity = 32
+        guard let residencySet = try? device.makeResidencySet(descriptor: residencyDescriptor) else {
+            throw FP8SRError.unavailable("metal4_residency_set")
+        }
+        self.residencySet = residencySet
+
+        var loadedLayers: [Layer] = []
+        for layerManifest in manifest.layers {
+            let weightsURL = packURL.appendingPathComponent(layerManifest.weights)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let biasURL = packURL.appendingPathComponent(layerManifest.bias)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let weightsData = try Data(contentsOf: weightsURL)
+            let biasData = try Data(contentsOf: biasURL)
+            let runtimeK = FP8SRRuntime.paddedKernelElements(layerManifest)
+            let sourceK = ((layerManifest.kernel * layerManifest.kernel * layerManifest.inChannels + 31) / 32) * 32
+            let weightsBuffer = try FP8SRRuntime.makeWeightBuffer(
+                device: device,
+                data: weightsData,
+                sourceKernelElements: sourceK,
+                runtimeKernelElements: runtimeK
+            )
+            let biasBuffer = try FP8SRRuntime.makeSharedBuffer(device: device, data: biasData)
+            let kPadded = runtimeK
+            let weightDescriptor = MTLTensorDescriptor()
+            weightDescriptor.dimensions = MTLTensorExtents([32, kPadded])!
+            weightDescriptor.strides = MTLTensorExtents([1, 128])!
+            weightDescriptor.dataType = MTLTensorDataType(rawValue: 142)!
+            weightDescriptor.usage = .compute
+            weightDescriptor.storageMode = .shared
+            let attachments = MTLTensorBufferAttachments()
+            attachments.setBuffer(weightsBuffer, offset: 0, for: .data)
+            guard let weightsTensor = try? device.makeTensor(
+                descriptor: weightDescriptor,
+                attachments: attachments
+            ) else {
+                throw FP8SRError.invalid("weight_tensor_(layerManifest.name)")
+            }
+            loadedLayers.append(Layer(
+                manifest: layerManifest,
+                weights: weightsTensor,
+                weightBuffer: weightsBuffer,
+                bias: biasBuffer
+            ))
+            residencySet.addAllocation(weightsBuffer)
+            residencySet.addAllocation(biasBuffer)
+        }
+        residencySet.commit()
+        self.layers = loadedLayers
+        print("fp8_dispatch=ready dtype=MetalFloat8E4M3 activation=Float16 accumulation=Float16 layout=NHWC "
+            + "simdgroup=\(matmulPipeline.threadExecutionWidth) threadgroup=\(matmulPipeline.maxTotalThreadsPerThreadgroup)")
+    }
+
+    private static func paddedKernelElements(_ layer: FP8SRManifestLayer) -> Int {
+        let elements = layer.kernel * layer.kernel * layer.inChannels
+        // Keep the external pack contract 32-aligned, but use the wider
+        // dynamic-K tile required by the current M5 FP8 TensorOps runtime for
+        // the 32-channel convolution layers. K=288 is therefore zero-padded
+        // to 320 only in the GPU working buffers.
+        if elements <= 32 { return ((elements + 31) / 32) * 32 }
+        return ((elements + 63) / 64) * 64
+    }
+
+    private static func makeSharedBuffer(device: MTLDevice, data: Data) throws -> MTLBuffer {
+        let length = max(128, (data.count + 127) & ~127)
+        guard let buffer = device.makeBuffer(length: length, options: .storageModeShared) else {
+            throw FP8SRError.unavailable("buffer_allocation")
+        }
+        buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: length)
+        data.copyBytes(to: buffer.contents().assumingMemoryBound(to: UInt8.self), count: data.count)
+        return buffer
+    }
+
+    private static func makeWeightBuffer(
+        device: MTLDevice,
+        data: Data,
+        sourceKernelElements: Int,
+        runtimeKernelElements: Int
+    ) throws -> MTLBuffer {
+        let rowBytes = 128
+        let length = max(128, runtimeKernelElements * rowBytes)
+        guard data.count == sourceKernelElements * rowBytes,
+              let buffer = device.makeBuffer(length: length, options: .storageModeShared) else {
+            throw FP8SRError.invalid("weight_padding")
+        }
+        buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: length)
+        data.copyBytes(to: buffer.contents().assumingMemoryBound(to: UInt8.self), count: data.count)
+        return buffer
+    }
+
+    private static func validate(manifest: FP8SRManifest, packURL: URL) throws {
+        let exact = manifest.format == "FP8SR"
+            && manifest.version == 1
+            && manifest.upscaleFactor == 2
+            && manifest.layout == "NHWC"
+            && manifest.inputChannels == 3
+            && manifest.outputChannels == 3
+            && manifest.weightDType == "MetalFloat8E4M3"
+            && manifest.activationDType == "Float16"
+            && manifest.accumulationDType == "Float16"
+            && manifest.weightRowStrideBytes == 128
+        guard exact else { throw FP8SRError.invalid("manifest_contract") }
+        let expected: [(String, Int, Int, Int)] = [
+            ("conv0", 3, 3, 32),
+            ("conv1", 3, 32, 32),
+            ("conv2", 3, 32, 12),
+        ]
+        guard manifest.layers.count == expected.count else {
+            throw FP8SRError.invalid("layer_count")
+        }
+        for (layer, expectedLayer) in zip(manifest.layers, expected) {
+            guard layer.name == expectedLayer.0,
+                  layer.kernel == expectedLayer.1,
+                  layer.inChannels == expectedLayer.2,
+                  layer.outChannels == expectedLayer.3,
+                  layer.scale.isFinite,
+                  layer.scale > 0 else {
+                throw FP8SRError.invalid("layer_\(layer.name)")
+            }
+            let kPadded = ((layer.kernel * layer.kernel * layer.inChannels + 31) / 32) * 32
+            let outPadded = ((layer.outChannels + 31) / 32) * 32
+            guard kPadded % 32 == 0, outPadded % 32 == 0 else {
+                throw FP8SRError.invalid("tensor_alignment_\(layer.name)")
+            }
+            let weightsURL = packURL.appendingPathComponent(layer.weights)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let biasURL = packURL.appendingPathComponent(layer.bias)
+                .resolvingSymlinksInPath().standardizedFileURL
+            guard weightsURL.path.hasPrefix(packURL.path + "/"),
+                  biasURL.path.hasPrefix(packURL.path + "/"),
+                  FileManager.default.fileExists(atPath: weightsURL.path),
+                  FileManager.default.fileExists(atPath: biasURL.path) else {
+                throw FP8SRError.invalid("layer_files_\(layer.name)")
+            }
+            let weightSize = (try? FileManager.default.attributesOfItem(atPath: weightsURL.path)[.size] as? NSNumber)?.intValue ?? -1
+            let biasSize = (try? FileManager.default.attributesOfItem(atPath: biasURL.path)[.size] as? NSNumber)?.intValue ?? -1
+            guard weightSize == kPadded * 128, biasSize == outPadded * 2 else {
+                throw FP8SRError.invalid("buffer_size_\(layer.name)")
+            }
+        }
+    }
+
+    private func makeTensor(
+        buffer: MTLBuffer,
+        dimensions: [Int],
+        strides: [Int],
+        dataType: MTLTensorDataType
+    ) throws -> MTLTensor {
+        let descriptor = MTLTensorDescriptor()
+        descriptor.dimensions = MTLTensorExtents(dimensions)!
+        descriptor.strides = MTLTensorExtents(strides)!
+        descriptor.dataType = dataType
+        descriptor.usage = .compute
+        descriptor.storageMode = .shared
+        let attachments = MTLTensorBufferAttachments()
+        attachments.setBuffer(buffer, offset: 0, for: .data)
+        guard let tensor = try? device.makeTensor(descriptor: descriptor, attachments: attachments) else {
+            throw FP8SRError.invalid("activation_tensor")
+        }
+        return tensor
+    }
+
+    private func makeParamsBuffer<T>(_ value: inout T) throws -> MTLBuffer {
+        let data = withUnsafeBytes(of: &value) { Data($0) }
+        let buffer = try FP8SRRuntime.makeSharedBuffer(device: device, data: data)
+        transientBuffers.append(buffer)
+        residencySet.addAllocation(buffer)
+        return buffer
+    }
+
+    private func encodeDispatchBarrier(_ encoder: MTL4ComputeCommandEncoder) {
+        // MTL4 keeps multiple dispatches in one encoder, so dependent kernels
+        // need an explicit intra-pass barrier. Without it, a matmul may read
+        // the zero-filled activation buffer before im2col has completed.
+        encoder.barrier(
+            afterEncoderStages: .dispatch,
+            beforeEncoderStages: .dispatch,
+            visibilityOptions: .device
+        )
+    }
+
+    private func encodeImageIm2Col(
+        encoder: MTL4ComputeCommandEncoder,
+        image: MTLTexture,
+        destination: MTLBuffer,
+        params: inout FP8SRIm2ColParams,
+        pixelCount: Int
+    ) throws {
+        let paramsBuffer = try makeParamsBuffer(&params)
+        argumentTable.setTexture(image.gpuResourceID, index: 0)
+        argumentTable.setAddress(destination.gpuAddress, index: 1)
+        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+        encoder.setComputePipelineState(imageIm2ColPipeline)
+        encoder.setArgumentTable(argumentTable)
+        encoder.dispatchThreads(
+            threadsPerGrid: MTLSize(width: pixelCount * Int(params.targetK), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encodeDispatchBarrier(encoder)
+    }
+
+    private func encodeFeatureIm2Col(
+        encoder: MTL4ComputeCommandEncoder,
+        source: MTLBuffer,
+        destination: MTLBuffer,
+        params: inout FP8SRIm2ColParams,
+        pixelCount: Int
+    ) throws {
+        let paramsBuffer = try makeParamsBuffer(&params)
+        argumentTable.setAddress(source.gpuAddress, index: 0)
+        argumentTable.setAddress(destination.gpuAddress, index: 1)
+        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+        encoder.setComputePipelineState(featureIm2ColPipeline)
+        encoder.setArgumentTable(argumentTable)
+        encoder.dispatchThreads(
+            threadsPerGrid: MTLSize(width: pixelCount * Int(params.targetK), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encodeDispatchBarrier(encoder)
+    }
+
+    private func encodeMatmul(
+        encoder: MTL4ComputeCommandEncoder,
+        activation: MTLBuffer,
+        weights: MTLBuffer,
+        output: MTLBuffer,
+        params: inout FP8SRMatmulParams,
+        pixelCount: Int
+    ) throws {
+        let paramsBuffer = try makeParamsBuffer(&params)
+        argumentTable.setAddress(activation.gpuAddress, index: 0)
+        argumentTable.setAddress(weights.gpuAddress, index: 1)
+        argumentTable.setAddress(output.gpuAddress, index: 2)
+        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 3)
+        encoder.setComputePipelineState(matmulPipeline)
+        encoder.setArgumentTable(argumentTable)
+        let threadgroups = MTLSize(width: 1, height: (pixelCount + 63) / 64, depth: 1)
+        let width = max(1, matmulPipeline.threadExecutionWidth) * 4
+        encoder.dispatchThreadgroups(
+            threadgroupsPerGrid: threadgroups,
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encodeDispatchBarrier(encoder)
+    }
+
+    private func encodePostprocess(
+        encoder: MTL4ComputeCommandEncoder,
+        values: MTLBuffer,
+        bias: MTLBuffer,
+        params: inout FP8SRPostParams,
+        error: MTLBuffer
+    ) throws {
+        let paramsBuffer = try makeParamsBuffer(&params)
+        argumentTable.setAddress(values.gpuAddress, index: 0)
+        argumentTable.setAddress(bias.gpuAddress, index: 1)
+        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+        argumentTable.setAddress(error.gpuAddress, index: 3)
+        encoder.setComputePipelineState(postprocessPipeline)
+        encoder.setArgumentTable(argumentTable)
+        encoder.dispatchThreads(
+            threadsPerGrid: MTLSize(width: Int(params.pixelCount) * Int(params.channels), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encodeDispatchBarrier(encoder)
+    }
+
+    private func encodePixelShuffle(
+        encoder: MTL4ComputeCommandEncoder,
+        values: MTLBuffer,
+        destination: MTLBuffer,
+        params: inout FP8SRPixelParams
+    ) throws {
+        let paramsBuffer = try makeParamsBuffer(&params)
+        argumentTable.setAddress(values.gpuAddress, index: 0)
+        argumentTable.setAddress(destination.gpuAddress, index: 1)
+        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+        encoder.setComputePipelineState(pixelShufflePipeline)
+        encoder.setArgumentTable(argumentTable)
+        encoder.dispatchThreads(
+            threadsPerGrid: MTLSize(width: Int(params.pixelCount), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encodeDispatchBarrier(encoder)
+    }
+
+    func upscale(inputPath: String, outputPath: String) throws {
+        let sourceURL = URL(fileURLWithPath: inputPath)
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw FP8SRError.execution("input_decode")
+        }
+        let raw = getRawRGBA(cgImage: image)
+        guard raw.count == image.width * image.height * 4 else {
+            throw FP8SRError.execution("input_normalize")
+        }
+        if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
+            throw FP8SRError.execution("alpha")
+        }
+        guard image.width > 0, image.height > 0,
+              image.width <= 8192, image.height <= 8192 else {
+            throw FP8SRError.execution("input_dimensions")
+        }
+        let pixelCount = image.width * image.height
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: image.width,
+            height: image.height,
+            mipmapped: false
+        )
+        textureDescriptor.storageMode = .shared
+        textureDescriptor.usage = .shaderRead
+        guard let inputTexture = device.makeTexture(descriptor: textureDescriptor) else {
+            throw FP8SRError.execution("input_texture")
+        }
+        raw.withUnsafeBytes { bytes in
+            inputTexture.replace(
+                region: MTLRegionMake2D(0, 0, image.width, image.height),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: image.width * 4
+            )
+        }
+
+        guard let commandBuffer = device.makeCommandBuffer(),
+              let errorBuffer = device.makeBuffer(length: 128, options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: max(128, image.width * image.height * 16),
+                  options: .storageModeShared
+              ) else {
+            throw FP8SRError.execution("command_buffer")
+        }
+        errorBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: errorBuffer.length)
+        outputBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: outputBuffer.length)
+        transientBuffers.removeAll(keepingCapacity: true)
+        residencySet.addAllocation(inputTexture)
+        residencySet.addAllocation(errorBuffer)
+        residencySet.addAllocation(outputBuffer)
+        commandAllocator.reset()
+        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            commandBuffer.endCommandBuffer()
+            throw FP8SRError.execution("compute_encoder")
+        }
+
+        var previousOutput: MTLBuffer?
+        for (index, layer) in layers.enumerated() {
+            let kPadded = FP8SRRuntime.paddedKernelElements(layer.manifest)
+            let activationBuffer = try FP8SRRuntime.makeSharedBuffer(
+                device: device,
+                data: Data(count: max(128, kPadded * pixelCount * 2))
+            )
+            residencySet.addAllocation(activationBuffer)
+            _ = try makeTensor(
+                buffer: activationBuffer,
+                dimensions: [kPadded, pixelCount],
+                strides: [1, kPadded],
+                dataType: .float16
+            )
+            if index == 0 {
+                var params = FP8SRIm2ColParams(
+                    width: UInt32(image.width), height: UInt32(image.height),
+                    sourceChannels: 3, sourceStride: 3,
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel)
+                )
+                try encodeImageIm2Col(
+                    encoder: encoder,
+                    image: inputTexture,
+                    destination: activationBuffer,
+                    params: &params,
+                    pixelCount: pixelCount
+                )
+            } else if let previousOutput {
+                var params = FP8SRIm2ColParams(
+                    width: UInt32(image.width), height: UInt32(image.height),
+                    sourceChannels: UInt32(layer.manifest.inChannels), sourceStride: 32,
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel)
+                )
+                try encodeFeatureIm2Col(
+                    encoder: encoder,
+                    source: previousOutput,
+                    destination: activationBuffer,
+                    params: &params,
+                    pixelCount: pixelCount
+                )
+            }
+
+            let outputLength = max(128, 32 * pixelCount * 2 + 128)
+            guard let layerOutput = device.makeBuffer(length: outputLength, options: .storageModeShared) else {
+                throw FP8SRError.execution("layer_output")
+            }
+            layerOutput.contents().initializeMemory(as: UInt8.self, repeating: 0, count: layerOutput.length)
+            residencySet.addAllocation(layerOutput)
+            _ = try makeTensor(
+                buffer: layerOutput,
+                dimensions: [32, pixelCount],
+                strides: [1, 32],
+                dataType: .float16
+            )
+            var matmulParams = FP8SRMatmulParams(
+                m: UInt32(pixelCount), n: 32, k: UInt32(kPadded)
+            )
+            try encodeMatmul(
+                encoder: encoder,
+                activation: activationBuffer,
+                weights: layer.weightBuffer,
+                output: layerOutput,
+                params: &matmulParams,
+                pixelCount: pixelCount
+            )
+            var postParams = FP8SRPostParams(
+                pixelCount: UInt32(pixelCount), channels: 32, scale: layer.manifest.scale
+            )
+            try encodePostprocess(
+                encoder: encoder,
+                values: layerOutput,
+                bias: layer.bias,
+                params: &postParams,
+                error: errorBuffer
+            )
+            previousOutput = layerOutput
+        }
+        guard let finalOutput = previousOutput else {
+            commandBuffer.endCommandBuffer()
+            throw FP8SRError.execution("no_layers")
+        }
+        var pixelParams = FP8SRPixelParams(
+            width: UInt32(image.width), height: UInt32(image.height),
+            pixelCount: UInt32(pixelCount), channels: 32
+        )
+        try encodePixelShuffle(
+            encoder: encoder,
+            values: finalOutput,
+            destination: outputBuffer,
+            params: &pixelParams
+        )
+        encoder.endEncoding()
+        residencySet.commit()
+        commandBuffer.useResidencySet(residencySet)
+        commandBuffer.endCommandBuffer()
+        let completionValue = nextCompletionValue
+        nextCompletionValue += 1
+        commandQueue.commit([commandBuffer])
+        // MTL4 queue events are ordered against work already submitted to the
+        // queue. Signal only after committing this command buffer; signaling
+        // before commit would let the CPU read back the zero-filled buffer.
+        commandQueue.signalEvent(completionEvent, value: completionValue)
+        completionEvent.wait(untilSignaledValue: completionValue, timeoutMS: 120_000)
+        guard completionEvent.signaledValue >= completionValue else {
+            throw FP8SRError.execution("gpu_timeout")
+        }
+        let errorValue = errorBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee
+        guard errorValue == 0 else {
+            throw FP8SRError.execution("nonfinite")
+        }
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: outputPath).deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard let context = CGContext(
+            data: outputBuffer.contents(),
+            width: image.width * 2,
+            height: image.height * 2,
+            bitsPerComponent: 8,
+            bytesPerRow: image.width * 2 * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw FP8SRError.execution("output_context")
+        }
+        guard let outputImage = context.makeImage() else {
+            throw FP8SRError.execution("output_image")
+        }
+        guard let destination = CGImageDestinationCreateWithURL(
+            URL(fileURLWithPath: outputPath) as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw FP8SRError.execution("output_destination")
+        }
+        CGImageDestinationAddImage(destination, outputImage, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw FP8SRError.execution("output_write")
+        }
+        print("fp8_dispatch=completed dtype=MetalFloat8E4M3 accumulation=Float16 output=\(image.width * 2)x\(image.height * 2)")
+    }
+}
+
+@available(macOS 27.0, *)
+func fp8TensorOpsUpscale(inputPath: String, outputPath: String, packPath: String) -> Bool {
+    do {
+        let runtime = try FP8SRRuntime.cached(packPath: packPath)
+        try runtime.upscale(inputPath: inputPath, outputPath: outputPath)
+        return true
+    } catch {
+        reportError("ASHelper: FP8 TensorOps fallback reason=\(error)")
+        return false
+    }
+}
+
 func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) -> Bool {
     guard format != "BC7" else {
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
@@ -871,6 +1747,7 @@ if args[1] == "--capabilities" {
     guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
     print("metal_available=\(MetalCompressor.shared != nil)")
     print("metalfx_spatial_available=\(metalFXSpatialAvailable())")
+    print("fp8_tensorops_available=\(fp8TensorOpsAvailable())")
 }
 else if args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
     // --upscale remains as a compatibility alias for older scripts.
@@ -885,6 +1762,33 @@ else if args[1] == "--metalfx-spatial-upscale" {
         fail("ASHelper: MetalFX Spatial requires macOS 13 or newer.")
     }
     if !metalFXSpatialUpscale(inputPath: args[2], outputPath: args[3]) {
+        exit(1)
+    }
+}
+else if args[1] == "--fp8-tensorops-upscale" {
+    guard args.count == 5 else { fail("ASHelper: --fp8-tensorops-upscale expects pack, input, and output paths.") }
+    guard #available(macOS 27.0, *) else {
+        fail("ASHelper: FP8 TensorOps requires macOS 27 or newer.")
+    }
+    if !fp8TensorOpsUpscale(inputPath: args[3], outputPath: args[4], packPath: args[2]) {
+        exit(1)
+    }
+}
+else if args[1] == "--fp8-tensorops-upscale-batch" {
+    guard args.count >= 5 else { fail("ASHelper: --fp8-tensorops-upscale-batch expects pack and at least one input/output pair.") }
+    guard (args.count - 3) % 2 == 0 else { fail("ASHelper: --fp8-tensorops-upscale-batch argument count is invalid.") }
+    guard #available(macOS 27.0, *) else {
+        fail("ASHelper: FP8 TensorOps requires macOS 27 or newer.")
+    }
+    do {
+        let runtime = try FP8SRRuntime.cached(packPath: args[2])
+        var index = 3
+        while index + 1 < args.count {
+            try runtime.upscale(inputPath: args[index], outputPath: args[index + 1])
+            index += 2
+        }
+    } catch {
+        reportError("ASHelper: FP8 TensorOps batch fallback reason=\(error)")
         exit(1)
     }
 }

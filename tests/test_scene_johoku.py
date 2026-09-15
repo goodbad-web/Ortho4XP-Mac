@@ -17,15 +17,15 @@ ROOT = Path(__file__).parents[1]
 johoku = _load("create_scene_johoku", ROOT / "tools" / "create_scene_johoku.py")
 
 
-def test_astro_tower_has_public_height_and_elliptical_detail():
+def test_astro_tower_has_public_height_and_reference_style_detail():
     mesh = johoku.build_astro_tower_mesh("near")
 
     assert max(vertex[1] for vertex in mesh.vertices) == 160.0
-    assert len(mesh.faces) > 1_000
+    assert len(mesh.faces) > 300
     assert len(mesh.vertices) < 20_000
-    # The box core is intentionally emitted first as a robust fallback; the
-    # first elliptical side follows its six faces.
-    first_face = mesh.faces[12]
+    # The first box is intentionally emitted first so X-Plane has the same
+    # proven render path as the reference MegaCityTowers package.
+    first_face = mesh.faces[2]
     normal = johoku._normal(*(mesh.vertices[index] for index in first_face[:3]))
     assert normal[0] > 0.0
 
@@ -39,6 +39,12 @@ def test_ellipse_caps_face_away_from_the_mesh():
 
     assert bottom[1] < 0.0
     assert top[1] > 0.0
+
+
+def test_star_building_stays_within_its_declared_height():
+    mesh = johoku.build_star_mesh("near")
+
+    assert max(vertex[1] for vertex in mesh.vertices) == 31.0
 
 
 def test_obj8_lod_sections_have_disjoint_draw_ranges():

@@ -123,10 +123,18 @@ a particular server.",
         "module": "IMG",
         "type": str,
         "default": "none",
-        "values": ("none", "lanczos", "metalfx_spatial"),
+        "values": ("none", "lanczos", "metalfx_spatial", "fp8_tensorops"),
         "short_name": "Upscale Backend",
         "short_name_japanese": "アップスケール方式",
-        "hint": "Select the optional 2x orthophoto upscaling backend. Lanczos is a conventional Core Image filter; MetalFX Spatial is an Apple GPU scaler and is only used when explicitly selected.\n\n日本語: オルソフォトの2倍拡大バックエンドを選択します。Lanczosは通常のCore Imageフィルタ、MetalFX SpatialはApple GPUのスケーラです。明示的に選択した場合だけ使用します。透明度を含む画像はLanczosへフォールバックします。",
+        "hint": "Select the optional 2x orthophoto upscaling backend. Lanczos is a conventional Core Image filter; MetalFX Spatial is an Apple GPU scaler; FP8 TensorOps uses an external FP8SR pack on macOS 27 or newer. Each GPU backend is used only when explicitly selected.\n\n日本語: オルソフォトの2倍拡大バックエンドを選択します。Lanczosは通常のCore Imageフィルタ、MetalFX SpatialはApple GPUのスケーラ、FP8 TensorOpsはmacOS 27以降で外部FP8SRパックを使います。GPU方式は明示的に選択した場合だけ使用し、非対応時はLanczosへフォールバックします。",
+    },
+    "fp8_model_path": {
+        "module": "IMG",
+        "type": str,
+        "default": "",
+        "short_name": "FP8SR Model Pack",
+        "short_name_japanese": "FP8SRモデルパック",
+        "hint": "Path to an external FP8SR pack used by FP8 TensorOps. The pack must contain manifest.json and is never bundled with Ortho4XP.\n\n日本語: FP8 TensorOpsで使用する外部FP8SRパックのパスです。パックにはmanifest.jsonが必要で、Ortho4XP本体には同梱しません。",
     },
     # Kept only so existing global and tile config files can be migrated. They
     # are intentionally not included in any visible config-variable list.
@@ -486,6 +494,7 @@ def _upscale_backend_label(value):
         "none": ("None", "なし"),
         "lanczos": ("Lanczos", "Lanczos"),
         "metalfx_spatial": ("MetalFX Spatial", "MetalFX Spatial"),
+        "fp8_tensorops": ("FP8 TensorOps", "FP8 TensorOps"),
     }
     english, japanese = labels.get(value, (str(value), str(value)))
     return UI.ui_text(english, japanese)
@@ -583,6 +592,7 @@ list_dsf_vars = [
     "cover_zl",
     "dsf_node_budget",
     "upscale_backend",
+    "fp8_model_path",
     "use_gpu_acceleration",
     "use_gpu_for_color_filters",
     "dds_converter",

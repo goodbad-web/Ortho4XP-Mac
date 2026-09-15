@@ -148,12 +148,15 @@ def add_ellipse_shell(
         # culls back-facing OBJ8 polygons by default.
         mesh.add_face((p0, p3, p2, p1), ((u0, 0.04), (u0, 0.68), (u1, 0.68), (u1, 0.04)))
 
-    bottom = [_ellipse_point(rx, rz, y0, 2.0 * math.pi * i / segments, x=x, z=z) for i in range(segments)]
-    top = [_ellipse_point(rx, rz, y1, 2.0 * math.pi * i / segments, x=x, z=z) for i in range(segments)]
+    angles = [2.0 * math.pi * i / segments for i in range(segments)]
+    bottom = [_ellipse_point(rx, rz, y0, angle, x=x, z=z) for angle in angles]
+    top = [_ellipse_point(rx, rz, y1, angle, x=x, z=z) for angle in angles]
+    bottom_uvs = [(0.50 + 0.45 * math.cos(angle), 0.02 + 0.02 * math.sin(angle)) for angle in angles]
+    top_uvs = [(0.50 + 0.42 * math.cos(angle), 0.84 + 0.12 * math.sin(angle)) for angle in angles]
     # The increasing-angle ring points downwards in OBJ8's right-handed
     # coordinate system.  Reverse only the top cap so both caps face out.
-    mesh.add_face(tuple(bottom), tuple((0.0, 0.0) for _ in bottom))
-    mesh.add_face(tuple(reversed(top)), tuple((0.0, 0.72) for _ in top))
+    mesh.add_face(tuple(bottom), tuple(bottom_uvs))
+    mesh.add_face(tuple(reversed(top)), tuple(reversed(top_uvs)))
 
 
 def add_ellipse_band(
@@ -177,38 +180,47 @@ def add_ellipse_band(
 
 
 def build_astro_tower_mesh(detail: str = "near") -> MeshData:
-    """Build the central elliptical tower at one of three detail budgets."""
+    """Build the central tower using the proven box-based OBJ8 path.
+
+    The podium may use a curved shell, but the tower itself must remain on the
+    same simple box/band path as the working MegaCityTowers scenery.  This
+    avoids the tower disappearing as a whole on X-Plane render paths that do
+    not accept the previous high-vertex elliptical section reliably.
+    """
     if detail == "near":
-        segments, band_step = SEGMENTS_NEAR, 1
+        band_step = 1
     elif detail == "mid":
-        segments, band_step = SEGMENTS_MID, 3
+        band_step = 3
     elif detail == "far":
-        segments, band_step = SEGMENTS_FAR, 99
+        band_step = 99
     else:
         raise ValueError(f"unsupported detail: {detail}")
 
     mesh = MeshData()
     base_height = 7.0
     body_top = 153.0
-    # Keep a proven box-core silhouette inside the elliptical shell.  This
-    # makes the landmark robust across X-Plane render paths while the shell
-    # and bands provide the rounded facade seen from near range.
-    add_box(mesh, 52.0, body_top - base_height, 34.0, y=base_height)
+    body_width, body_depth = 52.0, 34.0
+    # Keep the entire tower on the same simple geometry family as the
+    # reference MegaCityTowers package.  The stepped crown and continuous
+    # floor bands preserve the landmark silhouette without risking an
+    # all-or-nothing failure in X-Plane's OBJ8 object loader.
+    add_box(mesh, body_width, body_top - base_height, body_depth, y=base_height)
     add_box(mesh, 62.0, base_height, 48.0, y=0.0)
-    add_ellipse_shell(mesh, 29.0, 21.0, 0.0, body_top, segments)
     if detail != "far":
         for floor in range(1, 46):
             y = base_height + (body_top - base_height) * floor / 45.0
             if floor % band_step == 0:
-                add_ellipse_band(mesh, 29.0, 21.0, y - 0.10, 0.20, segments)
+                add_box(mesh, body_width + 1.1, 0.20, body_depth + 1.1, y=y - 0.10)
         if detail == "near":
             for x in (-21.0, -10.5, 0.0, 10.5, 21.0):
-                add_box(mesh, 0.72, body_top - base_height, 0.48, x=x, y=base_height, z=21.1)
-                add_box(mesh, 0.72, body_top - base_height, 0.48, x=x, y=base_height, z=-21.1)
+                add_box(mesh, 0.72, body_top - base_height, 0.48, x=x, y=base_height, z=body_depth / 2.0 + 0.25)
+                add_box(mesh, 0.72, body_top - base_height, 0.48, x=x, y=base_height, z=-body_depth / 2.0 - 0.25)
+            for z in (-14.0, 14.0):
+                add_box(mesh, 0.55, body_top - base_height, 0.85, y=base_height, z=z)
 
     # The top silhouette is kept simple but recognizable at distance.
-    add_ellipse_shell(mesh, 30.0, 22.0, body_top, 157.0, segments)
-    add_ellipse_shell(mesh, 18.0, 12.0, 157.0, 159.0, max(6, segments // 2))
+    add_box(mesh, 56.0, 4.0, 38.0, y=body_top)
+    add_box(mesh, 30.0, 2.0, 22.0, y=157.0)
     add_box(mesh, 3.0, 1.0, 3.0, y=159.0)
     return mesh
 
@@ -225,10 +237,12 @@ def build_star_mesh(detail: str = "near", *, width: float = 58.0, depth: float =
         for floor in range(1, 12):
             y = height * floor / 11.0
             if floor % step == 0:
-                add_box(mesh, width + 0.8, 0.14, depth + 0.8, y=y - 0.07)
+                band_height = 0.14
+                add_box(mesh, width + 0.8, band_height, depth + 0.8, y=y - band_height)
         # A shallow central entrance volume is cheaper and more legible than
         # dozens of small balcony meshes.
-        add_box(mesh, width * 0.24, 4.0, depth * 0.30, y=height, z=depth * 0.18)
+        entrance_height = 4.0
+        add_box(mesh, width * 0.24, entrance_height, depth * 0.30, y=height - entrance_height, z=depth * 0.18)
     return mesh
 
 

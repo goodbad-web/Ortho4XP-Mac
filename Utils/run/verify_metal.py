@@ -20,12 +20,53 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
+TOOLS = ROOT / "tools"
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(TOOLS))
 os.chdir(ROOT)
 
 
 def fail(message: str) -> None:
     raise SystemExit(f"FAIL: {message}")
+
+
+def build_coreml_reference_helper(artifact_dir: Path) -> tuple[Path | None, str]:
+    helper = artifact_dir / "CoreMLReference"
+    module_cache = artifact_dir / "coreml-module-cache"
+    module_cache.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "xcrun",
+            "swiftc",
+            "-O",
+            "-module-cache-path",
+            str(module_cache),
+            str(ROOT / "Utils/run/CoreMLReference.swift"),
+            "-o",
+            str(helper),
+            "-framework",
+            "Foundation",
+            "-framework",
+            "CoreGraphics",
+            "-framework",
+            "CoreImage",
+            "-framework",
+            "CoreML",
+            "-framework",
+            "CoreVideo",
+            "-framework",
+            "ImageIO",
+            "-framework",
+            "UniformTypeIdentifiers",
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0 or not helper.is_file():
+        return None, (result.stdout or "").strip()
+    return helper, (result.stdout or "").strip()
 
 
 def parse_probe(probe: Path) -> tuple[bool, str, bool]:
@@ -259,6 +300,89 @@ def compare_upscale_backend(
             "p95": percentile(samples_ms, 0.95),
             "first_measured": samples_ms[0],
             "scope": "ASHelper process plus image decode, upscale, readback, and PNG encode",
+        },
+        "quality": quality,
+    }
+
+
+def compare_fp8_tensorops_backend(
+    helper: Path,
+    pack: Path,
+    source: Path,
+    reference: Path,
+    output: Path,
+    runs: int,
+) -> dict[str, Any]:
+    command_prefix = [
+        str(helper),
+        "--fp8-tensorops-upscale",
+        str(pack),
+        str(source),
+    ]
+    warmup_output = output.with_name(output.stem + "_warmup.png")
+    warmup = subprocess.run(
+        command_prefix + [str(warmup_output)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if warmup.returncode != 0 or not warmup_output.is_file():
+        return {
+            "status": "FAIL",
+            "backend": "fp8_tensorops",
+            "warmup_exit": warmup.returncode,
+            "output": str(output),
+            "diagnostic": (warmup.stdout or "").strip(),
+        }
+
+    samples_ms: list[float] = []
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for _ in range(runs):
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
+        started = time.perf_counter()
+        last_result = subprocess.run(
+            command_prefix + [str(output)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        samples_ms.append((time.perf_counter() - started) * 1000.0)
+        if last_result.returncode != 0 or not output.is_file():
+            return {
+                "status": "FAIL",
+                "backend": "fp8_tensorops",
+                "warmup_exit": warmup.returncode,
+                "run_exit": last_result.returncode,
+                "output": str(output),
+                "diagnostic": (last_result.stdout or "").strip(),
+            }
+
+    try:
+        quality = image_quality_metrics(output, reference)
+    except ValueError as error:
+        return {
+            "status": "FAIL",
+            "backend": "fp8_tensorops",
+            "output": str(output),
+            "error": str(error),
+        }
+    return {
+        "status": "PASS",
+        "backend": "fp8_tensorops",
+        "pack": str(pack),
+        "output": str(output),
+        "runs": runs,
+        "timing_ms": {
+            "samples": samples_ms,
+            "median": percentile(samples_ms, 0.5),
+            "p95": percentile(samples_ms, 0.95),
+            "first_measured": samples_ms[0],
+            "scope": "ASHelper process plus image decode, TensorOps dispatch, readback, and PNG encode",
         },
         "quality": quality,
     }
@@ -517,6 +641,17 @@ def main() -> int:
     parser.add_argument("--helper", type=Path, default=ROOT / "Utils/mac/ASHelper")
     parser.add_argument("--batch-count", type=int, default=64)
     parser.add_argument("--compare-upscale", action="store_true")
+    parser.add_argument(
+        "--compare-fp8",
+        action="store_true",
+        help="compare the deterministic FP8SR fixture or an external --fp8-pack",
+    )
+    parser.add_argument("--fp8-pack", type=Path)
+    parser.add_argument(
+        "--coreml-reference-model",
+        type=Path,
+        help="optional compiled .mlmodelc used only as the FP8 quality reference",
+    )
     parser.add_argument("--compare-runs", type=int, default=5)
     parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
@@ -525,6 +660,8 @@ def main() -> int:
         fail("--batch-count must be between 1 and 128")
     if args.compare_runs < 1 or args.compare_runs > 20:
         fail("--compare-runs must be between 1 and 20")
+    if args.coreml_reference_model is not None and not args.compare_fp8:
+        fail("--coreml-reference-model requires --compare-fp8")
     if not args.helper.is_file() or not os.access(args.helper, os.X_OK):
         fail(f"ASHelper is not executable: {args.helper}")
 
@@ -535,6 +672,18 @@ def main() -> int:
 
     metal_available, probe_output, host_metal_supported = parse_probe(args.probe)
     metalfx_spatial_available = "metalfx_spatial_available=true" in probe_output.splitlines()
+    capability_result = subprocess.run(
+        [str(args.helper), "--capabilities"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    capability_output = capability_result.stdout or ""
+    fp8_tensorops_available = (
+        capability_result.returncode == 0
+        and "fp8_tensorops_available=true" in capability_output.splitlines()
+    )
     artifact_dir = Path(tempfile.mkdtemp(prefix="ortho4xp-metal-"))
     print(f"artifacts={artifact_dir}")
     overall_ok = True
@@ -543,6 +692,8 @@ def main() -> int:
         "metal_available": metal_available,
         "host_metal_supported": host_metal_supported,
         "metalfx_spatial_available": metalfx_spatial_available,
+        "fp8_tensorops_available": fp8_tensorops_available,
+        "ashelper_capabilities": capability_output,
         "probe": probe_output,
         "batch_count": args.batch_count,
         "compare_runs": args.compare_runs,
@@ -627,6 +778,99 @@ def main() -> int:
                             overall_ok = False
                     comparison_report[str(target_size)] = case_report
             report["upscale_comparison"] = comparison_report
+
+        if args.compare_fp8:
+            fp8_report: dict[str, Any] = {}
+            if not fp8_tensorops_available:
+                fp8_report["status"] = "SKIP(fp8_tensorops_unavailable)"
+                print("fp8 comparison=SKIP(fp8_tensorops_unavailable)")
+            else:
+                from fp8sr_pack import create_fixture, fp8sr_fp16_reference, validate_pack
+
+                fp8_pack = args.fp8_pack
+                if fp8_pack is None:
+                    fp8_pack = create_fixture(artifact_dir / "fp8sr-fixture")
+                try:
+                    validate_pack(fp8_pack)
+                except (OSError, ValueError) as error:
+                    fp8_report["status"] = "FAIL"
+                    fp8_report["error"] = str(error)
+                    print(f"fp8 comparison=FAIL error={error}")
+                    overall_ok = False
+                else:
+                    fp8_source = artifact_dir / "fp8_source_16.png"
+                    fp8_reference = artifact_dir / "fp8_reference_32.png"
+                    with Image.open(source).convert("RGB") as small_source:
+                        resampling = getattr(Image, "Resampling", Image)
+                        small_source.resize((16, 16), resampling.BOX).save(
+                            fp8_source, format="PNG"
+                        )
+                    fp8sr_fp16_reference(fp8_pack, fp8_source, fp8_reference)
+                    reference_for_fp8 = fp8_reference
+                    coreml_failed = False
+                    if args.coreml_reference_model is not None:
+                        coreml_report: dict[str, Any] = {
+                            "model": str(args.coreml_reference_model),
+                        }
+                        coreml_helper, compile_detail = build_coreml_reference_helper(
+                            artifact_dir
+                        )
+                        if coreml_helper is None:
+                            coreml_report["status"] = "FAIL(compile)"
+                            coreml_report["diagnostic"] = compile_detail
+                            coreml_failed = True
+                        else:
+                            coreml_output = artifact_dir / "coreml_reference_32.png"
+                            coreml_result = subprocess.run(
+                                [
+                                    str(coreml_helper),
+                                    str(args.coreml_reference_model),
+                                    str(fp8_source),
+                                    str(coreml_output),
+                                ],
+                                check=False,
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                            )
+                            coreml_report["exit"] = coreml_result.returncode
+                            coreml_report["diagnostic"] = (
+                                coreml_result.stdout or ""
+                            ).strip()
+                            if coreml_result.returncode == 0 and coreml_output.is_file():
+                                coreml_report["status"] = "PASS"
+                                coreml_report["output"] = str(coreml_output)
+                                reference_for_fp8 = coreml_output
+                            else:
+                                coreml_report["status"] = "FAIL(runtime)"
+                                coreml_failed = True
+                        fp8_report["coreml_reference"] = coreml_report
+
+                    if coreml_failed:
+                        fp8_report["status"] = "FAIL(coreml_reference)"
+                        print("fp8 comparison=FAIL(coreml_reference)")
+                        overall_ok = False
+                    else:
+                        fp8_output = artifact_dir / "fp8_tensorops_32.png"
+                        fp8_result = compare_fp8_tensorops_backend(
+                            args.helper,
+                            fp8_pack,
+                            fp8_source,
+                            reference_for_fp8,
+                            fp8_output,
+                            args.compare_runs,
+                        )
+                        fp8_report.update(fp8_result)
+                        fp8_report["reference"] = str(reference_for_fp8)
+                        print(
+                            "fp8 comparison 32px="
+                            f"{fp8_result['status']} "
+                            f"timing={json.dumps(fp8_result.get('timing_ms', {}), sort_keys=True)} "
+                            f"quality={json.dumps(fp8_result.get('quality', {}), sort_keys=True)}"
+                        )
+                        if fp8_result["status"] != "PASS":
+                            overall_ok = False
+            report["fp8_comparison"] = fp8_report
 
         upscale_cases = [
             ("1024px upscale fixture", source, artifact_dir / "source_upscaled.png", (1024, 1024)),
