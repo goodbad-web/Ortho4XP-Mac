@@ -11,6 +11,7 @@ if str(VERIFY_ROOT) not in sys.path:
 
 import O4_Config_Utils as CFG  # noqa: E402
 import O4_Imagery_Utils as IMG  # noqa: E402
+import O4_Tile_Utils as TILE  # noqa: E402
 import verify_metal as VERIFY  # noqa: E402
 
 
@@ -205,3 +206,119 @@ def test_metalfx_batch_records_each_output(tmp_path):
     assert result["batch_tasks"] == 2
     assert result["batch_success"] == 2
     assert output_a.is_file() and output_b.is_file()
+
+
+def _direct_dds_spec(tmp_path, name, item_index):
+    temporary = tmp_path / f"{name}.gpu.tmp.dds"
+    final = tmp_path / f"{name}.dds"
+    return {
+        "item": (f"tile-{item_index}", item_index, 0, 16, "BI"),
+        "request": {
+            "input": str(tmp_path / f"{name}.jpg"),
+            "mask": "none",
+            "output": str(temporary),
+            "format": "BC1",
+            "color": {
+                "r": 1.0,
+                "g": 1.0,
+                "b": 1.0,
+                "contrast": 1.0,
+                "brightness": 0.0,
+                "saturation": 1.0,
+            },
+        },
+        "input_size": (2, 2),
+        "temporary_path": str(temporary),
+        "final_path": str(final),
+        "target_format": "BC1",
+        "cleanup_paths": [],
+    }
+
+
+def test_metalfx_direct_dds_batch_writes_no_png_and_cleans_requests(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(TILE.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    monkeypatch.setattr(
+        TILE.IMG,
+        "validate_dds_file",
+        lambda path, **kwargs: (Path(path).is_file(), None),
+    )
+    request_log = tmp_path / "request-log"
+    helper = tmp_path / "fake_direct_dds_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        f"open({str(request_log)!r} + '-' + str(os.getpid()), 'w', encoding='utf-8').write(json.dumps(request))\n"
+        "for item in request['items']:\n"
+        "    open(item['output'], 'wb').write(b'DDS direct')\n"
+        "    print('metalfx_dds_item=1/{} backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=direct_dds metalfx_ms=1 readback_ms=2 dds_ms=3 total_ms=6'.format(len(request['items'])))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    specs = [_direct_dds_spec(tmp_path, f"image-{index}", index) for index in range(9)]
+
+    result = TILE._run_metalfx_direct_dds_batch(
+        str(helper), specs, worker_limit=2, chunk_size=8
+    )
+
+    assert result["batch_tasks"] == 9
+    assert result["batch_success"] == 9
+    assert result["batch_workers"] == 2
+    assert result["batch_chunks"] == 2
+    assert result["batch_fallback"] == 0
+    assert result["metalfx_ms"] == 9.0
+    assert result["readback_ms"] == 18.0
+    assert result["dds_ms"] == 27.0
+    assert all(Path(spec["final_path"]).is_file() for spec in specs)
+    assert not list(tmp_path.glob("*.png"))
+    assert not list((tmp_path / "ortho4xp" / "tmp").glob(".metalfx-spatial-dds-*.json"))
+    requests = list(tmp_path.glob("request-log-*"))
+    assert len(requests) == 2
+    for request_path in requests:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        assert request["version"] == 1
+        assert all(item["format"] == "BC1" for item in request["items"])
+
+
+def test_metalfx_direct_dds_batch_keeps_success_and_reports_one_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(TILE.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    monkeypatch.setattr(
+        TILE.IMG,
+        "validate_dds_file",
+        lambda path, **kwargs: (Path(path).is_file(), None),
+    )
+    helper = tmp_path / "fake_partial_direct_dds_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import sys\n"
+        "request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        "for item in request['items']:\n"
+        "    if item['input'].endswith('image-fail.jpg'):\n"
+        "        print('metalfx_dds_item=1/1 backend=metalfx_spatial effective_backend=metalfx_spatial fallback_reason=gpu_failure')\n"
+        "        continue\n"
+        "    open(item['output'], 'wb').write(b'DDS direct')\n"
+        "    print('metalfx_dds_item=1/1 backend=metalfx_spatial effective_backend=metalfx_spatial metalfx_ms=1 readback_ms=1 dds_ms=1')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    specs = [
+        _direct_dds_spec(tmp_path, "image-ok-a", 0),
+        _direct_dds_spec(tmp_path, "image-fail", 1),
+        _direct_dds_spec(tmp_path, "image-ok-b", 2),
+    ]
+
+    result = TILE._run_metalfx_direct_dds_batch(str(helper), specs)
+
+    assert result["batch_success"] == 2
+    assert result["batch_failed"] == 1
+    assert result["failed_items"] == [specs[1]["item"]]
+    assert result["fallback_reasons"] == {"gpu_failure": 1}
+    assert Path(specs[0]["final_path"]).is_file()
+    assert not Path(specs[1]["final_path"]).exists()
+    assert Path(specs[2]["final_path"]).is_file()
+    assert not Path(specs[1]["temporary_path"]).exists()

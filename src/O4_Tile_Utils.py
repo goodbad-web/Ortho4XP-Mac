@@ -723,6 +723,292 @@ def _resolve_gpu_batch_mask(tile, til_x_left, til_y_top, zoomlevel, provider_cod
     )
     return fallback_mask_path, fallback_mask_path
 
+
+def _build_metalfx_direct_dds_spec(item, dds_format):
+    """Build one opaque-provider request for ASHelper direct MetalFX DDS work."""
+    tile, til_x_left, til_y_top, zoomlevel, provider_code = item
+    out_file_name = FNAMES.dds_file_name_from_attributes(
+        til_x_left, til_y_top, zoomlevel, provider_code
+    )
+    file_dir = FNAMES.jpeg_file_dir_from_attributes(
+        tile.lat, tile.lon, zoomlevel, IMG.providers_dict[provider_code]
+    )
+    input_path = IMG.find_imagery_cache_path(
+        til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+    )
+    if not input_path or not IMG._jpeg_file_is_ready(input_path):
+        raise FileNotFoundError(f"input source not found for {out_file_name}")
+
+    with Image.open(input_path) as source_image:
+        source_width, source_height = source_image.size
+
+    png_file_name = out_file_name.replace("dds", "png")
+    mask_path = "none"
+    generated_mask_path = None
+    if tile.imprint_masks_to_dds:
+        mask_path, generated_mask_path = _resolve_gpu_batch_mask(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            provider_code,
+            png_file_name,
+        )
+
+    color_code = IMG.providers_dict[provider_code].get("color_filters", "none")
+    r, g, b = 1.0, 1.0, 1.0
+    contrast, brightness, saturation = 1.0, 0.0, 1.0
+    for color_filter in IMG.color_filters_dict.get(color_code, []):
+        filter_name = color_filter[0]
+        if filter_name == "brightness-contrast":
+            brightness_value, contrast_value = color_filter[1:3]
+            brightness = brightness_value / 255.0
+            contrast = 1.0 + (contrast_value / 128.0)
+        elif filter_name == "saturation":
+            saturation = 1.0 + (color_filter[1] / 100.0)
+
+    has_alpha = False
+    if mask_path != "none":
+        with Image.open(mask_path) as mask_image:
+            has_alpha = mask_image.convert("L").getextrema()[0] < 255
+    target_format = IMG.resolve_dds_format(dds_format, has_alpha)
+    if target_format not in ("BC1", "BC3"):
+        raise ValueError(f"unsupported direct MetalFX DDS format: {target_format}")
+
+    final_path = os.path.join(tile.build_dir, "textures", out_file_name)
+    temporary_path = final_path + ".gpu.tmp.dds"
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    try:
+        os.remove(temporary_path)
+    except OSError:
+        pass
+
+    cleanup_paths = []
+    if generated_mask_path:
+        cleanup_paths.append(generated_mask_path)
+    exact_mask_path = os.path.join(
+        tile.build_dir,
+        "textures",
+        FNAMES.mask_file(til_x_left, til_y_top, zoomlevel, provider_code),
+    )
+    if tile.imprint_masks_to_dds and os.path.isfile(exact_mask_path):
+        cleanup_paths.append(exact_mask_path)
+
+    return {
+        "item": item,
+        "request": {
+            "input": input_path,
+            "mask": mask_path,
+            "output": temporary_path,
+            "format": target_format,
+            "color": {
+                "r": r,
+                "g": g,
+                "b": b,
+                "contrast": contrast,
+                "brightness": brightness,
+                "saturation": saturation,
+            },
+        },
+        "input_size": (source_width, source_height),
+        "temporary_path": temporary_path,
+        "final_path": final_path,
+        "target_format": target_format,
+        "cleanup_paths": cleanup_paths,
+    }
+
+
+def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8):
+    """Run bounded ASHelper direct-DDS chunks and atomically publish valid DDS files."""
+    if not specs:
+        return {
+            "failed_items": [],
+            "batch_tasks": 0,
+            "batch_success": 0,
+            "batch_fallback": 0,
+            "batch_failed": 0,
+            "batch_workers": 0,
+            "batch_chunks": 0,
+            "metalfx_ms": 0.0,
+            "readback_ms": 0.0,
+            "dds_ms": 0.0,
+            "temporary_bytes": 0,
+            "duration_ms": 0.0,
+            "fallback_reasons": {},
+        }
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    chunk_size = max(1, int(chunk_size))
+    chunks = [
+        specs[index : index + chunk_size]
+        for index in range(0, len(specs), chunk_size)
+    ]
+    batch_workers = min(4, max(1, int(worker_limit)), len(chunks))
+    batch_started = time.perf_counter()
+    stats = {
+        "failed_items": [],
+        "batch_tasks": len(specs),
+        "batch_success": 0,
+        "batch_fallback": 0,
+        "batch_failed": 0,
+        "batch_workers": batch_workers,
+        "batch_chunks": len(chunks),
+        "metalfx_ms": 0.0,
+        "readback_ms": 0.0,
+        "dds_ms": 0.0,
+        "temporary_bytes": 0,
+        "duration_ms": 0.0,
+        "fallback_reasons": {},
+    }
+
+    def run_direct_chunk(chunk):
+        os.makedirs(os.path.join(UI.Ortho4XP_dir, "tmp"), exist_ok=True)
+        request_fd, request_path = tempfile.mkstemp(
+            prefix=".metalfx-spatial-dds-",
+            suffix=".json",
+            dir=os.path.join(UI.Ortho4XP_dir, "tmp"),
+        )
+        request = {
+            "version": 1,
+            "items": [spec["request"] for spec in chunk],
+        }
+        try:
+            with os.fdopen(request_fd, "w", encoding="utf-8") as stream:
+                json.dump(request, stream, separators=(",", ":"))
+            result = subprocess.run(
+                [as_helper, "--metalfx-spatial-dds-batch", request_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            return chunk, result
+        finally:
+            try:
+                os.remove(request_path)
+            except OSError:
+                pass
+
+    def mark_failed(spec, reason):
+        stats["batch_failed"] += 1
+        stats["failed_items"].append(spec["item"])
+        stats["fallback_reasons"][reason] = (
+            stats["fallback_reasons"].get(reason, 0) + 1
+        )
+        try:
+            os.remove(spec["temporary_path"])
+        except OSError:
+            pass
+
+    with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+        futures = {
+            executor.submit(run_direct_chunk, chunk): chunk for chunk in chunks
+        }
+        completed = 0
+        for future in as_completed(futures):
+            try:
+                chunk, batch_result = future.result()
+            except Exception as error:
+                # A failed child launch must not prevent other chunks from
+                # publishing their already validated DDS files.
+                chunk = futures[future]
+                for spec in chunk:
+                    mark_failed(spec, f"ashelper_exception:{type(error).__name__}")
+                completed += len(chunk)
+                UI.vprint(1, f"   MetalFX Spatial DDS batch: {completed}/{len(specs)}")
+                continue
+
+            output_level = 0 if batch_result.returncode != 0 else 2
+            output_lines = (batch_result.stdout or "").splitlines()
+            item_lines = [
+                line for line in output_lines if line.startswith("metalfx_dds_item=")
+            ]
+            for line in output_lines:
+                UI.vprint(output_level, "      " + line)
+
+            for index, spec in enumerate(chunk):
+                fields = {}
+                if index < len(item_lines):
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in item_lines[index].split()
+                        if "=" in field
+                    )
+                for field_name, stat_name in (
+                    ("metalfx_ms", "metalfx_ms"),
+                    ("readback_ms", "readback_ms"),
+                    ("dds_ms", "dds_ms"),
+                ):
+                    try:
+                        stats[stat_name] += float(fields.get(field_name, 0.0))
+                    except (TypeError, ValueError):
+                        pass
+
+                temp_path = spec["temporary_path"]
+                valid, dds_error = IMG.validate_dds_file(
+                    temp_path,
+                    expected_format=spec["target_format"],
+                    expected_dimensions=(
+                        spec["input_size"][0] * 2,
+                        spec["input_size"][1] * 2,
+                    ),
+                    require_mipmaps=True,
+                )
+                if not valid:
+                    reason = (
+                        fields.get("fallback_reason")
+                        or (f"ashelper_exit_{batch_result.returncode}"
+                            if batch_result.returncode else None)
+                        or dds_error
+                        or "direct_dds_invalid"
+                    )
+                    mark_failed(spec, reason)
+                    continue
+
+                try:
+                    output_bytes = os.path.getsize(temp_path)
+                    os.replace(temp_path, spec["final_path"])
+                except (OSError, ValueError) as error:
+                    mark_failed(spec, f"atomic_publish:{type(error).__name__}")
+                    continue
+
+                stats["batch_success"] += 1
+                stats["temporary_bytes"] += output_bytes
+                if fields.get("effective_backend") == "ci_lanczos":
+                    stats["batch_fallback"] += 1
+                    if fields.get("fallback_reason"):
+                        reason = fields["fallback_reason"]
+                        stats["fallback_reasons"][reason] = (
+                            stats["fallback_reasons"].get(reason, 0) + 1
+                        )
+
+            completed += len(chunk)
+            UI.vprint(1, f"   MetalFX Spatial DDS batch: {completed}/{len(specs)}")
+
+    stats["duration_ms"] = (time.perf_counter() - batch_started) * 1000.0
+    fallback_reasons = stats["fallback_reasons"]
+    UI.vprint(
+        1,
+        "   MetalFX direct DDS summary: "
+        "backend=metalfx_spatial effective_backend=metalfx_spatial "
+        f"dispatch=direct_dds png_intermediate=false batch_tasks={stats['batch_tasks']} "
+        f"batch_success={stats['batch_success']} batch_fallback={stats['batch_fallback']} "
+        f"batch_failed={stats['batch_failed']} batch_workers={stats['batch_workers']} "
+        f"batch_chunks={stats['batch_chunks']} metalfx_ms={stats['metalfx_ms']:.2f} "
+        f"readback_ms={stats['readback_ms']:.2f} dds_ms={stats['dds_ms']:.2f} "
+        f"temporary_bytes={stats['temporary_bytes']} duration_ms={stats['duration_ms']:.2f}"
+        + (
+            " fallback_reasons="
+            + ",".join(
+                f"{reason}:{count}" for reason, count in sorted(fallback_reasons.items())
+            )
+            if fallback_reasons
+            else ""
+        ),
+    )
+    return stats
+
 ################################################################################
 def download_textures(tile, download_queue, convert_queue):
     UI.vprint(1, "-> Opening download queue with", max_download_slots, "workers.")
@@ -1181,172 +1467,82 @@ def _build_tile(tile, persist_config=True):
                     success_count = 0
                     conversion_success = True
 
-            # Direct provider JPEGs are upscaled first in one ASHelper process.
-            # The generated PNGs are consumed by the existing DDS batch below,
-            # which is where provider color correction and masks are applied.
-            metalfx_batch_outputs = []
-            metalfx_batch_error = None
-            if conversion_success and metalfx_batch_items:
-                import O4_RAMDisk_Utils
+            # Direct provider JPEGs are processed by ASHelper without creating
+            # an 8192x8192 PNG intermediate.  Keep the number of child
+            # processes bounded because each MetalFX readback is large.
+            direct_metalfx_requested = bool(metalfx_batch_items)
+            metalfx_direct_specs = []
+            metalfx_direct_failed = []
+            metalfx_direct_cleanup = []
+            if conversion_success and direct_metalfx_requested:
                 UI.vprint(
                     1,
-                    "-> Executing MetalFX Spatial upscale batch "
+                    "-> Executing MetalFX Spatial direct DDS batch "
                     f"({len(metalfx_batch_items)} images)...",
                 )
-                metalfx_args = []
-                for item in metalfx_batch_items:
-                    item_tile, item_x, item_y, item_z, item_provider = item
-                    out_file_name = FNAMES.dds_file_name_from_attributes(
-                        item_x, item_y, item_z, item_provider
-                    )
-                    file_dir = FNAMES.jpeg_file_dir_from_attributes(
-                        item_tile.lat,
-                        item_tile.lon,
-                        item_z,
-                        IMG.providers_dict[item_provider],
-                    )
-                    input_path = IMG.find_imagery_cache_path(
-                        item_x, item_y, item_z, item_provider, file_dir
-                    )
-                    if not input_path or not IMG._jpeg_file_is_ready(input_path):
-                        metalfx_batch_error = f"input source not found for {out_file_name}"
-                        break
-                    output_path = os.path.join(
-                        UI.Ortho4XP_dir,
-                        "tmp",
-                        out_file_name.replace(
-                            ".dds", "_metalfx_spatial_upscaled.png"
-                        ),
-                    )
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
-                    metalfx_args.extend([input_path, output_path])
-                    metalfx_batch_outputs.append((item, input_path, output_path))
-
-                if metalfx_batch_error is None and metalfx_batch_outputs:
-                    batch_started = time.perf_counter()
-                    batch_tasks = len(metalfx_batch_outputs)
-                    batch_success = 0
-                    batch_fallback = 0
-                    batch_fallback_reasons = {}
-                    # Keep argv bounded for large tiles while preserving one
-                    # ASHelper runtime per chunk (device/queue/CIContext are
-                    # reused for every image in that process).
-                    chunk_pairs = 32
-                    for chunk_start in range(0, batch_tasks, chunk_pairs):
-                        chunk_outputs = metalfx_batch_outputs[
-                            chunk_start : chunk_start + chunk_pairs
-                        ]
-                        chunk_args = []
-                        for _, input_path, output_path in chunk_outputs:
-                            chunk_args.extend([input_path, output_path])
+                try:
+                    for item in metalfx_batch_items:
+                        spec = _build_metalfx_direct_dds_spec(item, dds_format)
+                        metalfx_direct_specs.append(spec)
+                        metalfx_direct_cleanup.extend(spec["cleanup_paths"])
+                except Exception as error:
+                    UI.vprint(1, f"WARNING: MetalFX direct DDS preparation failed: {error}")
+                    for prepared_spec in metalfx_direct_specs:
+                        for cleanup_path in prepared_spec.get("cleanup_paths", ()):
+                            try:
+                                os.remove(cleanup_path)
+                            except OSError:
+                                pass
                         try:
-                            batch_result = subprocess.run(
-                                [as_helper, "--metalfx-spatial-upscale-batch"]
-                                + chunk_args,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True,
-                                check=False,
-                            )
-                            if batch_result.stdout:
-                                output_level = 0 if batch_result.returncode != 0 else 2
-                                for line in batch_result.stdout.splitlines():
-                                    UI.vprint(output_level, "      " + line)
-                                    if line.startswith("metalfx_batch_item="):
-                                        batch_success += int(
-                                            "effective_backend=metalfx_spatial" in line
-                                        )
-                                        batch_fallback += int(
-                                            "effective_backend=ci_lanczos" in line
-                                        )
-                                        fields = dict(
-                                            field.split("=", 1)
-                                            for field in line.split()
-                                            if "=" in field
-                                        )
-                                        reason = fields.get("fallback_reason")
-                                        if reason:
-                                            batch_fallback_reasons[reason] = (
-                                                batch_fallback_reasons.get(reason, 0) + 1
-                                            )
-                            if batch_result.returncode != 0:
-                                metalfx_batch_error = (
-                                    f"ASHelper returned {batch_result.returncode}"
-                                )
-                                break
-                            invalid_outputs = [
-                                output_path
-                                for _, input_path, output_path in chunk_outputs
-                                if not IMG._valid_upscale_output(input_path, output_path)
-                            ]
-                            if invalid_outputs:
-                                metalfx_batch_error = (
-                                    "invalid output: " + ", ".join(invalid_outputs)
-                                )
-                                break
-                        except Exception as error:
-                            metalfx_batch_error = f"ASHelper execution failed: {error}"
-                            break
-                    duration_ms = (time.perf_counter() - batch_started) * 1000.0
-                    UI.vprint(
-                        1,
-                        "   MetalFX batch summary: "
-                        f"batch_tasks={batch_tasks} batch_success={batch_success} "
-                        f"batch_fallback={batch_fallback} duration_ms={duration_ms:.2f}"
-                        + (
-                            " fallback_reasons="
-                            + ",".join(
-                                f"{reason}:{count}"
-                                for reason, count in sorted(batch_fallback_reasons.items())
-                            )
-                            if batch_fallback_reasons
-                            else ""
-                        ),
-                    )
-
-                if metalfx_batch_error is not None:
-                    # ASHelper keeps successful per-image outputs even when
-                    # another item could not be recovered. Preserve those
-                    # outputs for inspection and remove only invalid files.
-                    for _, input_path, output_path in metalfx_batch_outputs:
-                        if IMG._valid_upscale_output(input_path, output_path):
-                            continue
-                        try:
-                            os.remove(output_path)
+                            os.remove(prepared_spec["temporary_path"])
                         except OSError:
                             pass
-                    UI.vprint(
-                        1,
-                        "WARNING: MetalFX batch failed "
-                        f"({metalfx_batch_error}); falling back to per-texture processing.",
-                    )
+                    metalfx_direct_specs = []
+                    metalfx_direct_cleanup = []
+                    metalfx_direct_failed = list(metalfx_batch_items)
+
+                batch_result = _run_metalfx_direct_dds_batch(
+                    as_helper,
+                    metalfx_direct_specs,
+                    worker_limit=2,
+                    chunk_size=8,
+                )
+                metalfx_direct_failed.extend(batch_result["failed_items"])
+
+                if metalfx_direct_failed:
                     fallback_progress = {
                         "done": 0,
                         "bar": 3,
-                        "message": "MetalFX fallback DDS conversion",
+                        "message": "MetalFX direct DDS fallback",
                     }
+                    fallback_config = dict(config_data)
+                    fallback_config["upscale_backend"] = "ci_lanczos"
                     fallback_success = _run_cpu_fallback(
-                        metalfx_batch_items,
-                        config_data,
+                        metalfx_direct_failed,
+                        fallback_config,
                         max_convert_slots,
                         fallback_progress,
                     )
-                    success_count += len(metalfx_batch_items) if fallback_success else 0
-                    conversion_success = bool(fallback_success)
-                    metalfx_batch_items = []
-                    metalfx_batch_outputs = []
-                elif metalfx_batch_outputs:
-                    success_count += len(metalfx_batch_outputs)
-                    # The existing DDS batch below applies masks and color
-                    # correction to these MetalFX PNGs.
-                    defer_gpu_batch = True
+                    success_count += batch_result["batch_success"]
+                    success_count += len(metalfx_direct_failed) if fallback_success else 0
+                    conversion_success = bool(
+                        fallback_success and success_count == len(convert_list)
+                    )
+                else:
+                    success_count += batch_result["batch_success"]
+                    conversion_success = True
 
+                for cleanup_path in sorted(set(metalfx_direct_cleanup)):
+                    try:
+                        os.remove(cleanup_path)
+                    except OSError:
+                        pass
+                metalfx_batch_items = []
+
+            # MetalFX direct DDS work is already complete.  The existing DDS
+            # batch below handles only deferred non-MetalFX items.
             batch_convert_list = (
-                metalfx_batch_items if metalfx_batch_items else convert_list
+                regular_convert_list if direct_metalfx_requested else convert_list
             )
 
             # TensorOps image work is intentionally batched in one ASHelper

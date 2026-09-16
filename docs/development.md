@@ -77,6 +77,19 @@ MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
 
 ログの`backend`、`effective_backend`、`alpha_mode`、`dispatch`、`duration_ms`と、batchの`batch_tasks`、`batch_success`、`batch_fallback`を記録する。`verify_metal.py --compare-upscale`はopaque、RGBA、batchを測定する。MetalFXを利用できない環境でRGBA単画像を実行した場合も、ASHelper内のLanczos fallbackが成功すれば出力を残し、実際にMetalFX dispatchが発生したかはログの`effective_backend`で区別する。
 
+直接プロバイダのopaque JPEGを実タイルで処理するときは、PNG中間ファイルを作らないdirect DDS経路を使用する。Python側は`--metalfx-spatial-dds-batch <request.json>`へ入力、マスク、色補正、BC1/BC3形式、`.gpu.tmp.dds`出力先を渡し、ASHelperがMetalFXのreadbackから既存DDS圧縮までを同一プロセス内で実行する。検証済みの一時DDSだけを`os.replace`で公開するため、途中失敗時に部分出力を公開しない。RGBA、ローカル合成、WebP、非対応provider、TensorOpsは従来の経路を維持する。
+
+direct DDS batchは既定2 worker、最大4 worker、1プロセス8画像chunkで実行する。verbosity 1では`MetalFX Spatial DDS batch: completed/total`、続けて`png_intermediate=false`、`metalfx_ms`、`readback_ms`、`dds_ms`、`temporary_bytes`、fallback理由を表示する。単独経路と性能を比較する場合は、同じ入力を次のように実行する。
+
+```sh
+cat >/private/tmp/metalfx-direct-dds.json <<'JSON'
+{"version":1,"items":[{"input":"/path/input.jpg","mask":"none","output":"/private/tmp/output.gpu.tmp.dds","format":"BC1","color":{"r":1.0,"g":1.0,"b":1.0,"contrast":1.0,"brightness":0.0,"saturation":1.0}}]}
+JSON
+Utils/mac/ASHelper --metalfx-spatial-dds-batch /private/tmp/metalfx-direct-dds.json
+```
+
+受入時は、旧MetalFX PNG経路、新direct DDS経路、CI Lanczosをwall/user/sys時間、CPU使用率、peak RSS、PNG中間ファイルの有無、DDS検証結果で比較する。GPU処理の実証には`gpucapture`の`.gputrace`、`gpudebug --oneshot --json`、`metalperftrace`の成果物を別々に保存し、DDSの成功だけでMetalFX dispatchやNeural Accelerator使用を推測しない。
+
 精度ラダーはFP16基準、FP8、FP4、INT2の順に実行する。FP8が画質ゲートを通過しない限りFP4以降は実行せず、FP4が通過しない限りINT2も実行しない。既定ゲートは、共通参照画像に対するFP16比でPSNR低下0.25dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値、継ぎ目なしである。
 
 ```sh

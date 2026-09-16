@@ -110,6 +110,21 @@ def test_execution_record_keeps_canonical_backend_and_gpu_evidence(tmp_path):
     assert saved["neural_accelerator_confirmed"] is False
 
 
+def test_tensorops_dispatch_metadata_records_tiled_execution():
+    diagnostics = """\
+tensorops_dispatch=completed dtype=Float16 output=8192x8192
+tensorops_dispatch=tiled tile=1/4 core=2048x2048 input=2049x2049 halo=1
+tensorops_dispatch=tiled tile=2/4 core=2048x2048 input=2049x2049 halo=1
+"""
+    metadata = verify_metal.tensorops_dispatch_metadata(diagnostics)
+    assert metadata["tensorops_dispatch"] == "tiled"
+    assert metadata["tile_count"] == 4
+    assert metadata["tile_core_size"] == [2048, 2048]
+    assert metadata["tile_input_sizes"] == [[2049, 2049], [2049, 2049]]
+    assert metadata["tile_halo"] == 1
+    assert metadata["tensorops_output_size"] == [8192, 8192]
+
+
 def test_neural_accelerator_counters_are_parsed_and_recorded(tmp_path):
     output = """{"children":[{"name":"neural_accelerator_utilization","values":[{"type":"string","value":"8.80%"}]},{"name":"neural_accelerator_limiter","values":[{"type":"string","value":"9.19%"}]}]}\n"""
     counters = verify_metal._neural_accelerator_counters(output)

@@ -51,6 +51,10 @@ tensorops_dispatch=ready dtype=MetalFloat8E4M3 activation=Float16 accumulation=F
 tensorops_dispatch=completed dtype=MetalFloat8E4M3 activation=Float16 accumulation=Float16 output=...
 ```
 
+入力の幅または高さが2048pxを超える場合は、TensorOpsを2048px以下の中心領域へ自動分割します。各タイルは3x3 edge-clamp畳み込み用に1pxのhaloを付け、出力の中心領域だけを2倍の最終画像へコピーします。4096x4096入力は通常4タイルとなり、途中タイルが失敗した場合は部分画像を公開せず、入力全体をCore Image Lanczosへフォールバックします。`tensorops_dispatch=tiled`、`tile_count`、`tile_core_size`、`tile_input_sizes`、`tile_halo`は検証ランナーのJSONLにも保存されます。
+
+この経路は、4096x4096のim2col要素数が32bit範囲を超えることと、3072px級の単一FP16活性値で実機上のアドレスずれが発生したことに対する安全策です。2048pxタイル、1px halo、約3GiBの活性値ガードはM5 Max/macOS 27での実行上の安全閾値であり、Metalの公式最大バッファサイズを意味しません。
+
 これはTensorOps dispatchの証拠であり、Neural Acceleratorの実使用を単独では意味しません。`--gpu-tools`を指定した検証では、GPU traceを`gpudebug profile run`で再プロファイルし、Neural Accelerator utilizationカウンタが0より大きい場合だけ`neural_accelerator_confirmed=true`として記録します。profile非対応時は`SKIP`とし、手動確認ではXcode GPU traceのNeural Acceleratorカウンタを使用します。
 
 速度・画質の検証は次で実行できます。`--fp8-pack`を省略すると一時ディレクトリへ決定的な小型パックを生成します。

@@ -80,6 +80,28 @@ final class BatchFailureState {
     }
 }
 
+struct MetalFXDirectDDSColor: Codable {
+    let r: Double
+    let g: Double
+    let b: Double
+    let contrast: Double
+    let brightness: Double
+    let saturation: Double
+}
+
+struct MetalFXDirectDDSItem: Codable {
+    let input: String
+    let mask: String
+    let output: String
+    let format: String
+    let color: MetalFXDirectDDSColor
+}
+
+struct MetalFXDirectDDSRequest: Codable {
+    let version: Int
+    let items: [MetalFXDirectDDSItem]
+}
+
 let metalSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -1455,14 +1477,22 @@ func compressWithMipmaps(cgImage: CGImage, mode: UInt32) -> Data? {
     return outData
 }
 
-func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Double, b: Double, contrast: Double, brightness: Double, saturation: Double, outputPath: String, format: String, useGPU: Bool) -> Bool {
-    guard format != "BC7" else {
-        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
-    }
-    let jpegURL = URL(fileURLWithPath: jpegPath)
-    guard let source = CGImageSourceCreateWithURL(jpegURL as CFURL, nil),
-          let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        reportError("ASHelper: Failed to load source image '\(jpegPath)'.")
+func convertCGImageWithPreprocess(
+    sourceImage: CGImage,
+    sourceLabel: String,
+    maskPath: String,
+    r: Double,
+    g: Double,
+    b: Double,
+    contrast: Double,
+    brightness: Double,
+    saturation: Double,
+    outputPath: String,
+    format: String,
+    useGPU: Bool
+) -> Bool {
+    guard format == "BC1" || format == "BC3" else {
+        reportError("ASHelper does not support \(format) output. Use nvcompress instead.")
         return false
     }
     // Construct CIImage from the decoded CGImage.  This keeps the CPU batch
@@ -1623,7 +1653,7 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
             out: &out,
             sourceImage: cpuImage
         ) {
-            reportError("ASHelper: Failed to compress image '\(jpegPath)'.")
+            reportError("ASHelper: Failed to compress image '\(sourceLabel)'.")
             return false
         }
     }
@@ -1631,14 +1661,53 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     return writeDDS(out, to: outputPath)
 }
 
-func lanczosUpscale(inputPath: String, outputPath: String) -> Bool {
-    let url = URL(fileURLWithPath: inputPath)
-    guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else {
-        reportError("ASHelper: Failed to load image or create Lanczos upscale filter for '\(inputPath)'.")
+func convertWithPreprocess(
+    jpegPath: String,
+    maskPath: String,
+    r: Double,
+    g: Double,
+    b: Double,
+    contrast: Double,
+    brightness: Double,
+    saturation: Double,
+    outputPath: String,
+    format: String,
+    useGPU: Bool
+) -> Bool {
+    let jpegURL = URL(fileURLWithPath: jpegPath)
+    guard let source = CGImageSourceCreateWithURL(jpegURL as CFURL, nil),
+          let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        reportError("ASHelper: Failed to load source image '\(jpegPath)'.")
         return false
     }
+    return convertCGImageWithPreprocess(
+        sourceImage: sourceImage,
+        sourceLabel: jpegPath,
+        maskPath: maskPath,
+        r: r,
+        g: g,
+        b: b,
+        contrast: contrast,
+        brightness: brightness,
+        saturation: saturation,
+        outputPath: outputPath,
+        format: format,
+        useGPU: useGPU
+    )
+}
+
+func lanczosImage(inputPath: String) -> CGImage? {
+    let url = URL(fileURLWithPath: inputPath)
+    guard let ci = CIImage(contentsOf: url), let f = CIFilter(name: "CILanczosScaleTransform") else {
+        return nil
+    }
     f.setValue(ci, forKey: kCIInputImageKey); f.setValue(2.0, forKey: kCIInputScaleKey)
-    guard let out = f.outputImage, let cg = CIContext(options: nil).createCGImage(out, from: out.extent) else {
+    guard let out = f.outputImage else { return nil }
+    return CIContext(options: nil).createCGImage(out, from: out.extent)
+}
+
+func lanczosUpscale(inputPath: String, outputPath: String) -> Bool {
+    guard let cg = lanczosImage(inputPath: inputPath) else {
         reportError("ASHelper: Failed to render Lanczos-upscaled image '\(inputPath)'.")
         return false
     }
@@ -1677,6 +1746,21 @@ private enum MetalFXSpatialError: Error, CustomStringConvertible {
 }
 
 @available(macOS 13.0, *)
+private struct MetalFXRawResult {
+    let raw: [UInt8]
+    let width: Int
+    let height: Int
+    let alphaMode: String
+    let readbackMs: Double
+}
+
+@available(macOS 13.0, *)
+private struct MetalFXScaleResult {
+    let raw: [UInt8]
+    let readbackMs: Double
+}
+
+@available(macOS 13.0, *)
 private final class MetalFXSpatialRuntime {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -1701,7 +1785,7 @@ private final class MetalFXSpatialRuntime {
         raw: [UInt8],
         width: Int,
         height: Int
-    ) throws -> [UInt8] {
+    ) throws -> MetalFXScaleResult {
         guard width > 0, height > 0,
               let inputBytes = try? checkedMultiply(width, height, 4, label: "metalfx_input"),
               raw.count == inputBytes,
@@ -1777,6 +1861,7 @@ private final class MetalFXSpatialRuntime {
             destinationBytesPerImage: outputBytes
         )
         blit.endEncoding()
+        let readbackStarted = CFAbsoluteTimeGetCurrent()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         guard commandBuffer.status == .completed else {
@@ -1784,10 +1869,14 @@ private final class MetalFXSpatialRuntime {
                 "command_buffer_" + (commandBuffer.error?.localizedDescription ?? "failed")
             )
         }
-        return Array(UnsafeBufferPointer(
+        let output = Array(UnsafeBufferPointer(
             start: readback.contents().assumingMemoryBound(to: UInt8.self),
             count: outputBytes
         ))
+        return MetalFXScaleResult(
+            raw: output,
+            readbackMs: (CFAbsoluteTimeGetCurrent() - readbackStarted) * 1000.0
+        )
     }
 
     private func scaleAlphaBicubic(
@@ -1843,7 +1932,7 @@ private final class MetalFXSpatialRuntime {
         return result
     }
 
-    func upscale(image: CGImage) throws -> (raw: [UInt8], alphaMode: String) {
+    func upscale(image: CGImage) throws -> (raw: [UInt8], alphaMode: String, readbackMs: Double) {
         let width = image.width
         let height = image.height
         guard let source = getRawRGBAUnassociated(cgImage: image),
@@ -1853,7 +1942,8 @@ private final class MetalFXSpatialRuntime {
         }
         let hasAlpha = stride(from: 3, to: source.count, by: 4).contains { source[$0] < 255 }
         if !hasAlpha {
-            return (try scaleOpaque(raw: source, width: width, height: height), "opaque")
+            let scaled = try scaleOpaque(raw: source, width: width, height: height)
+            return (scaled.raw, "opaque", scaled.readbackMs)
         }
 
         var opaque = source
@@ -1863,27 +1953,38 @@ private final class MetalFXSpatialRuntime {
         let rgbOutput = try scaleOpaque(raw: opaque, width: width, height: height)
         let alphaInput = stride(from: 3, to: source.count, by: 4).map { source[$0] }
         let alphaOutput = try scaleAlphaBicubic(alphaInput, width: width, height: height)
-        guard rgbOutput.count == alphaOutput.count * 4 else {
+        guard rgbOutput.raw.count == alphaOutput.count * 4 else {
             throw MetalFXSpatialError.execution("alpha_size")
         }
-        var combined = rgbOutput
+        var combined = rgbOutput.raw
         for pixel in 0..<alphaOutput.count {
             combined[pixel * 4 + 3] = alphaOutput[pixel]
         }
-        return (combined, "rgba_split_bicubic")
+        return (combined, "rgba_split_bicubic", rgbOutput.readbackMs)
     }
 
-    func render(inputPath: String, outputPath: String) throws -> String {
+    func renderRaw(inputPath: String) throws -> MetalFXRawResult {
         let sourceURL = URL(fileURLWithPath: inputPath)
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw MetalFXSpatialError.execution("input_load")
         }
         let result = try upscale(image: image)
-        guard writePNGUnassociated(
-            result.raw,
+        return MetalFXRawResult(
+            raw: result.raw,
             width: image.width * 2,
             height: image.height * 2,
+            alphaMode: result.alphaMode,
+            readbackMs: result.readbackMs
+        )
+    }
+
+    func render(inputPath: String, outputPath: String) throws -> String {
+        let result = try renderRaw(inputPath: inputPath)
+        guard writePNGUnassociated(
+            result.raw,
+            width: result.width,
+            height: result.height,
             outputPath: outputPath
         ) else {
             throw MetalFXSpatialError.output
@@ -1993,6 +2094,184 @@ func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
             + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
     )
     return allSuccessful
+}
+
+@available(macOS 13.0, *)
+private struct MetalFXDirectDDSItemResult {
+    let success: Bool
+    let effectiveBackend: String
+    let alphaMode: String
+    let fallbackReason: String?
+    let metalFXMs: Double
+    let readbackMs: Double
+    let ddsMs: Double
+    let totalMs: Double
+}
+
+@available(macOS 13.0, *)
+private func processMetalFXDirectDDSItem(
+    item: MetalFXDirectDDSItem,
+    runtime: MetalFXSpatialRuntime?
+) -> MetalFXDirectDDSItemResult {
+    let started = CFAbsoluteTimeGetCurrent()
+    var metalFXMs = 0.0
+    var readbackMs = 0.0
+    var ddsMs = 0.0
+    var alphaMode = "opaque"
+    var fallbackReason: String?
+
+    try? FileManager.default.removeItem(atPath: item.output)
+
+    do {
+        guard let runtime else {
+            throw MetalFXSpatialError.execution("metal_runtime")
+        }
+        let metalFXStarted = CFAbsoluteTimeGetCurrent()
+        let rawResult = try runtime.renderRaw(inputPath: item.input)
+        metalFXMs = (CFAbsoluteTimeGetCurrent() - metalFXStarted) * 1000.0
+        readbackMs = rawResult.readbackMs
+        alphaMode = rawResult.alphaMode
+        guard let outputImage = cgImageFromRGBAUnassociated(
+            rawResult.raw,
+            width: rawResult.width,
+            height: rawResult.height
+        ) else {
+            throw MetalFXSpatialError.execution("output_image")
+        }
+        let ddsStarted = CFAbsoluteTimeGetCurrent()
+        guard convertCGImageWithPreprocess(
+            sourceImage: outputImage,
+            sourceLabel: item.input,
+            maskPath: item.mask,
+            r: item.color.r,
+            g: item.color.g,
+            b: item.color.b,
+            contrast: item.color.contrast,
+            brightness: item.color.brightness,
+            saturation: item.color.saturation,
+            outputPath: item.output,
+            format: item.format,
+            useGPU: true
+        ) else {
+            throw MetalFXSpatialError.execution("dds_compress")
+        }
+        ddsMs = (CFAbsoluteTimeGetCurrent() - ddsStarted) * 1000.0
+        return MetalFXDirectDDSItemResult(
+            success: true,
+            effectiveBackend: "metalfx_spatial",
+            alphaMode: alphaMode,
+            fallbackReason: nil,
+            metalFXMs: metalFXMs,
+            readbackMs: readbackMs,
+            ddsMs: ddsMs,
+            totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+        )
+    } catch {
+        fallbackReason = String(describing: error)
+    }
+
+    let fallbackStarted = CFAbsoluteTimeGetCurrent()
+    guard let fallbackImage = lanczosImage(inputPath: item.input),
+          convertCGImageWithPreprocess(
+              sourceImage: fallbackImage,
+              sourceLabel: item.input,
+              maskPath: item.mask,
+              r: item.color.r,
+              g: item.color.g,
+              b: item.color.b,
+              contrast: item.color.contrast,
+              brightness: item.color.brightness,
+              saturation: item.color.saturation,
+              outputPath: item.output,
+              format: item.format,
+              useGPU: true
+          ) else {
+        return MetalFXDirectDDSItemResult(
+            success: false,
+            effectiveBackend: "failed",
+            alphaMode: "unknown",
+            fallbackReason: fallbackReason ?? "ci_lanczos_failed",
+            metalFXMs: metalFXMs,
+            readbackMs: readbackMs,
+            ddsMs: 0.0,
+            totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+        )
+    }
+    ddsMs = (CFAbsoluteTimeGetCurrent() - fallbackStarted) * 1000.0
+    return MetalFXDirectDDSItemResult(
+        success: true,
+        effectiveBackend: "ci_lanczos",
+        alphaMode: "lanczos",
+        fallbackReason: fallbackReason,
+        metalFXMs: metalFXMs,
+        readbackMs: readbackMs,
+        ddsMs: ddsMs,
+        totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+    )
+}
+
+@available(macOS 13.0, *)
+func metalFXSpatialDDSBatch(requestPath: String) -> Bool {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: requestPath))
+        let request = try JSONDecoder().decode(MetalFXDirectDDSRequest.self, from: data)
+        guard request.version == 1, !request.items.isEmpty else {
+            throw MetalFXSpatialError.invalidInput
+        }
+        guard request.items.allSatisfy({ $0.format == "BC1" || $0.format == "BC3" }) else {
+            throw MetalFXSpatialError.execution("unsupported_format")
+        }
+
+        let runtime = try? MetalFXSpatialRuntime()
+        var successCount = 0
+        var fallbackCount = 0
+        var failedCount = 0
+        var fallbackReasons: [String: Int] = [:]
+        let started = CFAbsoluteTimeGetCurrent()
+
+        for (index, item) in request.items.enumerated() {
+            let result = autoreleasepool {
+                processMetalFXDirectDDSItem(item: item, runtime: runtime)
+            }
+            if result.success {
+                successCount += 1
+                if result.effectiveBackend == "ci_lanczos" {
+                    fallbackCount += 1
+                }
+            } else {
+                failedCount += 1
+            }
+            if let reason = result.fallbackReason {
+                fallbackReasons[reason, default: 0] += 1
+            }
+            print(
+                "metalfx_dds_item=\(index + 1)/\(request.items.count) "
+                    + "backend=metalfx_spatial effective_backend=\(result.effectiveBackend) "
+                    + "dispatch=direct_dds alpha_mode=\(result.alphaMode) "
+                    + "metalfx_ms=\(String(format: "%.2f", result.metalFXMs)) "
+                    + "readback_ms=\(String(format: "%.2f", result.readbackMs)) "
+                    + "dds_ms=\(String(format: "%.2f", result.ddsMs)) "
+                    + "total_ms=\(String(format: "%.2f", result.totalMs))"
+                    + (result.fallbackReason.map { " fallback_reason=\($0)" } ?? "")
+            )
+        }
+
+        let reasonSummary = fallbackReasons.keys.sorted().map {
+            "\($0):\(fallbackReasons[$0] ?? 0)"
+        }.joined(separator: ",")
+        print(
+            "backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=direct_dds "
+                + "png_intermediate=false batch_tasks=\(request.items.count) "
+                + "batch_success=\(successCount) batch_fallback=\(fallbackCount) "
+                + "batch_failed=\(failedCount) duration_ms="
+                + String(format: "%.2f", (CFAbsoluteTimeGetCurrent() - started) * 1000.0)
+                + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
+        )
+        return failedCount == 0
+    } catch {
+        reportError("ASHelper: MetalFX direct DDS batch failed: \(error)")
+        return false
+    }
 }
 
 func metalFXSpatialAvailable() -> Bool {
@@ -3168,6 +3447,17 @@ else if args[1] == "--metalfx-spatial-upscale-batch" {
         index += 2
     }
     if !metalFXSpatialUpscaleBatch(pairs: pairs) {
+        exit(1)
+    }
+}
+else if args[1] == "--metalfx-spatial-dds-batch" {
+    guard args.count == 3 else {
+        fail("ASHelper: --metalfx-spatial-dds-batch expects a request JSON path.")
+    }
+    guard #available(macOS 13.0, *) else {
+        fail("ASHelper: MetalFX Spatial requires macOS 13 or newer.")
+    }
+    if !metalFXSpatialDDSBatch(requestPath: args[2]) {
         exit(1)
     }
 }
