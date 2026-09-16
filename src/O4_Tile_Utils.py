@@ -105,6 +105,7 @@ class _BuildTransaction:
                 # and reusable DDS files visible at their canonical paths.
                 # Hardlinks provide a rollback snapshot without duplicating
                 # multi-gigabyte texture payloads.
+                self._write_marker("snapshotting", None, None)
                 self._link_current_to("initial")
                 self._write_marker("active", None, None)
             else:
@@ -114,6 +115,11 @@ class _BuildTransaction:
         except Exception:
             if self.preserve_inputs:
                 shutil.rmtree(self.root, ignore_errors=True)
+                for path in (self.marker_path, self.marker_path + ".tmp"):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
             raise
 
     def _write_marker(
@@ -367,6 +373,13 @@ def _recover_build_transaction(tile):
         best_settings = marker.get("best_settings")
         best_config = marker.get("best_config")
         target_snapshot = marker.get("target_snapshot")
+
+        if state == "snapshotting":
+            # Standalone snapshot creation only links/copies into staging; the
+            # canonical outputs have not been changed yet. Discard a partial
+            # snapshot rather than attempting to restore incomplete inputs.
+            transaction.cleanup()
+            return True
 
         if state in ("complete", "restored"):
             transaction.cleanup()

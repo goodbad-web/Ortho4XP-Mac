@@ -131,6 +131,25 @@ def test_standalone_transaction_keeps_inputs_visible_and_restores_in_place_write
     assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
 
 
+def test_recovery_discards_an_interrupted_standalone_snapshot(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_outputs(tile, "initial")
+    build_dir = Path(tile.build_dir)
+    transaction = TILE._BuildTransaction(tile, preserve_inputs=True)
+    transaction._write_marker("snapshotting", None, None)
+
+    assert TILE._recover_build_transaction(tile) is True
+    assert (
+        build_dir / "terrain" / "100_200_BI16_initial.ter"
+    ).read_text(encoding="utf-8") == "initial"
+    assert (build_dir / "textures" / "100_200_BI16.dds").read_text(
+        encoding="utf-8"
+    ) == "initial"
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
 def test_standalone_build_restores_outputs_when_step_three_fails(
     tmp_path, monkeypatch
 ):
