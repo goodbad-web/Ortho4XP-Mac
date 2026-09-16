@@ -53,6 +53,38 @@ for line in sys.stdin:
         client.close()
 
 
+def test_jsonl_server_clamps_resident_worker_request(tmp_path):
+    helper = tmp_path / "parallelism_ashelper"
+    _write_helper(
+        helper,
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['op'] == 'shutdown':
+        print(json.dumps({'id': request['id'], 'op': 'shutdown', 'ok': True, 'results': [], 'shutdown': True}), flush=True)
+        break
+    results = [
+        {'id': task['id'], 'ok': True, 'backend': str(request.get('parallelism'))}
+        for task in request['tasks']
+    ]
+    print(json.dumps({'id': request['id'], 'op': request['op'], 'ok': True, 'results': results}), flush=True)
+""",
+    )
+
+    client = ASHelperJSONLServer(str(helper))
+    try:
+        response = client.convert_batch(
+            [{'id': 'a', 'input': 'a', 'output': 'a.dds', 'format': 'BC3'}],
+            parallelism=99,
+        )
+        assert response['results'][0]['backend'] == '12'
+    finally:
+        client.close()
+
+
 def test_jsonl_server_restarts_once_then_disables_gpu(tmp_path):
     helper = tmp_path / "crashing_ashelper"
     state = tmp_path / "starts"

@@ -3041,8 +3041,11 @@ def _build_tile(tile, persist_config=True):
                     gpu_backend_counts = {"metal": 0, "cpu": 0, "unknown": 0}
                     gpu_telemetry = {
                         "decode_ms": 0.0,
+                        "mask_ms": 0.0,
+                        "color_ms": 0.0,
                         "preprocess_ms": 0.0,
                         "compression_ms": 0.0,
+                        "readback_ms": 0.0,
                         "write_ms": 0.0,
                         "total_ms": 0.0,
                         "peak_rss_mb": 0.0,
@@ -3202,9 +3205,19 @@ def _build_tile(tile, persist_config=True):
                         )
                         for field, value in gpu_telemetry.items():
                             metrics.set_value("gpu_dds_" + field, value)
+                        if server is not None:
+                            metrics.set_value(
+                                "ashelper_restart_count",
+                                getattr(server, "restart_count", 0),
+                            )
+                            metrics.set_value(
+                                "ashelper_gpu_disabled",
+                                bool(getattr(server, "gpu_disabled", False)),
+                            )
                         metrics.increment(
                             "gpu_dds_failures",
-                            gpu_backend_counts["unknown"],
+                            gpu_backend_counts["unknown"]
+                            + (len(batch_requests) if server_failed else 0),
                         )
                         UI.vprint(
                             1,
@@ -3238,6 +3251,11 @@ def _build_tile(tile, persist_config=True):
                                     expected_dimensions
                                 )
                         if invalid_outputs:
+                            if metrics is not None:
+                                metrics.increment(
+                                    "gpu_dds_validation_failures",
+                                    len(invalid_outputs),
+                                )
                             for path, reason in invalid_outputs:
                                 UI.vprint(
                                     0,

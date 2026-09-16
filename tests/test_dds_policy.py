@@ -99,6 +99,7 @@ def test_scope_and_auto_format_are_exposed_by_configuration():
     assert "AUTO" in CFG.cfg_vars["dds_format"]["values"]
     assert "upscale_scope" in CFG.list_dsf_vars
     assert CFG.cfg_vars["upscale_scope"]["values"] == ("none", "all", "airport")
+    assert CFG.cfg_vars["gpu_dds_workers"]["values"] == tuple(range(1, 13))
 
 
 def test_validate_dds_requires_a_full_mipmap_chain_when_requested(tmp_path):
@@ -140,3 +141,40 @@ def test_terrain_load_center_uses_the_final_dds_dimension(tmp_path):
     assert terrain_file.read_text(encoding="utf-8").startswith(
         "LOAD_CENTER 1 2 123 4\n"
     )
+
+
+def test_terrain_load_center_skips_unchanged_write_and_uses_validated_dimensions(
+    tmp_path, monkeypatch
+):
+    textures = tmp_path / "textures"
+    terrain = tmp_path / "terrain"
+    textures.mkdir()
+    terrain.mkdir()
+    dds_path = textures / "0_0_test16.dds"
+    _write_dxt1_dds(dds_path)
+    terrain_file = terrain / "0_0_test16.ter"
+    terrain_file.write_text(
+        "LOAD_CENTER 1 2 123 4\n"
+        "BASE_TEX_NOWRAP ../textures/0_0_test16.dds\n",
+        encoding="utf-8",
+    )
+    original = terrain_file.read_bytes()
+
+    def fail_if_read(_path):
+        raise AssertionError("validated DDS dimensions should be reused")
+
+    monkeypatch.setattr(IMG, "read_dds_dimensions", fail_if_read)
+    tile = SimpleNamespace(build_dir=str(tmp_path))
+    count = TILE._sync_terrain_load_centers(
+        tile,
+        {str(dds_path.resolve()): (4, 4)},
+    )
+
+    assert count == 1
+    assert terrain_file.read_bytes() == original
+    assert tile._terrain_load_center_stats == {
+        "files": 1,
+        "unchanged": 1,
+        "rewritten": 0,
+        "dimension_cache_hits": 1,
+    }

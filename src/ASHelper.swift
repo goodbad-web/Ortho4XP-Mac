@@ -90,6 +90,9 @@ final class DDSConversionTelemetry {
     var decodeMs = 0.0
     var preprocessMs = 0.0
     var compressionMs = 0.0
+    var maskMs = 0.0
+    var colorMs = 0.0
+    var readbackMs = 0.0
     var writeMs = 0.0
     var totalMs = 0.0
     var peakRssMB = 0.0
@@ -1353,7 +1356,12 @@ func compressImageWithCPUMipmaps(_ image: CGImage, mode: UInt32) -> Data? {
     return output
 }
 
-func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Bool) -> Data? {
+func compressWithPreprocessedCIImage(
+    finalCI: CIImage,
+    mode: UInt32,
+    useGPU: Bool,
+    telemetry: DDSConversionTelemetry? = nil
+) -> Data? {
     guard let comp = MetalCompressor.shared else { return nil }
     let dev = comp.dev
     let pipe = comp.pipe
@@ -1440,10 +1448,12 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
         return nil
     }
 
+    let readbackStarted = CFAbsoluteTimeGetCurrent()
     var outData = Data()
     for buf in buffers {
         outData.append(Data(bytes: buf.contents(), count: buf.length))
     }
+    telemetry?.readbackMs = (CFAbsoluteTimeGetCurrent() - readbackStarted) * 1000.0
     let expectedSize = (0..<mtlTexture.mipmapLevelCount).reduce(0) { total, level in
         let lW = max(1, w >> level)
         let lH = max(1, h >> level)
@@ -1598,6 +1608,7 @@ func convertCGImageWithPreprocess(
     
     // 1. Blend mask if present (via in-memory Mask Cache)
     if maskPath != "none" && maskPath != "" {
+        let maskStarted = CFAbsoluteTimeGetCurrent()
         let maskURL = URL(fileURLWithPath: maskPath)
         var cachedMask: CachedMask? = nil
         maskCacheLock.lock()
@@ -1680,9 +1691,11 @@ func convertCGImageWithPreprocess(
             return false
         }
         finalCI = blended
+        telemetry?.maskMs = (CFAbsoluteTimeGetCurrent() - maskStarted) * 1000.0
     }
     
     // 2. Color Balance (RGB Multiply)
+    let colorStarted = CFAbsoluteTimeGetCurrent()
     if r != 1.0 || g != 1.0 || b != 1.0 {
         let matrixFilter = CIFilter(name: "CIColorMatrix")!
         matrixFilter.setValue(finalCI, forKey: kCIInputImageKey)
@@ -1706,6 +1719,7 @@ func convertCGImageWithPreprocess(
             finalCI = controlled
         }
     }
+    telemetry?.colorMs = (CFAbsoluteTimeGetCurrent() - colorStarted) * 1000.0
     
     telemetry?.preprocessMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
 
@@ -1724,7 +1738,12 @@ func convertCGImageWithPreprocess(
     if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
     var compressed = false
     let compressionStarted = CFAbsoluteTimeGetCurrent()
-    if useGPU, let gData = compressWithPreprocessedCIImage(finalCI: finalCI, mode: formatCode, useGPU: useGPU) {
+    if useGPU, let gData = compressWithPreprocessedCIImage(
+        finalCI: finalCI,
+        mode: formatCode,
+        useGPU: useGPU,
+        telemetry: telemetry
+    ) {
         out.append(gData)
         compressed = true
         telemetry?.backend = "metal"
@@ -4550,59 +4569,63 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
     )
     var results = Array(repeating: [String: Any](), count: tasks.count)
     let resultLock = NSLock()
-    let semaphore = DispatchSemaphore(value: concurrencyLimit)
-    DispatchQueue.concurrentPerform(iterations: tasks.count) { index in
-        semaphore.wait()
-        defer { semaphore.signal() }
-        autoreleasepool {
-            let task = tasks[index]
-            let taskID = serverTaskID(task, index: index)
-            guard let input = serverString(task, "input"),
-                  let output = serverString(task, "output"),
-                  let format = serverString(task, "format"),
-                  format == "BC1" || format == "BC3" else {
+    DispatchQueue.concurrentPerform(iterations: min(concurrencyLimit, tasks.count)) { workerIndex in
+        var index = workerIndex
+        while index < tasks.count {
+            autoreleasepool {
+                let task = tasks[index]
+                let taskID = serverTaskID(task, index: index)
+                guard let input = serverString(task, "input"),
+                      let output = serverString(task, "output"),
+                      let format = serverString(task, "format"),
+                      format == "BC1" || format == "BC3" else {
+                    resultLock.lock()
+                    results[index] = serverTaskResult(
+                        taskID,
+                        success: false,
+                        backend: "server",
+                        error: "invalid_task"
+                    )
+                    resultLock.unlock()
+                    return
+                }
+
+                let telemetry = DDSConversionTelemetry()
+                let ok = convertWithPreprocess(
+                    jpegPath: input,
+                    maskPath: serverString(task, "mask") ?? "none",
+                    r: serverDouble(task, "r", defaultValue: 1.0),
+                    g: serverDouble(task, "g", defaultValue: 1.0),
+                    b: serverDouble(task, "b", defaultValue: 1.0),
+                    contrast: serverDouble(task, "contrast", defaultValue: 1.0),
+                    brightness: serverDouble(task, "brightness", defaultValue: 0.0),
+                    saturation: serverDouble(task, "saturation", defaultValue: 1.0),
+                    outputPath: output,
+                    format: format,
+                    useGPU: useGPU,
+                    telemetry: telemetry
+                )
                 resultLock.lock()
                 results[index] = serverTaskResult(
                     taskID,
-                    success: false,
-                    backend: "server",
-                    error: "invalid_task"
-                )
-                resultLock.unlock()
-                return
-            }
-
-            let telemetry = DDSConversionTelemetry()
-            let ok = convertWithPreprocess(
-                jpegPath: input,
-                maskPath: serverString(task, "mask") ?? "none",
-                r: serverDouble(task, "r", defaultValue: 1.0),
-                g: serverDouble(task, "g", defaultValue: 1.0),
-                b: serverDouble(task, "b", defaultValue: 1.0),
-                contrast: serverDouble(task, "contrast", defaultValue: 1.0),
-                brightness: serverDouble(task, "brightness", defaultValue: 0.0),
-                saturation: serverDouble(task, "saturation", defaultValue: 1.0),
-                outputPath: output,
-                format: format,
-                useGPU: useGPU,
-                telemetry: telemetry
-            )
-            resultLock.lock()
-            results[index] = serverTaskResult(
-                taskID,
-                success: ok,
-                backend: telemetry.backend,
-                error: ok ? nil : "conversion_failed",
-                extra: [
+                    success: ok,
+                    backend: telemetry.backend,
+                    error: ok ? nil : "conversion_failed",
+                    extra: [
                     "decode_ms": telemetry.decodeMs,
+                    "mask_ms": telemetry.maskMs,
+                    "color_ms": telemetry.colorMs,
                     "preprocess_ms": telemetry.preprocessMs,
                     "compression_ms": telemetry.compressionMs,
+                    "readback_ms": telemetry.readbackMs,
                     "write_ms": telemetry.writeMs,
-                    "total_ms": telemetry.totalMs,
-                    "peak_rss_mb": telemetry.peakRssMB,
-                ]
-            )
-            resultLock.unlock()
+                        "total_ms": telemetry.totalMs,
+                        "peak_rss_mb": telemetry.peakRssMB,
+                    ]
+                )
+                resultLock.unlock()
+            }
+            index += concurrencyLimit
         }
     }
     return results
@@ -5007,8 +5030,11 @@ else if args[1] == "--convert-batch-v3" {
     var cpuCount = 0
     var failedCount = 0
     var decodeMs = 0.0
+    var maskMs = 0.0
+    var colorMs = 0.0
     var preprocessMs = 0.0
     var compressionMs = 0.0
+    var readbackMs = 0.0
     var writeMs = 0.0
     var totalMs = 0.0
     var peakRssMB = 0.0
@@ -5039,8 +5065,11 @@ else if args[1] == "--convert-batch-v3" {
         }
         if !ok { failedCount += 1 }
         decodeMs += telemetry.decodeMs
+        maskMs += telemetry.maskMs
+        colorMs += telemetry.colorMs
         preprocessMs += telemetry.preprocessMs
         compressionMs += telemetry.compressionMs
+        readbackMs += telemetry.readbackMs
         writeMs += telemetry.writeMs
         totalMs += telemetry.totalMs
         peakRssMB = max(peakRssMB, telemetry.peakRssMB)
@@ -5063,8 +5092,11 @@ else if args[1] == "--convert-batch-v3" {
             + "batch_failed=\(failedCount) metal_items=\(metalCount) "
             + "cpu_fallback_items=\(cpuCount) concurrency=\(concurrencyLimit) "
             + "decode_ms=\(String(format: "%.2f", decodeMs)) "
+            + "mask_ms=\(String(format: "%.2f", maskMs)) "
+            + "color_ms=\(String(format: "%.2f", colorMs)) "
             + "preprocess_ms=\(String(format: "%.2f", preprocessMs)) "
             + "compression_ms=\(String(format: "%.2f", compressionMs)) "
+            + "readback_ms=\(String(format: "%.2f", readbackMs)) "
             + "write_ms=\(String(format: "%.2f", writeMs)) "
             + "total_item_ms=\(String(format: "%.2f", totalMs)) "
             + "peak_rss_mb=\(String(format: "%.2f", peakRssMB))"

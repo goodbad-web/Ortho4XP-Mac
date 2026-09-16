@@ -18,6 +18,7 @@ def test_metrics_write_atomic_schema_and_attempts(tmp_path):
     metrics = PerformanceMetrics(Tile())
     metrics.set_config({"enable_streaming_conversion": True})
     metrics.set_capabilities({"metal_available": False})
+    metrics.set_value("gpu_dds_worker_count", 8)
     metrics.begin_attempt(0, {"cover_zl": 18})
     with metrics.stage("imagery/DSF"):
         metrics.increment("textures_downloaded", 3)
@@ -35,3 +36,4 @@ def test_metrics_write_atomic_schema_and_attempts(tmp_path):
     assert payload["attempts"][0]["counters"]["textures_downloaded"] == 3
     assert payload["attempts"][0]["queue"]["conversion"]["max_size"] == 2
     assert payload["attempts"][0]["batches"]["cpu"]["items"] == 3
+    assert payload["totals"]["measurements"]["gpu_dds_worker_count"] == 8

@@ -253,16 +253,18 @@ class ASHelperJSONLServer:
         tasks: Iterable[Mapping[str, Any]],
         *,
         gpu: bool = True,
+        parallelism: Optional[int] = None,
     ) -> Dict[str, Any]:
         task_list = [dict(task) for task in tasks]
-        return self.request(
-            {
-                "id": "batch-{}".format(uuid.uuid4().hex),
-                "op": "convert_batch",
-                "gpu": bool(gpu),
-                "tasks": task_list,
-            }
-        )
+        payload = {
+            "id": "batch-{}".format(uuid.uuid4().hex),
+            "op": "convert_batch",
+            "gpu": bool(gpu),
+            "tasks": task_list,
+        }
+        if parallelism is not None:
+            payload["parallelism"] = max(1, min(12, int(parallelism)))
+        return self.request(payload)
 
     def metalfx_upscale_batch(
         self,
