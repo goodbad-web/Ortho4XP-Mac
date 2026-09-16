@@ -5,7 +5,11 @@ import bz2
 import random
 import json
 import hashlib
+import math
 import threading
+import errno
+import tempfile
+from contextlib import contextmanager
 import tkinter as tk
 from email.utils import parsedate_to_datetime
 import requests
@@ -16,6 +20,16 @@ from xml.sax.saxutils import quoteattr
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 from O4_DSF_Budget import stable_id_key
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX
+    msvcrt = None
 
 overpass_servers = {
     "DE": "https://overpass-api.de/api/interpreter",
@@ -80,7 +94,294 @@ _overpass_coverage = {
     "FR": _FRANCE_OVERPASS_COVERAGE,
     "CH": _SWITZERLAND_OVERPASS_COVERAGE,
 }
-_OSM_CACHE_MANIFEST_VERSION = 1
+_OSM_CACHE_MANIFEST_VERSION = 2
+_SUPPORTED_OSM_CACHE_MANIFEST_VERSIONS = (1, 2)
+
+
+class _OverpassRequestCoordinatorError(RuntimeError):
+    """Base error for the cross-process Overpass request gate."""
+
+
+class _OverpassRequestCancelled(_OverpassRequestCoordinatorError):
+    pass
+
+
+class _OverpassRequestUnavailable(_OverpassRequestCoordinatorError):
+    pass
+
+
+class _OverpassRequestCoordinator:
+    """Serialize Overpass requests and share cooldowns across tile workers.
+
+    The tile batch builder uses spawned processes, so a process-local lock is
+    insufficient.  A lock file is released by the operating system when a
+    worker exits, while the small state file keeps a Retry-After/backoff
+    cooldown visible to the next worker.
+    """
+
+    poll_seconds = 0.25
+    invalid_state_cooldown = 30.0
+
+    def __init__(self, lock_path=None, state_path=None, sleep_func=None, clock_func=None):
+        temp_dir = tempfile.gettempdir()
+        self.lock_path = lock_path or os.path.join(
+            temp_dir, "Ortho4XP-overpass-request.lock"
+        )
+        self.state_path = state_path or os.path.join(
+            temp_dir, "Ortho4XP-overpass-request.json"
+        )
+        self._sleep_func = sleep_func
+        self._clock_func = clock_func
+        self._thread_lock = threading.RLock()
+
+    def _now(self):
+        return self._clock_func() if self._clock_func is not None else time.time()
+
+    @staticmethod
+    def _cancelled(cancel_check):
+        try:
+            return bool(cancel_check and cancel_check())
+        except Exception:
+            return False
+
+    def _sleep(self, seconds):
+        # Resolve this dynamically so tests and the GUI cancellation path can
+        # replace time.sleep without rebuilding the coordinator.
+        sleep_func = self._sleep_func or time.sleep
+        sleep_func(max(0.0, seconds))
+
+    def _acquire_thread_lock(self, cancel_check):
+        """Acquire the in-process guard while keeping cancellation responsive."""
+        while True:
+            if self._cancelled(cancel_check):
+                raise _OverpassRequestCancelled()
+            if self._thread_lock.acquire(timeout=self.poll_seconds):
+                return
+
+    def _sleep_with_cancellation(self, seconds, cancel_check):
+        deadline = self._now() + max(0.0, seconds)
+        while True:
+            if self._cancelled(cancel_check):
+                raise _OverpassRequestCancelled()
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                return
+            self._sleep(min(remaining, self.poll_seconds))
+
+    def _try_lock(self, handle):
+        if fcntl is not None:
+            try:
+                fcntl.flock(
+                    handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                return True
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    return False
+                raise _OverpassRequestUnavailable(
+                    "could not acquire POSIX Overpass lock"
+                ) from error
+
+        if msvcrt is not None:  # pragma: no cover - exercised on Windows
+            try:
+                handle.seek(0)
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError as error:
+                if getattr(error, "winerror", None) in (33, 36) or error.errno in (
+                    errno.EACCES,
+                    errno.EAGAIN,
+                ):
+                    return False
+                raise _OverpassRequestUnavailable(
+                    "could not acquire Windows Overpass lock"
+                ) from error
+
+        raise _OverpassRequestUnavailable(
+            "no supported cross-process file locking primitive"
+        )
+
+    @staticmethod
+    def _unlock(handle):
+        if handle is None:
+            return
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return
+        if msvcrt is not None:  # pragma: no cover - exercised on Windows
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+
+    def _read_state(self):
+        if not os.path.isfile(self.state_path):
+            return 0.0, None
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as stream:
+                state = json.load(stream)
+            if not isinstance(state, dict):
+                raise ValueError("state is not an object")
+            if not isinstance(state.get("reason"), str):
+                raise ValueError("state reason is invalid")
+            updated_at = float(state["updated_at"])
+            if updated_at < 0 or not math.isfinite(updated_at):
+                raise ValueError("state timestamp is invalid")
+            cooldown_until = float(state["cooldown_until"])
+            if cooldown_until < 0 or not math.isfinite(cooldown_until):
+                raise ValueError("negative cooldown")
+            return cooldown_until, state["reason"]
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None, "invalid-state"
+
+    def _write_state(self, cooldown_until, reason):
+        state_dir = os.path.dirname(os.path.abspath(self.state_path))
+        os.makedirs(state_dir, exist_ok=True)
+        temporary_path = "{}.tmp.{}.{}".format(
+            self.state_path, os.getpid(), threading.get_ident()
+        )
+        payload = {
+            "cooldown_until": float(cooldown_until),
+            "reason": str(reason or "backoff"),
+            "updated_at": self._now(),
+        }
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True)
+                stream.write("\n")
+            os.replace(temporary_path, self.state_path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+    def _set_cooldown_unlocked(self, seconds, reason):
+        seconds = max(0.0, float(seconds))
+        now = self._now()
+        current, _ = self._read_state()
+        if current is None:
+            current = now + self.invalid_state_cooldown
+        self._write_state(max(current, now + seconds), reason)
+
+    @contextmanager
+    def _lock_only(self, cancel_check=None):
+        """Acquire the file lock without waiting for an existing cooldown."""
+        cancel_check = cancel_check or (lambda: getattr(UI, "red_flag", False))
+        self._acquire_thread_lock(cancel_check)
+        handle = None
+        try:
+            while True:
+                if self._cancelled(cancel_check):
+                    raise _OverpassRequestCancelled()
+                try:
+                    os.makedirs(
+                        os.path.dirname(os.path.abspath(self.lock_path)),
+                        exist_ok=True,
+                    )
+                    handle = open(self.lock_path, "a+b")
+                except OSError as error:
+                    raise _OverpassRequestUnavailable(
+                        "could not open Overpass lock"
+                    ) from error
+                try:
+                    if self._try_lock(handle):
+                        break
+                    handle.close()
+                    handle = None
+                    self._sleep_with_cancellation(
+                        self.poll_seconds, cancel_check
+                    )
+                except Exception:
+                    if handle is not None:
+                        self._unlock(handle)
+                        handle.close()
+                        handle = None
+                    raise
+            yield self
+        finally:
+            if handle is not None:
+                self._unlock(handle)
+                handle.close()
+            self._thread_lock.release()
+
+    def set_cooldown(self, seconds, reason):
+        """Atomically extend the shared cooldown after a failed request."""
+        with self._lock_only():
+            self._set_cooldown_unlocked(seconds, reason)
+
+    def set_cooldown_locked(self, seconds, reason):
+        """Extend cooldown while the caller owns ``slot``."""
+        self._set_cooldown_unlocked(seconds, reason)
+
+    @contextmanager
+    def slot(self, cancel_check=None):
+        """Yield one exclusive Overpass HTTP request slot."""
+        cancel_check = cancel_check or (lambda: getattr(UI, "red_flag", False))
+        self._acquire_thread_lock(cancel_check)
+        handle = None
+        try:
+            while True:
+                if self._cancelled(cancel_check):
+                    raise _OverpassRequestCancelled()
+                try:
+                    os.makedirs(
+                        os.path.dirname(os.path.abspath(self.lock_path)),
+                        exist_ok=True,
+                    )
+                    handle = open(self.lock_path, "a+b")
+                except OSError as error:
+                    raise _OverpassRequestUnavailable(
+                        "could not open Overpass lock"
+                    ) from error
+
+                try:
+                    if not self._try_lock(handle):
+                        handle.close()
+                        handle = None
+                        self._sleep_with_cancellation(
+                            self.poll_seconds, cancel_check
+                        )
+                        continue
+                    cooldown_until, reason = self._read_state()
+                    now = self._now()
+                    if cooldown_until is None:
+                        # A malformed state is treated as a rate-limit signal,
+                        # not as permission to send immediately.
+                        cooldown_until = now + self.invalid_state_cooldown
+                        self._write_state(cooldown_until, reason)
+                    if cooldown_until > now:
+                        self._unlock(handle)
+                        handle.close()
+                        handle = None
+                        self._sleep_with_cancellation(
+                            cooldown_until - now, cancel_check
+                        )
+                        continue
+                    break
+                except Exception:
+                    if handle is not None:
+                        self._unlock(handle)
+                        handle.close()
+                        handle = None
+                    raise
+            yield self
+        finally:
+            if handle is not None:
+                self._unlock(handle)
+                handle.close()
+            self._thread_lock.release()
+
+
+_overpass_request_coordinator = _OverpassRequestCoordinator()
 
 ################################################################################
 class OSM_layer:
@@ -649,6 +950,67 @@ def _build_osm_tag_filters(queries, tags_of_interest=None):
     return input_tags, target_tags
 
 
+def _normalize_osm_queries(queries):
+    if queries is None:
+        return []
+    if isinstance(queries, str):
+        return [queries]
+    return list(queries)
+
+
+def _query_group_payload(group):
+    group = list(group)
+    if len(group) == 1:
+        return group[0]
+    return tuple(group)
+
+
+def _query_group_count(query_count):
+    if query_count <= 1:
+        return 1
+    return 2 if query_count <= 4 else 3
+
+
+def _partition_osm_queries(queries):
+    """Partition query clauses into deterministic, contiguous groups."""
+    queries = _normalize_osm_queries(queries)
+    group_count = _query_group_count(len(queries))
+    if group_count == 1:
+        return [queries]
+    base, remainder = divmod(len(queries), group_count)
+    groups = []
+    offset = 0
+    for index in range(group_count):
+        size = base + (1 if index < remainder else 0)
+        groups.append(queries[offset : offset + size])
+        offset += size
+    return groups
+
+
+def _manifest_queries(queries):
+    return [
+        [str(item) for item in query]
+        if isinstance(query, (tuple, list))
+        else str(query)
+        for query in _normalize_osm_queries(queries)
+    ]
+
+
+def _build_request_plan(groups, tags_of_interest=None, split_reason=None):
+    return {
+        "group_count": len(groups),
+        "split_reason": split_reason,
+        "groups": [
+            {
+                "index": index,
+                "queries": _manifest_queries(group),
+                "query_signature": _query_signature(group, tags_of_interest),
+            }
+            for index, group in enumerate(groups)
+        ],
+    }
+
+
 def normalize_osm_failure_policy(value=None):
     policy = osm_download_failure_policy if value is None else value
     return policy if policy in OSM_FAILURE_POLICIES else "abort"
@@ -710,6 +1072,7 @@ def _server_order(preferred_server, bbox):
 
 
 def _query_signature(queries, tags_of_interest=None):
+    queries = _normalize_osm_queries(queries)
     canonical_queries = []
     for query in queries:
         if isinstance(query, (tuple, list)):
@@ -729,6 +1092,57 @@ def _query_signature(queries, tags_of_interest=None):
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validate_request_plan(manifest, queries, tags_of_interest, allow_unbound_request):
+    """Validate the grouped-request portion of a version 2 manifest."""
+    manifest_queries = manifest.get("queries")
+    if not isinstance(manifest_queries, list) or not manifest_queries:
+        return None
+    expected_queries = (
+        manifest_queries
+        if allow_unbound_request
+        else _normalize_osm_queries(queries)
+    )
+    if not allow_unbound_request and manifest_queries != _manifest_queries(queries):
+        return None
+
+    request_plan = manifest.get("request_plan")
+    if not isinstance(request_plan, dict):
+        return None
+    groups = request_plan.get("groups")
+    group_count = request_plan.get("group_count")
+    if not isinstance(groups, list) or not isinstance(group_count, int):
+        return None
+    if group_count != len(groups) or group_count < 1:
+        return None
+    split_reason = request_plan.get("split_reason")
+    if split_reason is None and group_count != 1:
+        return None
+    if split_reason == "http_504" and group_count != _query_group_count(
+        len(expected_queries)
+    ):
+        return None
+    if split_reason not in (None, "http_504"):
+        return None
+
+    expected_groups = _partition_osm_queries(expected_queries)
+    if len(expected_groups) != group_count:
+        return None
+    for index, (manifest_group, expected_group) in enumerate(
+        zip(groups, expected_groups)
+    ):
+        if not isinstance(manifest_group, dict):
+            return None
+        if manifest_group.get("index") != index:
+            return None
+        if manifest_group.get("queries") != _manifest_queries(expected_group):
+            return None
+        if manifest_group.get("query_signature") != _query_signature(
+            expected_group, tags_of_interest
+        ):
+            return None
+    return request_plan
 
 
 def _sha256_file(filename):
@@ -785,27 +1199,41 @@ def _write_json_atomic(filename, payload):
 
 
 def _build_cache_manifest(
-    layer_name, bbox, queries, tags_of_interest, responses, osm_layer, filename
+    layer_name,
+    bbox,
+    queries,
+    tags_of_interest,
+    responses,
+    osm_layer,
+    filename,
+    request_plan=None,
 ):
-    response_statuses = [response.get("data_status") for response in responses]
+    queries = _normalize_osm_queries(queries)
+    manifest_responses = []
+    for index, response in enumerate(responses):
+        response = dict(response or {})
+        if request_plan is not None:
+            response.setdefault("group_index", index)
+        manifest_responses.append(response)
+    response_statuses = [response.get("data_status") for response in manifest_responses]
     validity = VALID_EMPTY if response_statuses and all(
         status == VALID_EMPTY for status in response_statuses
     ) else VALID_DATA
-    return {
+    manifest = {
         "schema_version": _OSM_CACHE_MANIFEST_VERSION,
         "status": "complete",
         "validity": validity,
         "layer": layer_name,
         "bbox": _normalized_bbox(bbox),
         "query_signature": _query_signature(queries, tags_of_interest),
-        "queries": [
-            [str(item) for item in query] if isinstance(query, (tuple, list)) else str(query)
-            for query in queries
-        ],
-        "responses": responses,
+        "queries": _manifest_queries(queries),
+        "responses": manifest_responses,
         "counts": _layer_counts(osm_layer),
         "data_sha256": _sha256_file(filename),
     }
+    if request_plan is not None:
+        manifest["request_plan"] = request_plan
+    return manifest
 
 
 def _load_verified_cache(
@@ -820,11 +1248,19 @@ def _load_verified_cache(
         if not isinstance(manifest, dict):
             UI.vprint(2, "    OSM cache manifest is not an object:", manifest_filename)
             return False
-        if manifest.get("schema_version") != _OSM_CACHE_MANIFEST_VERSION:
+        schema_version = manifest.get("schema_version")
+        if schema_version not in _SUPPORTED_OSM_CACHE_MANIFEST_VERSIONS:
             return False
         if manifest.get("status") != "complete":
             return False
         if manifest.get("layer") != layer_name:
+            return False
+        cache_source = manifest.get("source", "network")
+        if cache_source not in ("network", "bundled"):
+            return False
+        if cache_source == "bundled" and (
+            layer_name != "standalone" or not allow_unbound_request
+        ):
             return False
         if allow_unbound_request:
             if manifest.get("bbox") is not None:
@@ -836,15 +1272,39 @@ def _load_verified_cache(
                 queries, tags_of_interest
             ):
                 return False
+        if schema_version == 2:
+            request_plan = _validate_request_plan(
+                manifest,
+                queries,
+                tags_of_interest,
+                allow_unbound_request,
+            )
+            if request_plan is None:
+                return False
         responses = manifest.get("responses")
-        if not isinstance(responses, list) or not responses:
+        if not isinstance(responses, list):
             return False
-        if not allow_unbound_request and len(responses) != len(queries):
+        if cache_source == "bundled":
+            if responses:
+                return False
+        elif not responses:
             return False
+        if cache_source != "bundled":
+            if schema_version == 1:
+                if not allow_unbound_request and len(responses) != len(queries):
+                    return False
+            elif len(responses) != request_plan["group_count"]:
+                return False
         response_statuses = []
-        for response in responses:
+        response_indexes = set()
+        for response_index, response in enumerate(responses):
             if not isinstance(response, dict):
                 return False
+            if schema_version == 2:
+                group_index = response.get("group_index")
+                if group_index != response_index or group_index in response_indexes:
+                    return False
+                response_indexes.add(group_index)
             data_status = response.get("data_status")
             if data_status not in (VALID_DATA, VALID_EMPTY):
                 return False
@@ -900,7 +1360,7 @@ def load_verified_osm_cache(
     queries, osm_layer, lat, lon, tags_of_interest=None, cached_suffix=""
 ):
     """Load the exact verified cache for one tile/layer, if available."""
-    queries = list(queries)
+    queries = _normalize_osm_queries(queries)
     if tags_of_interest is None:
         tags_of_interest = []
     elif isinstance(tags_of_interest, str):
@@ -924,13 +1384,158 @@ def load_verified_osm_cache(
     )
 
 
+def _response_with_metadata(result):
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], dict(result[1] or {})
+    return result, {}
+
+
+def _metadata_contains_status(metadata, status_code):
+    metadata = metadata or {}
+    if metadata.get("http_status") == status_code:
+        return True
+    return any(
+        isinstance(attempt, dict)
+        and attempt.get("http_status") == status_code
+        for attempt in metadata.get("attempts", [])
+    )
+
+
+def _merge_osm_payloads(payloads):
+    """Merge split responses while removing repeated OSM element IDs."""
+    merged_root = ElementTree.Element("osm", {"version": "0.6"})
+    seen_elements = set()
+    for payload in payloads:
+        root = ElementTree.fromstring(payload)
+        for child in root:
+            element_name = child.tag.rsplit("}", 1)[-1].lower()
+            element_id = child.attrib.get("id")
+            if element_name in ("node", "way", "relation") and element_id:
+                key = (element_name, element_id)
+            else:
+                key = (
+                    element_name,
+                    ElementTree.tostring(child, encoding="unicode"),
+                )
+            if key in seen_elements:
+                continue
+            seen_elements.add(key)
+            merged_root.append(child)
+    return ElementTree.tostring(merged_root, encoding="utf-8")
+
+
+def _download_osm_query_groups(
+    groups,
+    bbox,
+    server_code,
+    input_tags,
+    target_tags,
+    tags_of_interest=None,
+    layer_name="OSM",
+    split_reason=None,
+):
+    """Download and parse all groups without publishing partial data."""
+    responses = []
+    payloads = []
+    for group_index, group in enumerate(groups):
+        query_payload = _query_group_payload(group)
+        UI.logprint(
+            "[OSM] layer=",
+            layer_name,
+            "group_index=",
+            group_index,
+            "group_count=",
+            len(groups),
+            "split_reason=",
+            split_reason or "none",
+            "query_signature=",
+            _query_signature(group, tags_of_interest),
+        )
+        UI.vprint(
+            1,
+            "    * Downloading OSM data for",
+            _overpass_query_label(query_payload),
+        )
+        response, response_info = _response_with_metadata(
+            get_overpass_data(
+                query_payload, bbox, server_code, return_metadata=True
+            )
+        )
+        if UI.red_flag:
+            return None, responses, {
+                "query": _overpass_query_label(query_payload),
+                "group_index": group_index,
+                "reason": "cancelled",
+                "metadata": response_info,
+            }
+        if not response:
+            UI.vprint(
+                1,
+                "      No valid answer after",
+                max_osm_tentatives,
+                "; layer will not be published.",
+            )
+            return None, responses, {
+                "query": _overpass_query_label(query_payload),
+                "group_index": group_index,
+                "reason": "no-valid-response",
+                "metadata": response_info,
+            }
+
+        data_status, reason, counts = _inspect_osm_response(response)
+        if data_status is None:
+            return None, responses, {
+                "query": _overpass_query_label(query_payload),
+                "group_index": group_index,
+                "reason": reason or "response-parse-failed",
+                "metadata": response_info,
+            }
+        response_info.setdefault("status", data_status)
+        response_info.setdefault("data_status", data_status)
+        response_info.setdefault("http_status", 200)
+        response_info.setdefault("counts", counts)
+        response_info["group_index"] = group_index
+        response_info["group_queries"] = _manifest_queries(group)
+        responses.append(response_info)
+        payloads.append(response)
+
+    try:
+        merged_payload = _merge_osm_payloads(payloads)
+    except (ElementTree.ParseError, TypeError, ValueError) as error:
+        return None, responses, {
+            "reason": "response-parse-failed",
+            "error": repr(error),
+        }
+    candidate_layer = OSM_layer()
+    if not candidate_layer.update_dicosm(merged_payload, input_tags, target_tags):
+        return None, responses, {
+            "reason": "response-parse-failed",
+        }
+    return candidate_layer, responses, None
+
+
 def _retry_after_seconds(response):
     headers = getattr(response, "headers", {}) or {}
-    value = headers.get("Retry-After")
+    try:
+        value = headers.get("Retry-After")
+    except AttributeError:
+        value = None
+    if value is None:
+        try:
+            value = next(
+                header_value
+                for header_name, header_value in headers.items()
+                if str(header_name).lower() == "retry-after"
+            )
+        except (AttributeError, StopIteration):
+            value = None
     if value is None:
         return None
     try:
-        return max(0.0, min(float(value), 300.0))
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, min(seconds, 300.0))
     except (TypeError, ValueError):
         try:
             retry_at = parsedate_to_datetime(str(value))
@@ -1031,7 +1636,7 @@ def prompt_osm_failure(tile, failure, cache_available=False):
 
 def run_osm_layer_with_policy(tile, layer_name, queries, osm_layer, **kwargs):
     """Run a tile OSM layer and apply the configured failure policy."""
-    queries = list(queries)
+    queries = _normalize_osm_queries(queries)
     cached_suffix = kwargs.get("cached_suffix", "")
     tags_of_interest = kwargs.get("tags_of_interest", None)
 
@@ -1150,7 +1755,7 @@ def OSM_queries_to_OSM_layer(
 ):
     # Keep every query in a temporary layer. A cache and its manifest are
     # published only after the complete query set has succeeded.
-    queries = list(queries)
+    queries = _normalize_osm_queries(queries)
     if tags_of_interest is None:
         tags_of_interest = []
     elif isinstance(tags_of_interest, str):
@@ -1212,51 +1817,56 @@ def OSM_queries_to_OSM_layer(
                 old_cached_data_filename,
             )
 
-    candidate_layer = OSM_layer()
-    responses = []
-    for query in queries:
-        UI.vprint(1, "    * Downloading OSM data for", query)
-        response, response_info = get_overpass_data(
-            query, bbox, server_code, return_metadata=True
+    groups = [queries]
+    candidate_layer, responses, failure = _download_osm_query_groups(
+        groups,
+        bbox,
+        server_code,
+        input_tags,
+        target_tags,
+        tags_of_interest,
+        layer_name=cached_suffix or "OSM",
+    )
+    split_reason = None
+    if failure is not None and _metadata_contains_status(
+        failure.get("metadata"), 504
+    ) and len(queries) > 1:
+        initial_failure = failure
+        groups = _partition_osm_queries(queries)
+        candidate_layer, responses, failure = _download_osm_query_groups(
+            groups,
+            bbox,
+            server_code,
+            input_tags,
+            target_tags,
+            tags_of_interest,
+            layer_name=cached_suffix or "OSM",
+            split_reason="http_504",
         )
-        if UI.red_flag:
-            _record_layer_failure(osm_layer, {
+        if failure is None:
+            split_reason = "http_504"
+        else:
+            failure["split_reason"] = "http_504"
+            failure["initial_failure"] = initial_failure
+
+    if failure is not None:
+        _record_layer_failure(
+            osm_layer,
+            {
                 "layer": cached_suffix or "OSM",
-                "query": _overpass_query_label(query),
-                "reason": "cancelled",
-                "metadata": response_info,
-            })
-            return 0
-        if not response:
-            UI.logprint(
-                "No valid answer for",
-                query,
-                "after",
-                max_osm_tentatives,
-                ".",
-            )
-            UI.vprint(
-                1,
-                "      No valid answer after",
-                max_osm_tentatives,
-                "; layer will not be published.",
-            )
-            _record_layer_failure(osm_layer, {
-                "layer": cached_suffix or "OSM",
-                "query": _overpass_query_label(query),
-                "reason": "no-valid-response",
-                "metadata": response_info,
-            })
-            return 0
-        if not candidate_layer.update_dicosm(response, input_tags, target_tags):
-            _record_layer_failure(osm_layer, {
-                "layer": cached_suffix or "OSM",
-                "query": _overpass_query_label(query),
-                "reason": "response-parse-failed",
-                "metadata": response_info,
-            })
-            return 0
-        responses.append(response_info)
+                **failure,
+            },
+        )
+        return OSM_FAILED
+
+    UI.logprint(
+        "[OSM] layer=",
+        cached_suffix or "OSM",
+        "group_count=",
+        len(groups),
+        "split_reason=",
+        split_reason or "none",
+    )
 
     _replace_layer(osm_layer, candidate_layer)
     osm_layer.last_result = OSM_COMPLETE
@@ -1280,6 +1890,9 @@ def OSM_queries_to_OSM_layer(
                 responses,
                 osm_layer,
                 cached_data_filename,
+                request_plan=_build_request_plan(
+                    groups, tags_of_interest, split_reason
+                ),
             )
             if not _write_json_atomic(manifest_filename, manifest):
                 UI.vprint(1, "    WARNING: OSM cache remains unverified:", cached_data_filename)
@@ -1450,6 +2063,9 @@ def OSM_query_to_OSM_layer(
                 [response_info],
                 osm_layer,
                 cached_file_name,
+                request_plan=_build_request_plan(
+                    [query_list], tags_of_interest, None
+                ),
             )
             if not _write_json_atomic(manifest_filename, manifest):
                 UI.vprint(
@@ -1533,6 +2149,14 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
     for tentative in range(max(1, int(max_osm_tentatives))):
         retry_after_values = []
         retry_statuses = []
+        generic_backoff = None
+
+        def next_generic_backoff():
+            nonlocal generic_backoff
+            if generic_backoff is None:
+                generic_backoff = _retry_delay(tentative, [], [None])
+            return generic_backoff
+
         for true_server_code in server_order:
             base_url = overpass_servers[true_server_code]
             attempt_number = tentative + 1
@@ -1545,17 +2169,53 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                 true_server_code,
             )
             UI.vprint(3, "Sending POST request to", base_url)
+            failure_delay = None
+            retry_after = None
+            status_code = None
             try:
                 # POST keeps large vector queries out of URL length limits.
-                response = session.post(
-                    base_url,
-                    data={"data": full_query},
-                    timeout=310,
-                    headers=headers,
-                )
-                status_code = getattr(response, "status_code", None)
-                UI.vprint(3, "OSM response status :", status_code)
-                content = response.content or b""
+                with _overpass_request_coordinator.slot() as request_slot:
+                    try:
+                        response = session.post(
+                            base_url,
+                            data={"data": full_query},
+                            timeout=310,
+                            headers=headers,
+                        )
+                    except requests.RequestException:
+                        failure_delay = next_generic_backoff()
+                        request_slot.set_cooldown_locked(
+                            failure_delay, "request-error"
+                        )
+                        raise
+                    except Exception:
+                        failure_delay = next_generic_backoff()
+                        request_slot.set_cooldown_locked(
+                            failure_delay, "unexpected-error"
+                        )
+                        raise
+
+                    status_code = getattr(response, "status_code", None)
+                    UI.vprint(3, "OSM response status :", status_code)
+                    content = response.content or b""
+                    retry_after = _retry_after_seconds(response)
+                    if status_code in (406, 429):
+                        retry_statuses.append(status_code)
+                        failure_delay = (
+                            retry_after if retry_after is not None else 30.0
+                        )
+                        retry_after_values.append(failure_delay)
+                        request_slot.set_cooldown_locked(
+                            failure_delay, str(status_code)
+                        )
+                    elif status_code != 200:
+                        failure_delay = next_generic_backoff()
+                        request_slot.set_cooldown_locked(
+                            failure_delay, "HTTP status " + str(status_code)
+                        )
+
+                data_status = None
+                reason = None
                 if status_code == 200:
                     data_status, reason, counts = _inspect_osm_response(content)
                     if data_status is not None:
@@ -1591,14 +2251,13 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                             data_status,
                         )
                         return (content, metadata) if return_metadata else content
+                    failure_delay = next_generic_backoff()
+                    _overpass_request_coordinator.set_cooldown(
+                        failure_delay, reason or "overpass-failure"
+                    )
                 else:
                     reason = "HTTP status " + str(status_code)
                     counts = None
-                retry_after = _retry_after_seconds(response)
-                if status_code in (406, 429):
-                    retry_statuses.append(status_code)
-                    if retry_after is not None:
-                        retry_after_values.append(retry_after)
                 attempts.append(
                     {
                         "server": true_server_code,
@@ -1606,6 +2265,7 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                         "http_status": status_code,
                         "reason": reason,
                         "retry_after": retry_after,
+                        "cooldown": failure_delay,
                     }
                 )
                 UI.vprint(
@@ -1627,12 +2287,48 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                     status_code,
                     "reason=",
                     reason,
+                    "cooldown=",
+                    failure_delay,
                 )
                 if status_code != 200:
                     try:
                         UI.vprint(2, "        Server message:", response.text[:200])
                     except Exception:
                         pass
+            except _OverpassRequestCancelled:
+                attempts.append(
+                    {
+                        "server": true_server_code,
+                        "attempt": attempt_number,
+                        "http_status": None,
+                        "reason": "cancelled",
+                    }
+                )
+                metadata = {
+                    "status": FAILED,
+                    "reason": "cancelled",
+                    "attempts": attempts,
+                }
+                return (None, metadata) if return_metadata else 0
+            except _OverpassRequestUnavailable as error:
+                attempts.append(
+                    {
+                        "server": true_server_code,
+                        "attempt": attempt_number,
+                        "http_status": None,
+                        "reason": "request-coordinator-unavailable",
+                        "error": repr(error),
+                    }
+                )
+                UI.logprint(
+                    "[OSM] request coordinator unavailable:", repr(error)
+                )
+                metadata = {
+                    "status": FAILED,
+                    "reason": "request-coordinator-unavailable",
+                    "attempts": attempts,
+                }
+                return (None, metadata) if return_metadata else 0
             except requests.RequestException as error:
                 attempts.append(
                     {
@@ -1641,6 +2337,7 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                         "http_status": None,
                         "reason": "request-error",
                         "error": repr(error),
+                        "cooldown": failure_delay or next_generic_backoff(),
                     }
                 )
                 retry_statuses.append(None)
@@ -1654,6 +2351,8 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                     "status=request-error",
                     "error=",
                     error,
+                    "cooldown=",
+                    failure_delay or next_generic_backoff(),
                 )
                 UI.vprint(
                     1,
@@ -1670,6 +2369,7 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                         "http_status": None,
                         "reason": "unexpected-error",
                         "error": repr(error),
+                        "cooldown": failure_delay or next_generic_backoff(),
                     }
                 )
                 retry_statuses.append(None)
@@ -1683,6 +2383,8 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                     "status=unexpected-error",
                     "error=",
                     error,
+                    "cooldown=",
+                    failure_delay or next_generic_backoff(),
                 )
                 UI.vprint(
                     1,
@@ -1697,14 +2399,20 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
 
         if tentative + 1 >= max(1, int(max_osm_tentatives)):
             break
-        delay = _retry_delay(tentative, retry_after_values, retry_statuses)
+        if retry_after_values:
+            delay = max(retry_after_values)
+        elif any(status in (406, 429) for status in retry_statuses):
+            delay = 30.0
+        else:
+            delay = generic_backoff or _retry_delay(
+                tentative, retry_after_values, retry_statuses
+            )
         UI.vprint(
             1,
             "        All covered Overpass servers failed; new attempt in",
             round(delay, 2),
             "sec...",
         )
-        time.sleep(delay)
 
     metadata = {"status": FAILED, "reason": "all-covered-servers-failed", "attempts": attempts}
     return (None, metadata) if return_metadata else 0

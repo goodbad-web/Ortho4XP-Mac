@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "source": "bundled",
+  "validity": "VALID_DATA",
+  "layer": "standalone",
+  "bbox": null,
+  "query_signature": null,
+  "queries": [],
+  "responses": [],
+  "counts": {
+    "nodes": 56026,
+    "ways": 0,
+    "relations": 1,
+    "elements": 56027
+  },
+  "data_sha256": "0c08dff4851fefff70386187b571eb6472bc3e84ef4a0f62061e37306e6301fa"
+}
