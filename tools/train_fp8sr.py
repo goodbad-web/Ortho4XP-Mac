@@ -49,6 +49,7 @@ DEFAULT_BATCH_SIZE = 16
 DEFAULT_EPOCHS = 100
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_ADAM_EPS = 1e-4
 DEFAULT_SEED = 42
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 
@@ -366,7 +367,12 @@ def train(args: argparse.Namespace) -> Path:
     )
     model = build_model().to(device=device, dtype=torch.float16)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        # FP16 AdamW state on MPS needs an epsilon above the FP16 subnormal
+        # range; 1e-8 otherwise becomes zero and can produce NaN on step 2.
+        eps=args.adam_eps,
     )
     total_steps = max(1, args.epochs * len(loader))
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
@@ -422,6 +428,7 @@ def train(args: argparse.Namespace) -> Path:
                 "epochs": args.epochs,
                 "learning_rate": args.learning_rate,
                 "weight_decay": args.weight_decay,
+                "adam_eps": args.adam_eps,
                 "warmup_ratio": args.warmup_ratio,
                 "loss": "L1",
                 "best_epoch": epoch + 1,
@@ -999,6 +1006,7 @@ def _add_common_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--adam-eps", type=float, default=DEFAULT_ADAM_EPS)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
 
 

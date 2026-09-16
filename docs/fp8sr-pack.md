@@ -114,7 +114,7 @@ dataset/
   --gpu-tools
 ```
 
-`run`サブコマンドでは同じ処理を一括実行できます。FP16のvalidation品質がLanczos以上でない場合はFP8量子化を停止します。FP8はFP16比でPSNR低下0.25 dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値を満たした場合だけ採用候補になります。FP8不合格でも候補パックと検証結果は保存されますが、本番設定へ自動採用しません。
+`run`サブコマンドでは同じ処理を一括実行できます。FP16のvalidation品質がLanczos以上でない場合はFP8量子化を停止します。FP8はFP16比でPSNR低下0.25 dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値を満たした場合だけ採用候補になります。FP8不合格でも候補パックと検証結果は保存されますが、本番設定へ自動採用しません。MPS上のFP16 AdamWは`--adam-eps 1e-4`を既定値とし、FP16 optimizer stateのゼロ除算によるNaNを避けます。必要に応じてCLIで上書きできます。
 
 `verify`はFP16のvalidation全件とゲートを完了してから、FP8のvalidation全件を実行します。FP16が不合格または参照計算が非有限になった場合、FP8は`BLOCKED`となり実行しません。JSONLの`reference_only`レコードはPython参照実装の結果で、`effective_backend`にもその実装名を記録します。macOS上のASHelper TensorOps実行は別レコードとして記録し、GPU実行失敗は検証全体を失敗にします。Metal非対応、ASHelper不在、GPU証跡ツール不在は理由付き`SKIP`です。
 

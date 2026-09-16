@@ -447,11 +447,15 @@ def _validate_finite_weights(
 def _round_fp16(value: float) -> float:
     value = float(value)
     # Python's half-float packer raises OverflowError for finite values above
-    # the FP16 range, while Metal arithmetic produces +/-inf.  Preserve the
-    # latter so the reference path can apply the same non-finite gate as the
-    # GPU path instead of terminating the verifier with a traceback.
-    if math.isfinite(value) and abs(value) > 65504.0:
-        return math.copysign(float("inf"), value)
+    # the largest finite value.  Round-to-nearest FP16 still represents values
+    # through the midpoint to infinity (65520) as 65504; only values at or
+    # above that midpoint become +/-inf.
+    if math.isfinite(value):
+        magnitude = abs(value)
+        if magnitude >= 65520.0:
+            return math.copysign(float("inf"), value)
+        if magnitude > 65504.0:
+            return math.copysign(65504.0, value)
     return struct.unpack("<e", struct.pack("<e", value))[0]
 
 

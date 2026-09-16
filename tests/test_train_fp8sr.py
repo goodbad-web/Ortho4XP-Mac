@@ -1,5 +1,6 @@
-import json
 import argparse
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import train_fp8sr  # noqa: E402
 from fp8sr_pack import (  # noqa: E402
     EXPECTED_LAYERS,
     FP8SRPackError,
+    _round_fp16,
     fp8sr_fp16_reference,
     validate_pack,
     write_pack,
@@ -89,6 +91,8 @@ def test_cli_exposes_all_pipeline_stages():
     for command, command_args in arguments.items():
         parsed = parser.parse_args([command, *command_args])
         assert parsed.command == command
+    train_args = parser.parse_args(["train", "--dataset", "data", "--output-dir", "out"])
+    assert train_args.adam_eps == pytest.approx(1e-4)
 
 
 def test_fp16_reference_reports_nonfinite_instead_of_overflowing(tmp_path):
@@ -117,6 +121,14 @@ def test_fp16_reference_reports_nonfinite_instead_of_overflowing(tmp_path):
             tmp_path / "output.png",
             reject_nonfinite=True,
         )
+
+
+def test_fp16_rounding_uses_the_overflow_midpoint():
+    assert _round_fp16(65505.0) == 65504.0
+    assert _round_fp16(65519.0) == 65504.0
+    assert _round_fp16(-65519.0) == -65504.0
+    assert math.isinf(_round_fp16(65520.0))
+    assert math.isinf(_round_fp16(-65520.0))
 
 
 def test_record_contains_timing_and_gpu_evidence_fields():
