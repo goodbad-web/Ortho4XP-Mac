@@ -90,6 +90,14 @@ MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
 
 direct DDS batchは既定2 worker、最大4 worker、1プロセス8画像chunkで実行する。verbosity 1では`MetalFX Spatial DDS batch: completed/total`、続けて`png_intermediate=false`、`metalfx_ms`、`readback_ms`、`dds_ms`、`temporary_bytes`、fallback理由を表示する。単独経路と性能を比較する場合は、同じ入力を次のように実行する。
 
+### SSDストリーミングと共有メモリhandoff
+
+RAM diskを正本にせず、SSD上のimagery cacheとtransaction stagingを正本として使う性能改善は、`docs/performance_shared_memory_plan.md`に固定している。`enable_streaming_conversion=False`と`enable_shared_memory_handoff=False`が安全な初期値であり、前者はダウンロード完了画像からbounded queueへ投入する既存のopt-in経路、後者はそのうち対応するopaque RGB8・BC1/BC3だけをresident ASHelperへ共有メモリで渡す経路である。
+
+共有メモリ経路は物理メモリの8%を自動予算とし、2--8 GiBに制限する。`shared_memory_budget_gb`が正数ならタイル単位の明示予算を使う。入力はPythonが作成したPOSIX segmentをASHelperがread-onlyでmapし、DDS出力を同じく共有segmentへ返す。DDS bytesをPythonで検証してからSSD上の一時ファイルへ書き、`os.replace`でtransaction stagingへ公開する。共有メモリの作成、能力不足、プロトコルエラー、ASHelper障害ではpath-based GPUまたは既存CPU fallbackへ戻り、共有segmentはrequest終了時に解放する。
+
+この経路の受入は実GPUのMetal dispatchとは別に行う。`--capabilities`の`shared_memory_version`はtransport対応の宣言であり、GPU実行成功は`effective_backend=metalfx_spatial`、`dispatch=direct_dds`、fallbackなしを別途確認する。結果は`Ortho4XP_performance.json`へ保存し、RAM diskあり/なしではなく、同一SSD cacheの旧経路・SSD streaming・共有メモリhandoffを各3回の中央値で比較する。
+
 TensorOps direct DDSは1プロセス8画像のchunkを単位にし、画像別activation/output、DDS一時payloadとmipmap、親プロセスRSS、物理メモリの70%を含む推定working setからworker数を動的に決める（最大4）。512px級は安全な範囲で並列化し、2048px以上は通常1 workerに制限する。物理メモリを取得できない場合も安全のため1 workerとする。chunk終了時にASHelperを終了するため、Metal/PNG/CGImageの一時リソースをプロセス境界で回収できる。ログには`batch_workers`、`batch_chunks`、`chunk_size=8`、`memory_budget_mb`、`parent_rss_mb`、`estimated_worker_mb`、`estimated_total_mb`、`peak_rss_mb`、`rss_after_item_mb`、`signal=9`（SIGKILL時）、`fallback_reasons`を記録する。TensorOps batchが失敗した場合は元JPEGを使って失敗画像だけをMetalFXへ再処理し、MetalFXも失敗した画像だけを`ci_lanczos`へ送る。成功済みDDSは再処理しない。`--tensorops-upscale`とそのbatchはPNG互換CLIとして残るが、実タイルのdirect DDSでは`png_intermediate=false`となり、`_tensorops_upscaled.png`や`tile_input.png`を生成しない。
 
 ```sh

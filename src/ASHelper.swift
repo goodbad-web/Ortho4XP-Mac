@@ -858,6 +858,24 @@ func cgImageFromRGBAUnassociated(_ input: [UInt8], width: Int, height: Int) -> C
     return cgImageFromRGBA(premultiplied, width: width, height: height)
 }
 
+func cgImageFromRGB(_ input: [UInt8], width: Int, height: Int) -> CGImage? {
+    guard width > 0, height > 0,
+          let pixelCount = try? checkedMultiply(width, height, label: "rgb_pixels"),
+          let byteCount = try? checkedMultiply(pixelCount, 3, label: "rgb_bytes"),
+          input.count == byteCount else {
+        return nil
+    }
+    var rgba = [UInt8](repeating: 255, count: pixelCount * 4)
+    for pixel in 0..<pixelCount {
+        let source = pixel * 3
+        let destination = pixel * 4
+        rgba[destination] = input[source]
+        rgba[destination + 1] = input[source + 1]
+        rgba[destination + 2] = input[source + 2]
+    }
+    return cgImageFromRGBA(rgba, width: width, height: height)
+}
+
 func writePNG(_ raw: [UInt8], width: Int, height: Int, outputPath: String) -> Bool {
     guard width > 0, height > 0 else { return false }
     let pixelProduct = width.multipliedReportingOverflow(by: height)
@@ -1592,7 +1610,8 @@ func convertCGImageWithPreprocess(
     outputPath: String,
     format: String,
     useGPU: Bool,
-    telemetry: DDSConversionTelemetry? = nil
+    telemetry: DDSConversionTelemetry? = nil,
+    outputData: UnsafeMutablePointer<Data?>? = nil
 ) -> Bool {
     let started = CFAbsoluteTimeGetCurrent()
     var completed = false
@@ -1783,6 +1802,11 @@ func convertCGImageWithPreprocess(
     }
     telemetry?.compressionMs = (CFAbsoluteTimeGetCurrent() - compressionStarted) * 1000.0
 
+    if let outputData {
+        outputData.pointee = out
+        completed = true
+        return true
+    }
     let writeStarted = CFAbsoluteTimeGetCurrent()
     let written = writeDDS(out, to: outputPath)
     telemetry?.writeMs = (CFAbsoluteTimeGetCurrent() - writeStarted) * 1000.0
@@ -4507,10 +4531,10 @@ private func serverRawRasterBatch(
 
 // MARK: - Resident JSON Lines server
 
-// The server protocol deliberately carries only paths and scalar options.  It
-// keeps the large image payloads on the staging filesystem and lets the
-// Python-side tile scheduler apply backpressure without starting one helper
-// process per batch.
+// The default server protocol carries paths and scalar options.  The optional
+// shared-memory transport carries only POSIX segment descriptors, keeping
+// large RGB/DDS payloads out of JSON while the Python-side scheduler applies
+// the same bounded backpressure.
 private func serverString(_ request: [String: Any], _ key: String) -> String? {
     guard let value = request[key] as? String, !value.isEmpty else { return nil }
     return value
@@ -4558,10 +4582,257 @@ private func serverTaskResult(
     return result
 }
 
+private final class ServerSharedMemoryMapping {
+    let fileDescriptor: Int32
+    let mapped: UnsafeMutableRawPointer
+    let capacity: Int
+    let offset: Int
+
+    init(descriptor: [String: Any], writable: Bool) throws {
+        guard let name = descriptor["name"] as? String,
+              !name.isEmpty,
+              let capacityValue = descriptor["capacity"] as? NSNumber,
+              let offsetValue = descriptor["offset"] as? NSNumber else {
+            throw NSError(domain: "ASHelper", code: 20, userInfo: [
+                NSLocalizedDescriptionKey: "shared_memory_descriptor_invalid"
+            ])
+        }
+        let capacity = capacityValue.intValue
+        let offset = offsetValue.intValue
+        guard capacity > 0, offset >= 0, offset <= capacity else {
+            throw NSError(domain: "ASHelper", code: 21, userInfo: [
+                NSLocalizedDescriptionKey: "shared_memory_geometry_invalid"
+            ])
+        }
+        let flags = writable ? O_RDWR : O_RDONLY
+        // Python's SharedMemory.name omits the leading POSIX slash on
+        // Darwin, while shm_open requires it.
+        let posixName = name.hasPrefix("/") ? name : "/" + name
+        let fileDescriptor = serverShmOpen(name: posixName, flags: flags)
+        guard fileDescriptor >= 0 else {
+            throw NSError(domain: "ASHelper", code: 22, userInfo: [
+                NSLocalizedDescriptionKey: "shared_memory_open_failed_\(errno)"
+            ])
+        }
+        let protection = writable ? (PROT_READ | PROT_WRITE) : PROT_READ
+        let mapped = mmap(nil, capacity, protection, MAP_SHARED, fileDescriptor, 0)
+        guard mapped != MAP_FAILED else {
+            close(fileDescriptor)
+            throw NSError(domain: "ASHelper", code: 23, userInfo: [
+                NSLocalizedDescriptionKey: "shared_memory_map_failed_\(errno)"
+            ])
+        }
+        self.fileDescriptor = fileDescriptor
+        self.mapped = mapped!
+        self.capacity = capacity
+        self.offset = offset
+    }
+
+    var bytes: UnsafeMutableRawPointer {
+        mapped.advanced(by: offset)
+    }
+
+    deinit {
+        munmap(mapped, capacity)
+        close(fileDescriptor)
+    }
+}
+
+// Swift 6 imports the variadic libc declaration of shm_open as unavailable.
+// Resolve it dynamically and call the stable three-argument ABI instead of
+// adding a second native helper binary just for this transport.
+private typealias ServerShmOpenFunction = @convention(c) (
+    UnsafePointer<CChar>, Int32, mode_t
+) -> Int32
+
+private func serverShmOpen(name: String, flags: Int32) -> Int32 {
+    guard let handle = dlopen(nil, RTLD_LAZY),
+          let symbol = dlsym(handle, "shm_open") else {
+        return -1
+    }
+    let function = unsafeBitCast(symbol, to: ServerShmOpenFunction.self)
+    return name.withCString { function($0, flags, mode_t(0o600)) }
+}
+
+private func serverSharedDescriptor(
+    _ task: [String: Any],
+    _ key: String
+) -> [String: Any]? {
+    task[key] as? [String: Any]
+}
+
+private func serverSharedRGB(
+    _ mapping: ServerSharedMemoryMapping,
+    descriptor: [String: Any]
+) -> ([UInt8], Int, Int)? {
+    guard (descriptor["pixel_format"] as? String) == "RGB8",
+          (descriptor["read_only"] as? Bool) == true,
+          let widthValue = descriptor["width"] as? NSNumber,
+          let heightValue = descriptor["height"] as? NSNumber,
+          let strideValue = descriptor["stride"] as? NSNumber,
+          let usedValue = descriptor["used_bytes"] as? NSNumber else {
+        return nil
+    }
+    let width = widthValue.intValue
+    let height = heightValue.intValue
+    let stride = strideValue.intValue
+    let usedBytes = usedValue.intValue
+    guard width > 0, height > 0, stride >= width * 3,
+          usedBytes >= stride * height,
+          stride * height <= mapping.capacity - mapping.offset else {
+        return nil
+    }
+    var packed = [UInt8](repeating: 0, count: width * height * 3)
+    for row in 0..<height {
+        memcpy(
+            &packed[row * width * 3],
+            mapping.bytes.advanced(by: row * stride),
+            width * 3
+        )
+    }
+    return (packed, width, height)
+}
+
+private func serverSharedConvertTask(
+    _ task: [String: Any],
+    useGPU: Bool,
+    expectedGeneration: String?
+) -> [String: Any] {
+    let taskID = serverTaskID(task, index: 0)
+    guard let inputDescriptor = serverSharedDescriptor(task, "input_shared_memory"),
+          let outputDescriptor = serverSharedDescriptor(task, "output_shared_memory"),
+          let format = serverString(task, "format"),
+          format == "BC1" || format == "BC3" else {
+        return serverTaskResult(taskID, success: false, backend: "shared_memory", error: "invalid_shared_task")
+    }
+    if let expectedGeneration,
+       (task["generation"] as? String) != expectedGeneration {
+        return serverTaskResult(
+            taskID,
+            success: false,
+            backend: "shared_memory",
+            error: "stale_generation"
+        )
+    }
+
+    do {
+        guard (outputDescriptor["pixel_format"] as? String) == "DDS",
+              (outputDescriptor["read_only"] as? Bool) == false else {
+            return serverTaskResult(
+                taskID,
+                success: false,
+                backend: "shared_memory",
+                error: "shared_output_invalid"
+            )
+        }
+        let inputMapping = try ServerSharedMemoryMapping(descriptor: inputDescriptor, writable: false)
+        let outputMapping = try ServerSharedMemoryMapping(descriptor: outputDescriptor, writable: true)
+        guard let (rgb, width, height) = serverSharedRGB(inputMapping, descriptor: inputDescriptor),
+              let sourceImage = cgImageFromRGB(rgb, width: width, height: height) else {
+            return serverTaskResult(taskID, success: false, backend: "shared_memory", error: "shared_input_invalid")
+        }
+        let telemetry = DDSConversionTelemetry()
+        var outputData: Data?
+        let ok = withUnsafeMutablePointer(to: &outputData) { outputPointer in
+            convertCGImageWithPreprocess(
+                sourceImage: sourceImage,
+                sourceLabel: "shared_memory:\(taskID)",
+                maskPath: serverString(task, "mask") ?? "none",
+                r: serverDouble(task, "r", defaultValue: 1.0),
+                g: serverDouble(task, "g", defaultValue: 1.0),
+                b: serverDouble(task, "b", defaultValue: 1.0),
+                contrast: serverDouble(task, "contrast", defaultValue: 1.0),
+                brightness: serverDouble(task, "brightness", defaultValue: 0.0),
+                saturation: serverDouble(task, "saturation", defaultValue: 1.0),
+                outputPath: "",
+                format: format,
+                useGPU: useGPU,
+                telemetry: telemetry,
+                outputData: outputPointer
+            )
+        }
+        guard ok, let outputData else {
+            return serverTaskResult(
+                taskID,
+                success: false,
+                backend: telemetry.backend,
+                error: "conversion_failed"
+            )
+        }
+        guard outputData.count <= outputMapping.capacity - outputMapping.offset else {
+            return serverTaskResult(
+                taskID,
+                success: false,
+                backend: telemetry.backend,
+                error: "output_buffer_too_small",
+                extra: ["required_bytes": outputData.count]
+            )
+        }
+        outputData.withUnsafeBytes { rawBuffer in
+            if let baseAddress = rawBuffer.baseAddress {
+                memcpy(outputMapping.bytes, baseAddress, outputData.count)
+            }
+        }
+        return serverTaskResult(
+            taskID,
+            success: true,
+            backend: telemetry.backend,
+            extra: [
+                "used_bytes": outputData.count,
+                "decode_ms": telemetry.decodeMs,
+                "mask_setup_ms": telemetry.maskSetupMs,
+                "color_setup_ms": telemetry.colorSetupMs,
+                // Compatibility aliases: these legacy fields are setup-only
+                // timings, not the deferred Core Image render cost.
+                "mask_ms": telemetry.maskSetupMs,
+                "color_ms": telemetry.colorSetupMs,
+                "preprocess_ms": telemetry.preprocessMs,
+                "compression_ms": telemetry.compressionMs,
+                "readback_ms": telemetry.readbackMs,
+                "write_ms": telemetry.writeMs,
+                "total_ms": telemetry.totalMs,
+                "peak_rss_mb": telemetry.peakRssMB,
+            ]
+        )
+    } catch {
+        return serverTaskResult(
+            taskID,
+            success: false,
+            backend: "shared_memory",
+            error: String(describing: error)
+        )
+    }
+}
+
 private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
     let useGPU = (request["gpu"] as? Bool) ?? false
     guard let tasks = request["tasks"] as? [[String: Any]], !tasks.isEmpty else {
         return [serverTaskResult("batch", success: false, backend: "server", error: "tasks_required")]
+    }
+    let transport = (request["transport"] as? String) ?? "path"
+    if transport == "shared_memory" {
+        let expectedGeneration = request["generation"] as? String
+        return tasks.enumerated().map { index, task in
+            var taskWithStableID = task
+            if taskWithStableID["id"] == nil {
+                taskWithStableID["id"] = "task-\(index + 1)"
+            }
+            return serverSharedConvertTask(
+                taskWithStableID,
+                useGPU: useGPU,
+                expectedGeneration: expectedGeneration
+            )
+        }
+    }
+    guard transport == "path" else {
+        return tasks.enumerated().map { index, task in
+            serverTaskResult(
+                serverTaskID(task, index: index),
+                success: false,
+                backend: "server",
+                error: "unsupported_transport"
+            )
+        }
     }
 
     // Keep one resident helper memory-bounded.  The caller sends bounded
@@ -4867,6 +5138,12 @@ else if args[1] == "--capabilities" {
     }
     print("tensorops_available=\(tensorops)")
     print("fp8_tensorops_available=\(tensorops)")
+    // Versioned optional transport capability.  The Python client keeps the
+    // path transport when this key is absent, so older helpers remain valid.
+    print("shared_memory_version=1")
+    print("shared_memory_input_format=RGB8")
+    print("shared_memory_output_format=DDS")
+    print("shared_memory_max_buffer_bytes=8589934592")
 }
 else if args[1] == "--ci-lanczos-upscale" || args[1] == "--lanczos-upscale" || args[1] == "--upscale" {
     // The older spellings remain compatibility aliases.

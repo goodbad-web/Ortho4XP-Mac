@@ -254,16 +254,26 @@ class ASHelperJSONLServer:
         *,
         gpu: bool = True,
         parallelism: Optional[int] = None,
+        transport: str = "path",
+        server_session_id: Optional[str] = None,
+        generation: Optional[str] = None,
     ) -> Dict[str, Any]:
         task_list = [dict(task) for task in tasks]
+        if transport not in ("path", "shared_memory"):
+            raise ValueError("unsupported ASHelper transport: {}".format(transport))
         payload = {
             "id": "batch-{}".format(uuid.uuid4().hex),
             "op": "convert_batch",
             "gpu": bool(gpu),
+            "transport": transport,
             "tasks": task_list,
         }
         if parallelism is not None:
             payload["parallelism"] = max(1, min(12, int(parallelism)))
+        if server_session_id is not None:
+            payload["server_session_id"] = str(server_session_id)
+        if generation is not None:
+            payload["generation"] = str(generation)
         return self.request(payload)
 
     def metalfx_upscale_batch(

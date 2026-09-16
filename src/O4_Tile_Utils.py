@@ -10,6 +10,7 @@ import tempfile
 import re
 import traceback
 import multiprocessing
+import uuid
 from contextlib import contextmanager, nullcontext
 from itertools import count
 import O4_UI_Utils as UI
@@ -23,6 +24,7 @@ import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
 import O4_DSF_Budget as DSF_BUDGET
 import O4_Performance_Utils as PERF
+import O4_Shared_Memory as SHMEM
 from O4_Parallel_Utils import (
     parallel_launch,
     parallel_join,
@@ -42,6 +44,8 @@ conversion_queue_size = 0
 gpu_batch_size = 0
 gpu_dds_workers = 8
 gpu_batch_wait_ms = 50
+enable_shared_memory_handoff = False
+shared_memory_budget_gb = 0
 enable_parallel_overlay = False
 max_parallel_tiles = 1
 
@@ -740,6 +744,10 @@ def _ashelper_capabilities(as_helper):
             "metalfx_spatial_available": False,
             "tensorops_available": False,
             "fp8_tensorops_available": False,
+            "shared_memory_version": 0,
+            "shared_memory_input_format": None,
+            "shared_memory_output_format": None,
+            "shared_memory_max_buffer_bytes": 0,
             "probe_error": type(error).__name__,
         }
     else:
@@ -748,7 +756,15 @@ def _ashelper_capabilities(as_helper):
             if "=" not in line:
                 continue
             name, value = line.strip().split("=", 1)
-            values[name] = value.lower() == "true"
+            normalized = value.strip()
+            lowered = normalized.lower()
+            if lowered in ("true", "false"):
+                values[name] = lowered == "true"
+            else:
+                try:
+                    values[name] = int(normalized)
+                except ValueError:
+                    values[name] = normalized
         capabilities = {
             "metal_available": bool(result.returncode == 0 and values.get("metal_available")),
             "metalfx_spatial_available": bool(
@@ -759,6 +775,12 @@ def _ashelper_capabilities(as_helper):
             ),
             "fp8_tensorops_available": bool(
                 result.returncode == 0 and values.get("fp8_tensorops_available")
+            ),
+            "shared_memory_version": int(values.get("shared_memory_version", 0) or 0),
+            "shared_memory_input_format": values.get("shared_memory_input_format"),
+            "shared_memory_output_format": values.get("shared_memory_output_format"),
+            "shared_memory_max_buffer_bytes": int(
+                values.get("shared_memory_max_buffer_bytes", 0) or 0
             ),
         }
         if result.returncode != 0:
@@ -887,7 +909,12 @@ def _streaming_gpu_batch_size(tile):
     # Keep the existing safe batch size as the initial automatic value.  The
     # setting is deliberately shared by the scheduler and future ASHelper
     # server implementation, while each backend may lower it before dispatch.
-    return max(1, requested if requested > 0 else 32)
+    automatic = 32
+    if getattr(tile, "enable_shared_memory_handoff", enable_shared_memory_handoff):
+        # Shared-memory input/output is intentionally conservative until the
+        # real-tile acceptance run establishes a larger safe batch size.
+        automatic = 8
+    return max(1, requested if requested > 0 else automatic)
 
 
 def _streaming_batch_wait_ms(tile):
@@ -1121,6 +1148,87 @@ def _build_streaming_gpu_spec(task_id, item, dds_format):
     }
 
 
+def _shared_memory_spec(spec, budget, generation, max_buffer_bytes=0):
+    """Attach an RGB8 input and DDS output shared-memory lease to a spec.
+
+    The path-based request remains present as a compatibility fallback.  The
+    ASHelper shared transport reads only the versioned descriptors below.
+    """
+    request = spec["request"]
+    if request.get("mask") not in (None, "none", ""):
+        return None
+    if any(
+        abs(float(request.get(name, default)) - default) > 1e-9
+        for name, default in (
+            ("r", 1.0),
+            ("g", 1.0),
+            ("b", 1.0),
+            ("contrast", 1.0),
+            ("brightness", 0.0),
+            ("saturation", 1.0),
+        )
+    ):
+        return None
+    input_path = request.get("input")
+    if not input_path:
+        return None
+    try:
+        with Image.open(input_path) as source_image:
+            rgb_image = source_image.convert("RGB")
+            width, height = rgb_image.size
+            raw_rgb = rgb_image.tobytes()
+        output_capacity = SHMEM.dds_capacity_bytes(
+            width,
+            height,
+            spec["target_format"],
+        )
+        max_buffer = int(max_buffer_bytes or 0)
+        if max_buffer > 0 and output_capacity > max_buffer:
+            return None
+        total_bytes = len(raw_rgb) + output_capacity
+        if not budget.acquire(total_bytes, timeout=5.0):
+            return None
+        input_region = SHMEM.SharedMemoryRegion(len(raw_rgb), label="rgb_input")
+        output_region = SHMEM.SharedMemoryRegion(output_capacity, label="dds_output")
+        input_region.write(raw_rgb)
+        request["input_shared_memory"] = input_region.descriptor(
+            width=width,
+            height=height,
+            stride=width * 3,
+            pixel_format=SHMEM.DEFAULT_INPUT_PIXEL_FORMAT,
+            used_bytes=len(raw_rgb),
+            read_only=True,
+        )
+        request["output_shared_memory"] = output_region.descriptor(
+            width=width,
+            height=height,
+            stride=0,
+            pixel_format=SHMEM.DEFAULT_OUTPUT_PIXEL_FORMAT,
+            used_bytes=0,
+            read_only=False,
+        )
+        request["generation"] = str(generation)
+        shared_spec = dict(spec)
+        shared_spec["shared_memory"] = True
+        shared_spec["shared_memory_bytes"] = total_bytes
+        shared_spec["input_region"] = input_region
+        shared_spec["output_region"] = output_region
+        shared_spec["input_dimensions"] = (width, height)
+        shared_spec["shared_generation"] = str(generation)
+        shared_spec["request"] = request
+        return shared_spec
+    except Exception:
+        try:
+            budget.release(total_bytes)
+        except (UnboundLocalError, NameError):
+            pass
+        for region_name in ("input_region", "output_region"):
+            region = locals().get(region_name)
+            if region is not None:
+                region.close()
+        return None
+
+
 class _StreamingConversionRunner:
     """Bridge downloads to bounded CPU and resident GPU conversion routes."""
 
@@ -1151,6 +1259,29 @@ class _StreamingConversionRunner:
             if gpu_requested and os.path.isfile(self.as_helper)
             else {}
         )
+        self.shared_memory_enabled = bool(
+            getattr(
+                tile,
+                "enable_shared_memory_handoff",
+                enable_shared_memory_handoff,
+            )
+            and self.capabilities.get("shared_memory_version", 0) >= 1
+            and self.capabilities.get("shared_memory_input_format") == "RGB8"
+            and self.capabilities.get("shared_memory_output_format") == "DDS"
+        )
+        self.shared_memory_budget = None
+        if self.shared_memory_enabled:
+            self.shared_memory_budget = SHMEM.SharedMemoryBudget(
+                SHMEM.shared_memory_budget_bytes(
+                    getattr(
+                        tile,
+                        "shared_memory_budget_gb",
+                        shared_memory_budget_gb,
+                    )
+                )
+            )
+        self.shared_memory_session_id = uuid.uuid4().hex
+        self._shared_specs_inflight = []
         self.effective_gpu = bool(
             use_gpu
             and (not gpu_requested or self.capabilities.get("metal_available", False))
@@ -1186,7 +1317,14 @@ class _StreamingConversionRunner:
                 dict(
                     self.capabilities,
                     ashelper_jsonl_server=self.gpu_server is not None,
+                    shared_memory_handoff=self.shared_memory_enabled,
                 )
+            )
+            self.metrics.set_value(
+                "shared_memory_budget_bytes",
+                self.shared_memory_budget.capacity_bytes
+                if self.shared_memory_budget is not None
+                else 0,
             )
         # The resident server owns the GPU lane. CPU fallback workers must not
         # independently initialize Metal for the same tile.
@@ -1263,9 +1401,17 @@ class _StreamingConversionRunner:
             return False
 
     def _dispatch_gpu(self, tasks):
+        try:
+            return self._dispatch_gpu_impl(tasks)
+        finally:
+            for spec in self._shared_specs_inflight:
+                self._release_shared_spec(spec)
+            self._shared_specs_inflight = []
+
+    def _dispatch_gpu_impl(self, tasks):
         if self.gpu_server is None or self.gpu_server.gpu_disabled:
             raise RuntimeError("ASHelper GPU server is disabled")
-        specs = []
+        path_specs = []
         for task in tasks:
             try:
                 spec = _build_streaming_gpu_spec(
@@ -1279,19 +1425,124 @@ class _StreamingConversionRunner:
                     task.task_id: False
                     for task in tasks
                 }
-            specs.append(spec)
+            path_specs.append(spec)
+
+        specs = path_specs
+        transport = "path"
+        shared_specs = []
+        generation = uuid.uuid4().hex
+        if self.shared_memory_enabled and self.shared_memory_budget is not None:
+            for spec in path_specs:
+                shared_spec = _shared_memory_spec(
+                    spec,
+                    self.shared_memory_budget,
+                    generation,
+                    self.capabilities.get("shared_memory_max_buffer_bytes", 0),
+                )
+                if shared_spec is None:
+                    if self.metrics is not None:
+                        self.metrics.increment("shared_memory_fallback")
+                    for prepared in shared_specs:
+                        self._release_shared_spec(prepared)
+                    shared_specs = []
+                    break
+                shared_specs.append(shared_spec)
+            if shared_specs and len(shared_specs) == len(path_specs):
+                specs = shared_specs
+                transport = "shared_memory"
+                if self.metrics is not None:
+                    self.metrics.increment(
+                        "shared_alloc_bytes",
+                        sum(spec.get("shared_memory_bytes", 0) for spec in specs),
+                    )
+            elif shared_specs:
+                for prepared in shared_specs:
+                    self._release_shared_spec(prepared)
+                shared_specs = []
+        self._shared_specs_inflight = (
+            list(specs) if transport == "shared_memory" else []
+        )
 
         if self.metrics is not None:
             self.metrics.increment("conversion_batches_gpu")
-        response = self.gpu_server.convert_batch(
-            [spec["request"] for spec in specs],
-            gpu=True,
-        )
+            if transport == "shared_memory":
+                self.metrics.increment("conversion_batches_shared_memory")
+        try:
+            response = self.gpu_server.convert_batch(
+                [spec["request"] for spec in specs],
+                gpu=True,
+                transport=transport,
+                server_session_id=self.shared_memory_session_id,
+                generation=generation,
+            )
+        finally:
+            if transport == "path":
+                for spec in shared_specs:
+                    self._release_shared_spec(spec)
         response_by_id = {
             result.get("id"): result
             for result in response.get("results", [])
             if isinstance(result, dict)
         }
+        if transport == "shared_memory":
+            shared_protocol_errors = {
+                "unsupported_transport",
+                "stale_generation",
+                "invalid_shared_task",
+                "shared_memory_descriptor_invalid",
+                "shared_memory_geometry_invalid",
+                "shared_input_invalid",
+                "shared_output_invalid",
+            }
+            protocol_failure = any(
+                result.get("error") in shared_protocol_errors
+                for result in response_by_id.values()
+                if isinstance(result, dict)
+            )
+            if protocol_failure:
+                # The ASHelper process answered, so preserve the resident GPU
+                # server and downgrade only the transport for this tile.
+                self.shared_memory_enabled = False
+                if self.metrics is not None:
+                    self.metrics.increment("shared_memory_fallback")
+                for spec in path_specs:
+                    path_request = dict(spec["request"])
+                    path_request.pop("input_shared_memory", None)
+                    path_request.pop("output_shared_memory", None)
+                    path_request.pop("generation", None)
+                    spec["request"] = path_request
+                specs = path_specs
+                transport = "path"
+                response = self.gpu_server.convert_batch(
+                    [spec["request"] for spec in specs],
+                    gpu=True,
+                    transport="path",
+                    server_session_id=self.shared_memory_session_id,
+                )
+                response_by_id = {
+                    result.get("id"): result
+                    for result in response.get("results", [])
+                    if isinstance(result, dict)
+                }
+        if transport == "shared_memory":
+            retry_specs = []
+            for spec in specs:
+                result = response_by_id.get(spec["task_id"], {})
+                required_bytes = int(result.get("required_bytes", 0) or 0)
+                if result.get("error") == "output_buffer_too_small" and required_bytes > 0:
+                    if self._resize_shared_output(spec, required_bytes):
+                        retry_specs.append(spec)
+            if retry_specs:
+                retry_response = self.gpu_server.convert_batch(
+                    [spec["request"] for spec in retry_specs],
+                    gpu=True,
+                    transport="shared_memory",
+                    server_session_id=self.shared_memory_session_id,
+                    generation=generation,
+                )
+                for result in retry_response.get("results", []):
+                    if isinstance(result, dict) and result.get("id"):
+                        response_by_id[result["id"]] = result
         normalized = {}
         for spec in specs:
             task_id = spec["task_id"]
@@ -1299,21 +1550,48 @@ class _StreamingConversionRunner:
             ok = bool(result.get("ok"))
             error = result.get("error")
             if ok:
-                valid, validation_error = IMG.validate_dds_file(
-                    spec["temporary_path"],
-                    expected_format=spec["target_format"],
-                    expected_dimensions=spec["input_size"],
-                    require_mipmaps=True,
-                )
-                if valid:
-                    try:
-                        os.replace(spec["temporary_path"], spec["final_path"])
-                    except OSError as publish_error:
+                if transport == "shared_memory":
+                    used_bytes = int(result.get("used_bytes", 0) or 0)
+                    payload = spec["output_region"].read(used_bytes)
+                    valid, validation_error = IMG.validate_dds_bytes(
+                        payload,
+                        expected_format=spec["target_format"],
+                        expected_dimensions=spec["input_size"],
+                        require_mipmaps=True,
+                    )
+                    if valid:
+                        try:
+                            with open(spec["temporary_path"], "wb") as output_stream:
+                                output_stream.write(payload)
+                                output_stream.flush()
+                                os.fsync(output_stream.fileno())
+                            os.replace(spec["temporary_path"], spec["final_path"])
+                        except OSError as publish_error:
+                            ok = False
+                            error = "atomic_publish:{}".format(
+                                type(publish_error).__name__
+                            )
+                    else:
                         ok = False
-                        error = "atomic_publish:{}".format(type(publish_error).__name__)
+                        error = validation_error or "invalid_dds"
                 else:
-                    ok = False
-                    error = validation_error or "invalid_dds"
+                    valid, validation_error = IMG.validate_dds_file(
+                        spec["temporary_path"],
+                        expected_format=spec["target_format"],
+                        expected_dimensions=spec["input_size"],
+                        require_mipmaps=True,
+                    )
+                    if valid:
+                        try:
+                            os.replace(spec["temporary_path"], spec["final_path"])
+                        except OSError as publish_error:
+                            ok = False
+                            error = "atomic_publish:{}".format(
+                                type(publish_error).__name__
+                            )
+                    else:
+                        ok = False
+                        error = validation_error or "invalid_dds"
             if not ok:
                 try:
                     os.remove(spec["temporary_path"])
@@ -1331,6 +1609,54 @@ class _StreamingConversionRunner:
                 error,
             )
         return normalized
+
+    def _release_shared_spec(self, spec):
+        input_region = spec.get("input_region")
+        output_region = spec.get("output_region")
+        for region in (input_region, output_region):
+            if region is not None:
+                region.close()
+        if self.shared_memory_budget is not None:
+            self.shared_memory_budget.release(spec.get("shared_memory_bytes", 0))
+
+    def _resize_shared_output(self, spec, required_bytes):
+        """Retry one shared-memory item once when ASHelper reports its size."""
+        if self.shared_memory_budget is None:
+            return False
+        required_bytes = int(required_bytes)
+        old_output = spec.get("output_region")
+        if old_output is None or required_bytes <= old_output.size_bytes:
+            return False
+        input_region = spec.get("input_region")
+        if input_region is None:
+            return False
+        old_total = int(spec.get("shared_memory_bytes", 0) or 0)
+        old_output.close()
+        self.shared_memory_budget.release(old_total)
+        new_total = input_region.size_bytes + required_bytes
+        if not self.shared_memory_budget.acquire(new_total, timeout=5.0):
+            # The old region is deliberately not recreated here.  The caller
+            # will route this item through the normal CPU fallback.
+            spec["output_region"] = None
+            spec["shared_memory_bytes"] = 0
+            return False
+        try:
+            new_output = SHMEM.SharedMemoryRegion(required_bytes, label="dds_output_retry")
+        except Exception:
+            self.shared_memory_budget.release(new_total)
+            spec["output_region"] = None
+            spec["shared_memory_bytes"] = 0
+            return False
+        spec["output_region"] = new_output
+        spec["shared_memory_bytes"] = new_total
+        spec["request"]["output_shared_memory"] = new_output.descriptor(
+            width=spec["input_size"][0],
+            height=spec["input_size"][1],
+            pixel_format=SHMEM.DEFAULT_OUTPUT_PIXEL_FORMAT,
+            used_bytes=0,
+            read_only=False,
+        )
+        return True
 
     def finish(self):
         if UI.red_flag:
@@ -3601,6 +3927,16 @@ def _start_full_pipeline(tile, include_overlays):
             ),
             "gpu_batch_wait_ms": int(
                 getattr(tile, "gpu_batch_wait_ms", gpu_batch_wait_ms)
+            ),
+            "enable_shared_memory_handoff": bool(
+                getattr(
+                    tile,
+                    "enable_shared_memory_handoff",
+                    enable_shared_memory_handoff,
+                )
+            ),
+            "shared_memory_budget_gb": int(
+                getattr(tile, "shared_memory_budget_gb", shared_memory_budget_gb)
             ),
             "max_convert_slots": int(getattr(tile, "max_convert_slots", max_convert_slots)),
             "max_download_slots": int(getattr(tile, "max_download_slots", max_download_slots)),

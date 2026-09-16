@@ -215,13 +215,13 @@ def dds_format_support_error(dds_converter, dds_format):
     return None
 
 
-def validate_dds_file(
-    path,
+def validate_dds_bytes(
+    payload,
     expected_format=None,
     expected_dimensions=None,
     require_mipmaps=False,
 ):
-    """Validate a compressed DDS header and its complete payload size.
+    """Validate DDS bytes and their complete compressed payload size.
 
     A converter returning zero is not sufficient evidence that the output is
     usable.  This check intentionally accepts both legacy DXT headers and the
@@ -229,13 +229,11 @@ def validate_dds_file(
     mismatched output before a tile can be activated.
     """
     try:
-        if not os.path.isfile(path):
-            return False, "DDS output is missing"
-        file_size = os.path.getsize(path)
+        data = bytes(payload)
+        file_size = len(data)
         if file_size < 128:
             return False, f"DDS output is too small ({file_size} bytes)"
-        with open(path, "rb") as stream:
-            header = stream.read(148)
+        header = data[:148]
         if len(header) < 128 or header[:4] != b"DDS ":
             return False, "DDS magic/header is missing"
         if struct.unpack_from("<I", header, 4)[0] != 124:
@@ -319,6 +317,28 @@ def validate_dds_file(
     except (OSError, struct.error, ValueError) as error:
         return False, f"could not validate DDS: {error}"
     return True, None
+
+
+def validate_dds_file(
+    path,
+    expected_format=None,
+    expected_dimensions=None,
+    require_mipmaps=False,
+):
+    """Read and validate one DDS file using the common byte validator."""
+    try:
+        if not os.path.isfile(path):
+            return False, "DDS output is missing"
+        with open(path, "rb") as stream:
+            payload = stream.read()
+    except OSError as error:
+        return False, f"could not validate DDS: {error}"
+    return validate_dds_bytes(
+        payload,
+        expected_format=expected_format,
+        expected_dimensions=expected_dimensions,
+        require_mipmaps=require_mipmaps,
+    )
 
 
 def read_dds_dimensions(path):
