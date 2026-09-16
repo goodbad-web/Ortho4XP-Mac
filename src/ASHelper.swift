@@ -3880,7 +3880,7 @@ struct RasterBlurParams {
     uint height;
     uint stride;
     uint radius;
-    bool vertical;
+    uint vertical;
 };
 
 kernel void o4_raster_blur_u8(
@@ -3896,7 +3896,7 @@ kernel void o4_raster_blur_u8(
     for (int offset = -radius; offset <= radius; offset++) {
         int x = int(gid.x);
         int y = int(gid.y);
-        if (params.vertical) y += offset;
+        if (params.vertical != 0) y += offset;
         else x += offset;
         if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
         value += float(input[y * int(params.stride) + x]) * weights[offset + radius];
@@ -3917,7 +3917,7 @@ kernel void o4_raster_blur_f32(
     for (int offset = -radius; offset <= radius; offset++) {
         int x = int(gid.x);
         int y = int(gid.y);
-        if (params.vertical) y += offset;
+        if (params.vertical != 0) y += offset;
         else x += offset;
         if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
         value += input[y * int(params.stride) + x] * weights[offset + radius];
@@ -3945,7 +3945,7 @@ private struct RasterBlurParams {
     var height: UInt32
     var stride: UInt32
     var radius: UInt32
-    var vertical: Bool
+    var vertical: UInt32
 }
 
 private final class RasterMetalRuntime {
@@ -4042,7 +4042,7 @@ private final class RasterMetalRuntime {
                 height: UInt32(height),
                 stride: UInt32(stride),
                 radius: UInt32(radius),
-                vertical: vertical
+                vertical: vertical ? 1 : 0
             )
             encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(input, offset: 0, index: 0)
@@ -4158,7 +4158,10 @@ private final class RasterMetalRuntime {
                     let destinationOffset = row * stride
                     let sourceOffset = row * width * MemoryLayout<Float>.size
                     destination.baseAddress!.advanced(by: destinationOffset)
-                        .assign(from: source.baseAddress!.advanced(by: sourceOffset), count: width * MemoryLayout<Float>.size)
+                    .update(
+                        from: source.baseAddress!.advanced(by: sourceOffset),
+                        count: width * MemoryLayout<Float>.size
+                    )
                 }
             }
         }

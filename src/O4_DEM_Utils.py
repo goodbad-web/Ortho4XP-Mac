@@ -4,6 +4,8 @@ import time
 import requests
 import zipfile
 import itertools
+import shutil
+import tempfile
 from math import sqrt
 import array
 import numpy
@@ -17,6 +19,53 @@ except:
 from PIL import Image
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
+
+
+def _resident_dem_smoothing(server, raster, mask_array, kernel):
+    """Try the resident ASHelper Metal raster operation for one DEM window."""
+    if server is None or getattr(server, "gpu_disabled", False):
+        return None
+    try:
+        from O4_ASHelper_Server import raster_batch
+
+        os.makedirs(FNAMES.Tmp_dir, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix=".dem-smooth-", dir=FNAMES.Tmp_dir)
+        input_path = os.path.join(workdir, "input.raw")
+        mask_path = os.path.join(workdir, "mask.raw")
+        output_path = os.path.join(workdir, "output.raw")
+        numpy.asarray(raster, dtype=numpy.float32, order="C").tofile(input_path)
+        numpy.asarray(mask_array * 255.0, dtype=numpy.uint8, order="C").tofile(mask_path)
+        height, width = raster.shape
+        response = raster_batch(
+            server,
+            "dem_smooth_batch",
+            [
+                {
+                    "id": "dem-smooth",
+                    "input": input_path,
+                    "mask": mask_path,
+                    "output": output_path,
+                    "width": int(width),
+                    "height": int(height),
+                    "stride": int(width * numpy.dtype(numpy.float32).itemsize),
+                    "mask_stride": int(width),
+                    "kernel": [float(value) for value in kernel],
+                }
+            ],
+        )
+        result = (response.get("results") or [{}])[0]
+        if not result.get("ok") or not os.path.isfile(output_path):
+            return None
+        output = numpy.fromfile(output_path, dtype=numpy.float32)
+        if output.size != height * width:
+            return None
+        return output.reshape((height, width)).copy()
+    except Exception as error:
+        UI.vprint(2, "Metal DEM smoothing fallback due to error:", error)
+        return None
+    finally:
+        if "workdir" in locals():
+            shutil.rmtree(workdir, ignore_errors=True)
 
 available_sources = (
     "View",
@@ -1006,7 +1055,13 @@ def upsample(alt_dem):
     return alt_dem_tmp
 
 ################################################################################
-def smoothen(raster, pix_width, mask_im, preserve_boundary=True):
+def smoothen(
+    raster,
+    pix_width,
+    mask_im,
+    preserve_boundary=True,
+    ashelper_server=None,
+):
     if not pix_width:
         return raster
     if not mask_im:
@@ -1019,7 +1074,18 @@ def smoothen(raster, pix_width, mask_im, preserve_boundary=True):
     tmp = tmp * mask_array
     tmpw = numpy.array(mask_array)
     use_gpu = getattr(UI, "use_gpu_for_dem_smoothing", False)
-    if use_gpu:
+    resident_gpu_result = None
+    if use_gpu and ashelper_server is not None:
+        resident_gpu_result = _resident_dem_smoothing(
+            ashelper_server,
+            numpy.array(raster),
+            mask_array,
+            kernel,
+        )
+    if resident_gpu_result is not None:
+        tmp = resident_gpu_result
+        use_gpu = True
+    elif use_gpu:
         try:
             import cv2
             gpu_tmp = cv2.UMat(tmp)
@@ -1044,12 +1110,13 @@ def smoothen(raster, pix_width, mask_im, preserve_boundary=True):
             tmpw[i] = numpy.convolve(tmpw[i], kernel)[pix_width:-pix_width]
         tmp = tmp.transpose()
         tmpw = tmpw.transpose()
-    tmp[mask_array != 0] = (
-        mask_array[mask_array != 0]
-        * tmp[mask_array != 0]
-        / tmpw[mask_array != 0]
-        + (1 - mask_array[mask_array != 0]) * raster[mask_array != 0]
-    )
+    if resident_gpu_result is None:
+        tmp[mask_array != 0] = (
+            mask_array[mask_array != 0]
+            * tmp[mask_array != 0]
+            / tmpw[mask_array != 0]
+            + (1 - mask_array[mask_array != 0]) * raster[mask_array != 0]
+        )
     if preserve_boundary:
         for i in range(pix_width):
             tmp[i] = (

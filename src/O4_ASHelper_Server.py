@@ -246,6 +246,18 @@ class ASHelperJSONLServer:
             }
         )
 
+    def mask_blur_batch(
+        self,
+        tasks: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        return raster_batch(self, "mask_blur_batch", tasks)
+
+    def dem_smooth_batch(
+        self,
+        tasks: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        return raster_batch(self, "dem_smooth_batch", tasks)
+
     def disable_gpu(self) -> None:
         with self._lock:
             self._gpu_disabled = True
@@ -276,3 +288,19 @@ class ASHelperJSONLServer:
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self.close()
         return False
+
+
+def raster_batch(
+    server: ASHelperJSONLServer,
+    operation: str,
+    tasks: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Send a raw-raster batch while keeping the protocol details local."""
+    return server.request(
+        {
+            "id": "batch-{}".format(uuid.uuid4().hex),
+            "op": operation,
+            "gpu": True,
+            "tasks": [dict(task) for task in tasks],
+        }
+    )

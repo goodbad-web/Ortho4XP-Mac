@@ -135,6 +135,7 @@ class TileConversionScheduler:
         if self._closed.is_set() or self._cancelled.is_set():
             self._record(task, False, "cancelled", "scheduler_closed")
             return False
+        wait_started = time.perf_counter()
         if timeout is None:
             while True:
                 if self._closed.is_set() or self._cancelled.is_set():
@@ -151,6 +152,11 @@ class TileConversionScheduler:
             except queue.Full:
                 self._record(task, False, "scheduler", "queue_full")
                 return False
+        if self.metrics is not None and hasattr(self.metrics, "record_queue_wait"):
+            self.metrics.record_queue_wait(
+                "input",
+                (time.perf_counter() - wait_started) * 1000.0,
+            )
         self._record_queue(self._input, "input")
         return True
 

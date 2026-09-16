@@ -9,7 +9,8 @@ import threading
 import tempfile
 import re
 import traceback
-from contextlib import nullcontext
+import multiprocessing
+from contextlib import contextmanager, nullcontext
 from itertools import count
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
@@ -585,6 +586,23 @@ def _ashelper_tensorops_available(as_helper):
     return bool(_ashelper_capabilities(as_helper).get("tensorops_available"))
 
 
+def _opencl_capabilities():
+    """Report OpenCL build/runtime flags without forcing a device dispatch."""
+    try:
+        import cv2
+
+        return {
+            "opencl_compiled": bool(cv2.ocl.haveOpenCL()),
+            "opencl_enabled": bool(cv2.ocl.useOpenCL()),
+        }
+    except Exception as error:
+        return {
+            "opencl_compiled": False,
+            "opencl_enabled": False,
+            "opencl_probe_error": type(error).__name__,
+        }
+
+
 def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
     """Build CPU conversion arguments while retaining prepared image work."""
     fallback_convert_list = []
@@ -679,6 +697,47 @@ def _streaming_batch_wait_ms(tile):
         0,
         int(getattr(tile, "gpu_batch_wait_ms", gpu_batch_wait_ms) or 0),
     )
+
+
+def _start_ashelper_jsonl_server(tile, metrics=None):
+    """Start one tile-local ASHelper process for raster/GPU work when useful."""
+    use_gpu = bool(
+        getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
+    )
+    wants_server = bool(
+        use_gpu
+        and (
+            getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
+            or getattr(tile, "use_gpu_for_masks", False)
+            or getattr(tile, "use_gpu_for_dem_smoothing", False)
+        )
+    )
+    if not wants_server:
+        return None
+    as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+    if not os.path.isfile(as_helper) or not os.access(as_helper, os.X_OK):
+        return None
+    capabilities = _ashelper_capabilities(as_helper)
+    capabilities.update(_opencl_capabilities())
+    if metrics is not None:
+        metrics.set_capabilities(capabilities)
+    if not capabilities.get("metal_available", False):
+        return None
+    try:
+        server = ASHelperJSONLServer(
+            as_helper,
+            logger=lambda message: UI.vprint(1, message),
+        )
+        server.start()
+        tile._ashelper_jsonl_server = server
+        return server
+    except Exception as error:
+        UI.vprint(
+            1,
+            "WARNING: ASHelper JSONL server could not start; retaining CPU/OpenCL "
+            "fallbacks: {}".format(error),
+        )
+        return None
 
 
 def _conversion_worker_config(tile, effective_gpu):
@@ -795,6 +854,11 @@ def _build_streaming_gpu_spec(task_id, item, dds_format):
             has_alpha = mask_image.convert("L").getextrema()[0] < 255
     target_format = IMG.resolve_dds_format(dds_format, has_alpha)
     if target_format not in ("BC1", "BC3"):
+        if generated_mask_path:
+            try:
+                os.remove(generated_mask_path)
+            except OSError:
+                pass
         return None
 
     final_path = os.path.join(tile.build_dir, "textures", out_file_name)
@@ -863,8 +927,13 @@ class _StreamingConversionRunner:
             and (not gpu_requested or self.capabilities.get("metal_available", False))
         )
         self.gpu_server = None
+        self._owns_gpu_server = False
+        shared_server = getattr(tile, "_ashelper_jsonl_server", None)
+        if shared_server is not None and not shared_server.gpu_disabled:
+            self.gpu_server = shared_server
         if (
-            gpu_requested
+            self.gpu_server is None
+            and gpu_requested
             and self.effective_gpu
             and os.path.isfile(self.as_helper)
             and os.access(self.as_helper, os.X_OK)
@@ -875,6 +944,7 @@ class _StreamingConversionRunner:
                     logger=lambda message: UI.vprint(1, message),
                 )
                 self.gpu_server.start()
+                self._owns_gpu_server = True
             except Exception as error:
                 UI.vprint(
                     1,
@@ -947,7 +1017,11 @@ class _StreamingConversionRunner:
         )
 
     def _gpu_eligible(self, task):
-        if self.gpu_server is None or self.gpu_server.gpu_disabled:
+        if (
+            self.gpu_server is None
+            or self.gpu_server.gpu_disabled
+            or self.dds_converter != "TextureConverter"
+        ):
             return False
         item = task.payload
         try:
@@ -1048,7 +1122,7 @@ class _StreamingConversionRunner:
                 success = True
             return success, results
         finally:
-            if self.gpu_server is not None:
+            if self.gpu_server is not None and self._owns_gpu_server:
                 self.gpu_server.close()
             if UI.red_flag or self.scheduler.error is not None:
                 self.pool.terminate()
@@ -2039,7 +2113,7 @@ def _build_tile(tile, persist_config=True):
             metrics = getattr(tile, "_performance_metrics", None)
             if metrics is not None:
                 metrics.set_capabilities(
-                    dict(capabilities, opencl_available=None)
+                    dict(capabilities, **_opencl_capabilities())
                 )
             gpu_batch_enabled = gpu_batch_requested and metal_available
             effective_gpu = use_gpu and (
@@ -2803,25 +2877,6 @@ def _report_metrics_failure(tile):
 
 ################################################################################
 def _start_full_pipeline(tile, include_overlays):
-    try:
-        IMG.validate_imagery_cache_settings()
-    except ValueError as error:
-        UI.vprint(
-            0,
-            UI.ui_text(
-                "ERROR: Invalid imagery cache settings: {}".format(error),
-                "エラー: 画像キャッシュ設定が不正です: {}".format(error),
-            ),
-        )
-        return 0
-    if not _recover_build_transaction(tile):
-        UI.exit_message_and_bottom_line(
-            UI.ui_text(
-                "ERROR: The previous tile build could not be recovered.",
-                "エラー: 前回のタイルビルドを復元できませんでした。",
-            )
-        )
-        return 0
     metrics = PERF.PerformanceMetrics(tile, "all_in_one")
     tile._performance_metrics = metrics
     metrics.set_config(
@@ -2838,16 +2893,70 @@ def _start_full_pipeline(tile, include_overlays):
             ),
             "max_convert_slots": int(getattr(tile, "max_convert_slots", max_convert_slots)),
             "max_download_slots": int(getattr(tile, "max_download_slots", max_download_slots)),
+            "enable_parallel_overlay": bool(
+                getattr(tile, "enable_parallel_overlay", enable_parallel_overlay)
+            ),
+            "max_parallel_tiles": int(
+                getattr(tile, "max_parallel_tiles", max_parallel_tiles)
+            ),
+            "dds_converter": getattr(
+                tile, "dds_converter", getattr(UI, "dds_converter", "nvcompress")
+            ),
+            "dds_format": getattr(tile, "dds_format", getattr(UI, "dds_format", "BC3")),
+            "use_gpu_acceleration": bool(
+                getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
+            ),
+            "use_gpu_for_masks": bool(getattr(tile, "use_gpu_for_masks", False)),
+            "use_gpu_for_dem_smoothing": bool(
+                getattr(tile, "use_gpu_for_dem_smoothing", False)
+            ),
         }
     )
-    UI.is_building_all = True
-    UI.initialize_build_log(tile.build_dir, tile)
     try:
-        return _build_all(tile, include_overlays=include_overlays)
+        try:
+            IMG.validate_imagery_cache_settings()
+        except ValueError as error:
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Invalid imagery cache settings: {}".format(error),
+                    "エラー: 画像キャッシュ設定が不正です: {}".format(error),
+                ),
+            )
+            metrics.fail(error)
+            return 0
+        if not _recover_build_transaction(tile):
+            UI.exit_message_and_bottom_line(
+                UI.ui_text(
+                    "ERROR: The previous tile build could not be recovered.",
+                    "エラー: 前回のタイルビルドを復元できませんでした。",
+                )
+            )
+            metrics.fail(RuntimeError("transaction recovery failed"))
+            return 0
+        _start_ashelper_jsonl_server(tile, metrics=metrics)
+        UI.is_building_all = True
+        UI.initialize_build_log(tile.build_dir, tile)
+        result = _build_all(tile, include_overlays=include_overlays)
+        if not result:
+            failure = getattr(tile, "last_pipeline_failure", None) or {}
+            metrics.fail(
+                RuntimeError(
+                    "{}: {}".format(
+                        failure.get("stage", "tile pipeline"),
+                        failure.get("error") or "stage returned failure",
+                    )
+                )
+            )
+        return result
     finally:
         UI.is_building_all = False
         UI.is_working = 0
-        UI.flush_build_log(tile.build_dir)
+        try:
+            UI.flush_build_log(tile.build_dir)
+        except Exception as error:
+            metrics.fail(error)
+            UI.vprint(1, "WARNING: Could not flush tile build log:", error)
         try:
             metrics.write(
                 os.path.join(tile.build_dir, "Ortho4XP_performance.json"),
@@ -2855,6 +2964,13 @@ def _start_full_pipeline(tile, include_overlays):
             )
         except Exception as error:
             UI.vprint(1, "WARNING: Could not write performance metrics:", error)
+        server = getattr(tile, "_ashelper_jsonl_server", None)
+        if server is not None:
+            server.close()
+            try:
+                delattr(tile, "_ashelper_jsonl_server")
+            except AttributeError:
+                pass
 
 
 def build_all(tile):
@@ -3294,7 +3410,7 @@ def _build_all(tile, include_overlays=True):
             else nullcontext()
         )
         with overlay_context:
-            overlay_result = OVL.build_overlay(tile.lat, tile.lon)
+            overlay_result = _build_overlay_stage(tile)
         if not overlay_result or UI.red_flag:
             _report_pipeline_failure(tile, "overlay extraction")
             return 0
@@ -3345,6 +3461,297 @@ def _run_batch_stage(tile, stage_name, stage):
     return False
 
 
+def _overlay_worker_entry(
+    lat,
+    lon,
+    custom_overlay_src,
+    ovl_exclude_pol,
+    ovl_exclude_net,
+    result_queue,
+):
+    """Run overlay extraction with process-local UI/module state."""
+    try:
+        import O4_Overlay_Utils as overlay_utils
+        import O4_UI_Utils as ui_utils
+
+        ui_utils.is_working = 0
+        ui_utils.red_flag = False
+        overlay_utils.custom_overlay_src = custom_overlay_src
+        overlay_utils.ovl_exclude_pol = list(ovl_exclude_pol)
+        overlay_utils.ovl_exclude_net = list(ovl_exclude_net)
+        result_queue.put(int(bool(overlay_utils.build_overlay(lat, lon))))
+    except Exception:
+        result_queue.put(0)
+
+
+def _build_overlay_stage(tile):
+    """Use the historical serial overlay path unless explicitly opted in."""
+    if not getattr(tile, "enable_parallel_overlay", enable_parallel_overlay):
+        return OVL.build_overlay(tile.lat, tile.lon)
+    # A parallel tile worker already has isolated process state. Nesting a
+    # second child here would only add startup cost and lose useful logging.
+    if getattr(tile, "_parallel_tile_worker", False):
+        return OVL.build_overlay(tile.lat, tile.lon)
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_overlay_worker_entry,
+        args=(
+            tile.lat,
+            tile.lon,
+            getattr(OVL, "custom_overlay_src", ""),
+            getattr(OVL, "ovl_exclude_pol", []),
+            getattr(OVL, "ovl_exclude_net", []),
+            result_queue,
+        ),
+        name="Ortho4XP-overlay-{}".format(FNAMES.short_latlon(tile.lat, tile.lon)),
+    )
+    process.start()
+    try:
+        while process.is_alive():
+            if UI.red_flag:
+                process.terminate()
+                process.join(timeout=2)
+                return 0
+            process.join(timeout=0.1)
+        try:
+            return int(result_queue.get(timeout=1))
+        except Exception:
+            return 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=2)
+        result_queue.close()
+
+
+@contextmanager
+def _host_gpu_semaphore(enabled):
+    """Serialize GPU-owning work across opt-in tile worker processes."""
+    if not enabled:
+        yield
+        return
+    file_descriptor = None
+    try:
+        import fcntl
+
+        semaphore_path = os.path.join(tempfile.gettempdir(), ".ortho4xp-gpu-semaphore")
+        file_descriptor = os.open(semaphore_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+        yield
+    except (ImportError, OSError):
+        # The normal single-tile path remains usable on platforms without
+        # advisory file locks; the child processes still have isolated state.
+        yield
+    finally:
+        if file_descriptor is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+
+
+def _parallel_tile_worker(payload):
+    """Build one tile in a spawn-isolated process for opt-in batch mode."""
+    try:
+        import O4_Config_Utils as CFG
+        import O4_UI_Utils as worker_ui
+
+        lat = int(payload["lat"])
+        lon = int(payload["lon"])
+        tile = CFG.Tile(lat, lon, payload.get("custom_build_dir", ""))
+        for name, value in payload.get("tile_values", {}).items():
+            if hasattr(tile, name):
+                setattr(tile, name, value)
+        if payload.get("do_ptc") and not tile.read_from_config():
+            return lat, lon, False, "tile config could not be read"
+        tile.build_dir = FNAMES.build_dir(lat, lon, tile.custom_build_dir)
+        tile.make_dirs()
+        tile._parallel_tile_worker = True
+        worker_ui.is_working = 0
+        worker_ui.red_flag = False
+
+        stages = []
+        if payload.get("do_osm"):
+            stages.append(("vector data", VMAP.build_poly_file))
+        if payload.get("do_mesh"):
+            stages.append(("mesh", MESH.build_mesh))
+        if payload.get("do_mask"):
+            stages.append(("water masks", MASK.build_masks))
+        if payload.get("do_dsf"):
+            stages.append(("imagery/DSF", lambda current_tile: build_tile(current_tile)))
+        if payload.get("do_ovl"):
+            stages.append(
+                (
+                    "overlay extraction",
+                    lambda current_tile: _build_overlay_stage(current_tile),
+                )
+            )
+
+        uses_gpu = bool(
+            getattr(tile, "use_gpu_acceleration", False)
+            or getattr(tile, "use_gpu_for_masks", False)
+            or getattr(tile, "use_gpu_for_dem_smoothing", False)
+            or getattr(tile, "enable_streaming_conversion", False)
+        )
+        with _host_gpu_semaphore(uses_gpu):
+            for stage_name, stage in stages:
+                try:
+                    succeeded = bool(stage(tile))
+                except Exception as error:
+                    return lat, lon, False, "{}: {}".format(stage_name, error)
+                if not succeeded or worker_ui.red_flag:
+                    return lat, lon, False, "{} failed".format(stage_name)
+        return lat, lon, True, None
+    except Exception as error:
+        return int(payload.get("lat", 0)), int(payload.get("lon", 0)), False, str(error)
+
+
+def _build_tile_list_parallel(
+    tile,
+    list_lat_lon,
+    do_osm,
+    do_mesh,
+    do_mask,
+    do_dsf,
+    do_ovl,
+    do_ptc,
+    worker_count,
+):
+    """Run explicit multi-tile batches with isolated UI/module state.
+
+    The tile workers are direct children of the caller rather than Pool
+    workers.  A tile may itself create the historical DDS conversion pool (or
+    the streaming CPU pool), and Python's daemon Pool workers are prohibited
+    from creating children on macOS spawn.
+    """
+    try:
+        import O4_Config_Utils as CFG
+
+        tile_values = {
+            name: getattr(tile, name)
+            for name in CFG.list_tile_vars
+            if hasattr(tile, name)
+        }
+    except Exception:
+        tile_values = {}
+    payloads = [
+        {
+            "lat": lat,
+            "lon": lon,
+            "custom_build_dir": tile.custom_build_dir,
+            "tile_values": tile_values,
+            "do_osm": do_osm,
+            "do_mesh": do_mesh,
+            "do_mask": do_mask,
+            "do_dsf": do_dsf,
+            "do_ovl": do_ovl,
+            "do_ptc": do_ptc,
+        }
+        for lat, lon in list_lat_lon
+    ]
+    context = multiprocessing.get_context("spawn")
+    failed = False
+    completed = 0
+    for batch_start in range(0, len(payloads), worker_count):
+        batch = payloads[batch_start : batch_start + worker_count]
+        result_queue = context.Queue()
+        processes = []
+        raw_results = []
+        try:
+            for payload in batch:
+                process = context.Process(
+                    target=_parallel_tile_worker,
+                    args=(payload,),
+                    name="Ortho4XP-tile-{}".format(
+                        FNAMES.short_latlon(payload["lat"], payload["lon"])
+                    ),
+                )
+                process.start()
+                processes.append(process)
+
+            active = list(processes)
+            while active:
+                if UI.red_flag:
+                    for process in active:
+                        if process.is_alive():
+                            process.terminate()
+                    for process in active:
+                        process.join(timeout=2)
+                    UI.exit_message_and_bottom_line(
+                        UI.ui_text(
+                            "ERROR: Parallel batch build cancelled.",
+                            "エラー: 並列バッチビルドをキャンセルしました。",
+                        )
+                    )
+                    return 0
+                try:
+                    raw_results.append(result_queue.get(timeout=0.2))
+                except queue.Empty:
+                    pass
+                for process in list(active):
+                    if not process.is_alive():
+                        process.join()
+                        active.remove(process)
+
+            while True:
+                try:
+                    raw_results.append(result_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            for payload in batch:
+                key = (payload["lat"], payload["lon"])
+                matching = next(
+                    (result for result in raw_results if (result[0], result[1]) == key),
+                    None,
+                )
+                if matching is None:
+                    result = (
+                        payload["lat"],
+                        payload["lon"],
+                        False,
+                        "worker exited without a result",
+                    )
+                else:
+                    result = matching
+                lat, lon, succeeded, detail = result
+                completed += 1
+                UI.vprint(
+                    1,
+                    "Parallel tile {}/{}: {}".format(
+                        completed, len(payloads), FNAMES.short_latlon(lat, lon)
+                    ),
+                )
+                if not succeeded:
+                    failed = True
+                    UI.lvprint(
+                        0,
+                        UI.ui_text(
+                            "ERROR: Parallel tile {} failed: {}".format(
+                                FNAMES.short_latlon(lat, lon), detail or "unknown error"
+                            ),
+                            "エラー: 並列タイル {} に失敗しました: {}".format(
+                                FNAMES.short_latlon(lat, lon), detail or "不明なエラー"
+                            ),
+                        ),
+                    )
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=2)
+            result_queue.close()
+            result_queue.join_thread()
+    return 0 if failed else 1
+
+
 ################################################################################
 def build_tile_list(
     tile, list_lat_lon, do_osm, do_mesh, do_mask, do_dsf, do_ovl, do_ptc
@@ -3352,6 +3759,27 @@ def build_tile_list(
     if UI.is_working:
         return 0
     UI.red_flag = 0
+    requested_parallel_tiles = int(
+        getattr(tile, "max_parallel_tiles", max_parallel_tiles) or 1
+    )
+    if requested_parallel_tiles > 1 and len(list_lat_lon) > 1:
+        worker_count = min(2, requested_parallel_tiles, len(list_lat_lon))
+        UI.vprint(
+            0,
+            "-> Starting isolated parallel tile workers:",
+            worker_count,
+        )
+        return _build_tile_list_parallel(
+            tile,
+            list_lat_lon,
+            do_osm,
+            do_mesh,
+            do_mask,
+            do_dsf,
+            do_ovl,
+            do_ptc,
+            worker_count,
+        )
     timer = time.time()
     UI.lvprint(
         0, "Batch build launched for a number of", len(list_lat_lon), "tiles."
@@ -3459,9 +3887,7 @@ def build_tile_list(
             stages.append(
                 (
                     "overlay extraction",
-                    lambda current_tile: OVL.build_overlay(
-                        current_tile.lat, current_tile.lon
-                    ),
+                    _build_overlay_stage,
                 )
             )
 

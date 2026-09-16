@@ -1012,6 +1012,7 @@ def smooth_raster_over_airports(tile, dico_airports, preserve_boundary=True):
             pix,
             airport_im,
             preserve_boundary=False,
+            ashelper_server=getattr(tile, "_ashelper_jsonl_server", None),
         )
     if preserve_boundary:
         pix = max_pix

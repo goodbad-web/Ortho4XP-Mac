@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import queue
+import shutil
+import tempfile
 from math import atan, ceil, floor
 import numpy
 import cv2
@@ -19,6 +21,50 @@ from O4_Parallel_Utils import parallel_execute
 
 mask_altitude_above = 0.5
 masks_build_slots = max(1, (os.cpu_count() or 4) - 2)
+
+
+def _resident_mask_blur(server, img_array, kernel):
+    """Try one Metal separable mask blur through the tile-local ASHelper."""
+    if server is None or getattr(server, "gpu_disabled", False):
+        return None
+    try:
+        from O4_ASHelper_Server import raster_batch
+
+        os.makedirs(FNAMES.Tmp_dir, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix=".mask-blur-", dir=FNAMES.Tmp_dir)
+        input_path = os.path.join(workdir, "input.raw")
+        output_path = os.path.join(workdir, "output.raw")
+        source = numpy.asarray(img_array, dtype=numpy.uint8, order="C")
+        source.tofile(input_path)
+        height, width = source.shape
+        response = raster_batch(
+            server,
+            "mask_blur_batch",
+            [
+                {
+                    "id": "mask-blur",
+                    "input": input_path,
+                    "output": output_path,
+                    "width": int(width),
+                    "height": int(height),
+                    "stride": int(source.strides[0]),
+                    "kernel": [float(value) for value in kernel],
+                }
+            ],
+        )
+        result = (response.get("results") or [{}])[0]
+        if not result.get("ok") or not os.path.isfile(output_path):
+            return None
+        output = numpy.fromfile(output_path, dtype=numpy.uint8)
+        if output.size != height * width:
+            return None
+        return output.reshape((height, width)).copy()
+    except Exception as error:
+        UI.vprint(2, "Metal mask blur fallback due to error:", error)
+        return None
+    finally:
+        if "workdir" in locals():
+            shutil.rmtree(workdir, ignore_errors=True)
 
 ################################################################################
 def mask_name_for_texture(tile, til_x_left, til_y_top, zl, *args):
@@ -531,7 +577,14 @@ def blur_mask(img_array, tile, sea_level):
         kernel = numpy.array(list(range(1, blur_width)) + [blur_width] + list(range(blur_width - 1, 0, -1)), dtype=numpy.float32)
         kernel = kernel / (blur_width ** 2)
         use_gpu = getattr(tile, "use_gpu_for_masks", False)
-        if use_gpu:
+        resident_gpu_result = _resident_mask_blur(
+            getattr(tile, "_ashelper_jsonl_server", None),
+            img_array,
+            kernel,
+        )
+        if resident_gpu_result is not None:
+            b_img_array = resident_gpu_result
+        elif use_gpu:
             try:
                 gpu_img = cv2.UMat(img_array)
                 gpu_blurred = cv2.sepFilter2D(gpu_img, -1, kernel, kernel)

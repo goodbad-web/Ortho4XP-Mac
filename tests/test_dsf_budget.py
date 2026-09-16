@@ -12,6 +12,7 @@ from O4_DSF_Budget import (  # noqa: E402
     MAX_AUTO_REDUCE_ATTEMPTS,
     normalize_budget,
     retry_settings,
+    retry_stage_for_settings,
     stable_id_key,
     summarize_dsf_pools,
     validate_dsf_commands,
@@ -52,6 +53,12 @@ def test_retry_settings_keep_mesh_zoom_as_lower_bound():
         "limit_tris": 1.0,
     }
     assert retry_settings(base, MAX_AUTO_REDUCE_ATTEMPTS, 18)["cover_zl"] == 18
+
+
+def test_retry_stage_uses_conservative_dependency_table():
+    assert retry_stage_for_settings({"curvature_tol", "limit_tris"}) == "mesh"
+    assert retry_stage_for_settings({"cover_zl"}) == "vector data"
+    assert retry_stage_for_settings({"unknown_setting"}) == "vector data"
 
 
 def test_summarize_dsf_pools_separates_budget_from_structural_validity():

@@ -210,6 +210,22 @@ class PerformanceMetrics:
                 if capacity is not None:
                     queue_data["capacity"] = int(capacity)
 
+    def record_queue_wait(self, name: str, duration_ms: float) -> None:
+        with self._lock:
+            target = self._target()
+            targets = [target]
+            if target is not self.data["totals"]:
+                targets.append(self.data["totals"])
+            for current in targets:
+                queue_data = current.setdefault("queue", {}).setdefault(
+                    str(name), {"samples": 0, "max_size": 0}
+                )
+                queue_data["wait_samples"] = queue_data.get("wait_samples", 0) + 1
+                queue_data["wait_ms"] = queue_data.get("wait_ms", 0.0) + float(duration_ms)
+                queue_data["max_wait_ms"] = max(
+                    queue_data.get("max_wait_ms", 0.0), float(duration_ms)
+                )
+
     def fail(self, error: Any) -> None:
         with self._lock:
             self.data["failure"] = {
