@@ -1,3 +1,4 @@
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -208,6 +209,59 @@ def test_recovery_resumes_path_prepared_before_state_update(ram_paths, monkeypat
     assert RAM.recover_orphaned_symlinks() is True
     assert (Path(session.tmp_path) / "original").read_bytes() == b"original"
     assert not Path(RAM._state_path()).exists()
+
+
+def test_recovery_resumes_staged_restore_after_ram_disk_disappears(ram_paths, monkeypatch):
+    session = _session(ram_paths, use_orthophotos=False)
+    session.prepared_paths.add(session.tmp_path)
+    monkeypatch.setattr(RAM, "RAM_DISK_PATH", session.ram_disk_path)
+    ram_root = Path(session.ram_disk_path)
+    ram_root.mkdir()
+    Path(session.tmp_path).symlink_to(session.ram_disk_path)
+    (ram_root / "payload").write_bytes(b"payload")
+    _mock_owned_volume(monkeypatch)
+    monkeypatch.setattr(RAM, "_detach_owned_session", lambda current_session: True)
+
+    original_rename = RAM.os.rename
+
+    def interrupt_staged_rename(source, destination):
+        if ".Ortho4XP_restore_" in str(source):
+            raise KeyboardInterrupt
+        return original_rename(source, destination)
+
+    monkeypatch.setattr(RAM.os, "rename", interrupt_staged_rename)
+    with pytest.raises(KeyboardInterrupt):
+        RAM._cleanup_session(session)
+
+    state = RAM._read_state()
+    staged_destination = state["restore_destinations"][session.tmp_path]
+    assert session.tmp_path in state["restore_ready_paths"]
+    assert Path(staged_destination, "payload").read_bytes() == b"payload"
+    monkeypatch.setattr(RAM.os, "rename", original_rename)
+    shutil.rmtree(session.ram_disk_path)
+    monkeypatch.setattr(RAM, "is_ram_disk_active", lambda path: False)
+
+    assert RAM.recover_orphaned_symlinks() is True
+    assert (Path(session.tmp_path) / "payload").read_bytes() == b"payload"
+    assert not Path(RAM._state_path()).exists()
+
+
+def test_recovery_keeps_state_when_staged_restore_is_incomplete(ram_paths, monkeypatch):
+    session = _session(ram_paths, use_orthophotos=False)
+    session.prepared_paths.add(session.tmp_path)
+    session.restore_destinations[session.tmp_path] = str(
+        Path(ram_paths) / ".Ortho4XP_restore_missing"
+    )
+    monkeypatch.setattr(RAM, "RAM_DISK_PATH", session.ram_disk_path)
+    Path(session.tmp_path).symlink_to(session.ram_disk_path)
+    monkeypatch.setattr(RAM, "is_ram_disk_active", lambda path: False)
+    RAM._write_state(session)
+
+    with pytest.raises(RAM.RamDiskConflict):
+        RAM.recover_orphaned_symlinks()
+
+    assert Path(session.tmp_path).is_symlink()
+    assert Path(RAM._state_path()).exists()
 
 
 def test_recovery_keeps_state_when_merge_fails(ram_paths, monkeypatch):

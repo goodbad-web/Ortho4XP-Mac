@@ -63,6 +63,8 @@ class _RamDiskSession:
     session_id: str
     prepared_paths: set = field(default_factory=set)
     restoring_paths: set = field(default_factory=set)
+    restore_destinations: dict = field(default_factory=dict)
+    restore_ready_paths: set = field(default_factory=set)
     restored_paths: set = field(default_factory=set)
 
     @property
@@ -84,6 +86,8 @@ class _RamDiskSession:
             "use_orthophotos": self.use_orthophotos,
             "prepared_paths": sorted(self.prepared_paths),
             "restoring_paths": sorted(self.restoring_paths),
+            "restore_destinations": dict(self.restore_destinations),
+            "restore_ready_paths": sorted(self.restore_ready_paths),
             "restored_paths": sorted(self.restored_paths),
             "pid": os.getpid(),
         }
@@ -280,6 +284,23 @@ def _remove_state():
 
 
 def _session_from_state(state):
+    restore_destinations = state.get("restore_destinations", {})
+    restore_ready_paths = state.get("restore_ready_paths", [])
+    if (
+        not isinstance(restore_destinations, dict)
+        or any(
+            not isinstance(path, str) or not isinstance(destination, str)
+            for path, destination in restore_destinations.items()
+        )
+        or not isinstance(restore_ready_paths, list)
+        or not all(isinstance(path, str) for path in restore_ready_paths)
+    ):
+        raise RamDiskConflict(
+            _ui_text(
+                "RAM disk state contains an invalid restore record.",
+                "RAMディスク状態に無効な復元記録が含まれています。",
+            )
+        )
     return _RamDiskSession(
         ram_disk_path=state["ram_disk_path"],
         tmp_path=state["tmp_path"],
@@ -292,6 +313,11 @@ def _session_from_state(state):
         session_id=str(state["session_id"]),
         prepared_paths=set(state.get("prepared_paths", [])),
         restoring_paths=set(state.get("restoring_paths", [])),
+        restore_destinations={
+            path: os.path.abspath(destination)
+            for path, destination in restore_destinations.items()
+        },
+        restore_ready_paths=set(restore_ready_paths),
         restored_paths=set(state.get("restored_paths", [])),
     )
 
@@ -304,6 +330,34 @@ def _validate_state_paths(session):
             _ui_text(
                 "RAM disk state points outside the current project paths.",
                 "RAMディスク状態が現在のプロジェクトパス外を指しています。",
+            )
+        )
+    expected_paths = {session.tmp_path, session.ortho_path}
+    project_root = _project_root()
+    for path, destination in session.restore_destinations.items():
+        if path not in expected_paths or not isinstance(destination, str):
+            raise RamDiskConflict(
+                _ui_text(
+                    "RAM disk state contains an invalid restore destination.",
+                    "RAMディスク状態に無効な復元先が含まれています。",
+                )
+            )
+        destination = os.path.abspath(destination)
+        if (
+            os.path.dirname(destination) != project_root
+            or not os.path.basename(destination).startswith(".Ortho4XP_restore_")
+        ):
+            raise RamDiskConflict(
+                _ui_text(
+                    "RAM disk state points to an unsafe restore destination.",
+                    "RAMディスク状態が安全でない復元先を指しています。",
+                )
+            )
+    if not session.restore_ready_paths.issubset(session.restore_destinations):
+        raise RamDiskConflict(
+            _ui_text(
+                "RAM disk state contains an incomplete restore record.",
+                "RAMディスク状態に不完全な復元記録が含まれています。",
             )
         )
 
@@ -762,6 +816,7 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
 
 def _cleanup_session(session):
     _validate_state_paths(session)
+    ram_disk_active = is_ram_disk_active(session.ram_disk_path)
     active = _validate_owned_volume(session, require_active=False)
     path_specs = (
         (
@@ -797,28 +852,85 @@ def _cleanup_session(session):
                 # path was prepared. Leave an untouched normal/missing path
                 # alone and only detach the owned volume during recovery.
                 continue
-        if path in session.restored_paths and _path_exists(path) and not os.path.islink(path):
+        staged_destination = session.restore_destinations.get(path)
+        if (
+            path in session.restored_paths
+            and _path_exists(path)
+            and not os.path.islink(path)
+            and (
+                staged_destination is None
+                or not _path_exists(staged_destination)
+            )
+        ):
             continue
         if (
             path in session.restoring_paths
             and _path_exists(path)
             and not os.path.islink(path)
             and not _path_exists(backup)
+            and (
+                staged_destination is None
+                or not _path_exists(staged_destination)
+            )
         ):
             session.restored_paths.add(path)
             session.restoring_paths.discard(path)
+            session.restore_destinations.pop(path, None)
+            session.restore_ready_paths.discard(path)
             _write_state(session)
             continue
         _ensure_owned_link_or_missing(path, target)
         destination = backup
         staged = False
-        if active and os.path.isdir(source):
+        if staged_destination is not None:
+            destination = staged_destination
+            staged = True
+            if _path_exists(destination) and (
+                os.path.islink(destination) or not os.path.isdir(destination)
+            ):
+                raise RamDiskConflict(
+                    _ui_text(
+                        f"Staged RAM restore destination is not a directory: {destination}",
+                        f"ステージ済みRAM復元先がディレクトリではありません: {destination}",
+                    )
+                )
+            if not _path_exists(destination):
+                if not ram_disk_active or not os.path.isdir(source):
+                    raise RamDiskConflict(
+                        _ui_text(
+                            f"Staged RAM restore data is unavailable: {destination}",
+                            f"ステージ済みRAM復元データが見つかりません: {destination}",
+                        )
+                    )
+                destination = tempfile.mkdtemp(
+                    prefix=".Ortho4XP_restore_",
+                    dir=os.path.dirname(path),
+                )
+                session.restore_destinations[path] = destination
+                session.restore_ready_paths.discard(path)
+                _write_state(session)
+            if path not in session.restore_ready_paths and (
+                not ram_disk_active or not os.path.isdir(source)
+            ):
+                raise RamDiskConflict(
+                    _ui_text(
+                        f"Staged RAM restore data is incomplete: {destination}",
+                        f"ステージ済みRAM復元データが未完成です: {destination}",
+                    )
+                )
+        elif ram_disk_active and os.path.isdir(source):
             if not _path_exists(destination):
                 destination = tempfile.mkdtemp(
                     prefix=".Ortho4XP_restore_",
                     dir=os.path.dirname(path),
                 )
                 staged = True
+                session.restore_destinations[path] = destination
+                session.restore_ready_paths.discard(path)
+                _write_state(session)
+        if ram_disk_active and os.path.isdir(source) and (
+            not staged or path not in session.restore_ready_paths
+        ):
             if path == session.tmp_path:
                 result = merge_directories(
                     source,
@@ -828,12 +940,10 @@ def _cleanup_session(session):
             else:
                 result = merge_directories(source, destination)
             if not result.success:
-                for plan in plans:
-                    if plan[4]:
-                        shutil.rmtree(plan[3], ignore_errors=True)
-                if staged:
-                    shutil.rmtree(destination, ignore_errors=True)
                 raise RamDiskMergeError("; ".join(result.failures))
+            if staged:
+                session.restore_ready_paths.add(path)
+                _write_state(session)
         plans.append((path, target, backup, destination, staged))
 
     for path, target, backup, destination, staged in plans:
@@ -850,6 +960,8 @@ def _cleanup_session(session):
             _restore_owned_path(path, backup, target, source_path=None)
         session.restored_paths.add(path)
         session.restoring_paths.discard(path)
+        session.restore_destinations.pop(path, None)
+        session.restore_ready_paths.discard(path)
         _write_state(session)
 
     if active and not _detach_owned_session(session):
