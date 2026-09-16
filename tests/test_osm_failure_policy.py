@@ -869,6 +869,32 @@ def test_same_layer_queries_are_combined_into_one_request(monkeypatch):
     assert calls == [tuple(queries)]
 
 
+def test_multiple_tuple_queries_are_flattened_into_one_request(monkeypatch):
+    queries = [
+        ('node["aeroway"]', 'way["aeroway"]'),
+        ('rel["aeroway"]', 'way["building"]'),
+    ]
+    calls = []
+
+    def network(query, bbox, server_code=None, return_metadata=False):
+        calls.append(query)
+        result = (_osm_with_node(), _valid_response_info())
+        return result if return_metadata else result[0]
+
+    monkeypatch.setattr(OSM, "get_overpass_data", network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, []
+    ) == OSM.OSM_COMPLETE
+    assert calls == [
+        (
+            'node["aeroway"]',
+            'way["aeroway"]',
+            'rel["aeroway"]',
+            'way["building"]',
+        )
+    ]
+
+
 def test_combined_request_is_not_split_when_it_succeeds(monkeypatch):
     queries = [
         'way["highway"="motorway"]',
@@ -1278,6 +1304,42 @@ def test_invalid_shared_state_waits_safely_before_recreating_it(
     assert sum(isolated_overpass_request_coordinator.sleeps) == pytest.approx(30.0)
     assert set(state) >= {"cooldown_until", "reason", "updated_at"}
     assert state["reason"] == "invalid-state"
+
+
+def test_malformed_200_sets_cooldown_before_releasing_request_slot(monkeypatch):
+    events = []
+
+    class Slot:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("exit")
+
+        def set_cooldown_locked(self, seconds, reason):
+            events.append("cooldown")
+
+    class Coordinator:
+        def slot(self):
+            return Slot()
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response(200, b"<osm>")
+
+    monkeypatch.setattr(OSM, "_overpass_request_coordinator", Coordinator())
+    monkeypatch.setattr(OSM.requests, "Session", lambda: Session())
+    monkeypatch.setattr(OSM, "_server_order", lambda preferred, bbox: ["DE"])
+    monkeypatch.setattr(OSM, "max_osm_tentatives", 1)
+
+    result, metadata = OSM.get_overpass_data(
+        'way["natural"="water"]', (30, 130, 31, 131), return_metadata=True
+    )
+
+    assert result is None
+    assert metadata["reason"] == "all-covered-servers-failed"
+    assert events == ["enter", "cooldown", "exit"]
 
 
 def test_lock_acquisition_failure_never_starts_network_request(

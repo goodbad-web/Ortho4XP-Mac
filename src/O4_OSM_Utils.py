@@ -962,7 +962,13 @@ def _query_group_payload(group):
     group = list(group)
     if len(group) == 1:
         return group[0]
-    return tuple(group)
+    flattened = []
+    for query in group:
+        if isinstance(query, (tuple, list)):
+            flattened.extend(query)
+        else:
+            flattened.append(query)
+    return tuple(flattened)
 
 
 def _query_group_count(query_count):
@@ -2172,6 +2178,9 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
             failure_delay = None
             retry_after = None
             status_code = None
+            data_status = None
+            reason = None
+            counts = None
             try:
                 # POST keeps large vector queries out of URL length limits.
                 with _overpass_request_coordinator.slot() as request_slot:
@@ -2213,51 +2222,47 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                         request_slot.set_cooldown_locked(
                             failure_delay, "HTTP status " + str(status_code)
                         )
-
-                data_status = None
-                reason = None
-                if status_code == 200:
-                    data_status, reason, counts = _inspect_osm_response(content)
-                    if data_status is not None:
-                        metadata = {
-                            "status": data_status,
-                            "data_status": data_status,
-                            "server": true_server_code,
-                            "attempt": attempt_number,
-                            "http_status": 200,
-                            "counts": counts,
-                            "payload_sha256": hashlib.sha256(content).hexdigest(),
-                            "attempts": attempts,
-                        }
-                        UI.logprint(
-                            "[OSM] query=",
-                            query_label,
-                            "success_server=",
-                            true_server_code,
-                            "attempt=",
-                            attempt_number,
-                            "status=200",
-                            "data_status=",
-                            data_status,
+                    if status_code == 200:
+                        data_status, reason, counts = _inspect_osm_response(content)
+                        if data_status is not None:
+                            metadata = {
+                                "status": data_status,
+                                "data_status": data_status,
+                                "server": true_server_code,
+                                "attempt": attempt_number,
+                                "http_status": 200,
+                                "counts": counts,
+                                "payload_sha256": hashlib.sha256(content).hexdigest(),
+                                "attempts": attempts,
+                            }
+                            UI.logprint(
+                                "[OSM] query=",
+                                query_label,
+                                "success_server=",
+                                true_server_code,
+                                "attempt=",
+                                attempt_number,
+                                "status=200",
+                                "data_status=",
+                                data_status,
+                            )
+                            UI.vprint(
+                                2,
+                                "        OSM query succeeded on server",
+                                true_server_code,
+                                "(attempt",
+                                attempt_number,
+                                "):",
+                                query_label,
+                                data_status,
+                            )
+                            return (content, metadata) if return_metadata else content
+                        failure_delay = next_generic_backoff()
+                        request_slot.set_cooldown_locked(
+                            failure_delay, reason or "overpass-failure"
                         )
-                        UI.vprint(
-                            2,
-                            "        OSM query succeeded on server",
-                            true_server_code,
-                            "(attempt",
-                            attempt_number,
-                            "):",
-                            query_label,
-                            data_status,
-                        )
-                        return (content, metadata) if return_metadata else content
-                    failure_delay = next_generic_backoff()
-                    _overpass_request_coordinator.set_cooldown(
-                        failure_delay, reason or "overpass-failure"
-                    )
-                else:
-                    reason = "HTTP status " + str(status_code)
-                    counts = None
+                    else:
+                        reason = "HTTP status " + str(status_code)
                 attempts.append(
                     {
                         "server": true_server_code,
