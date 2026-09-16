@@ -35,6 +35,189 @@ LEGACY_VERSION = 1
 VARIANT_VERSION = 2
 
 
+def _scalar_float(value: object) -> float:
+    """Convert Python, NumPy, or Torch scalar-like values to float."""
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    return float(value)
+
+
+def _tensor_shape(value: object) -> tuple[int, ...]:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        raise FP8SRPackError("weight or bias must expose a shape")
+    return tuple(int(dimension) for dimension in shape)
+
+
+def _tensor_value(value: object, *indices: int) -> float:
+    current = value
+    for index in indices:
+        current = current[index]
+    return _scalar_float(current)
+
+
+def _weight_value(weight_dtype: str, value: float) -> int | float:
+    if not math.isfinite(value):
+        raise FP8SRPackError("weights must contain only finite values")
+    if weight_dtype == "Float16":
+        if abs(value) > 65504.0:
+            raise FP8SRPackError("Float16 weights exceed the finite range")
+        return _round_fp16(value)
+    if weight_dtype == "MetalFloat8E4M3":
+        return encode_fp8_e4m3(value)
+    if weight_dtype == "MetalFloat4E2M1":
+        return encode_fp4_e2m1(value)
+    if weight_dtype == "Int2":
+        return encode_int2(value)
+    raise FP8SRPackError(f"unsupported weight dtype {weight_dtype!r}")
+
+
+def _weight_extension(weight_dtype: str) -> str:
+    return {
+        "Float16": "f16w",
+        "MetalFloat8E4M3": "fp8",
+        "MetalFloat4E2M1": "fp4",
+        "Int2": "int2",
+    }[weight_dtype]
+
+
+def _write_packed_weight(
+    pack: Path,
+    layer_name: str,
+    kernel: int,
+    in_channels: int,
+    out_channels: int,
+    weight_dtype: str,
+    weight: object,
+) -> Path:
+    expected_shape = (out_channels, in_channels, kernel, kernel)
+    if _tensor_shape(weight) != expected_shape:
+        raise FP8SRPackError(
+            f"layer {layer_name}: weight shape must be {expected_shape}, "
+            f"got {_tensor_shape(weight)}"
+        )
+    k_padded = ((kernel * kernel * in_channels + 31) // 32) * 32
+    out_padded = ((out_channels + 31) // 32) * 32
+    packed = bytearray(k_padded * ROW_STRIDE_BYTES)
+    for feature in range(kernel * kernel * in_channels):
+        ky, remainder = divmod(feature, kernel * in_channels)
+        kx, input_channel = divmod(remainder, in_channels)
+        for output_channel in range(out_channels):
+            value = _tensor_value(weight, output_channel, input_channel, ky, kx)
+            encoded = _weight_value(weight_dtype, value)
+            offset = feature * ROW_STRIDE_BYTES
+            if weight_dtype == "Float16":
+                struct.pack_into("<e", packed, offset + output_channel * 2, encoded)
+            elif weight_dtype == "MetalFloat8E4M3":
+                packed[offset + output_channel] = encoded
+            elif weight_dtype == "MetalFloat4E2M1":
+                packed[offset + output_channel // 2] |= encoded << ((output_channel % 2) * 4)
+            else:
+                packed[offset + output_channel // 4] |= encoded << ((output_channel % 4) * 2)
+    destination = pack / f"{layer_name}.{_weight_extension(weight_dtype)}"
+    destination.write_bytes(packed)
+    return destination
+
+
+def _write_packed_bias(
+    pack: Path,
+    layer_name: str,
+    out_channels: int,
+    bias: object,
+) -> Path:
+    if _tensor_shape(bias) != (out_channels,):
+        raise FP8SRPackError(
+            f"layer {layer_name}: bias shape must be {(out_channels,)}, "
+            f"got {_tensor_shape(bias)}"
+        )
+    out_padded = ((out_channels + 31) // 32) * 32
+    data = bytearray(out_padded * 2)
+    for channel in range(out_channels):
+        value = _scalar_float(bias[channel])
+        if not math.isfinite(value):
+            raise FP8SRPackError(f"layer {layer_name}: bias must be finite")
+        if abs(value) > 65504.0:
+            raise FP8SRPackError(f"layer {layer_name}: bias exceeds the Float16 range")
+        struct.pack_into("<e", data, channel * 2, value)
+    destination = pack / f"{layer_name}.f16"
+    destination.write_bytes(data)
+    return destination
+
+
+def write_pack(
+    pack_path: str | Path,
+    layers: list[dict[str, object]],
+    weight_dtype: str,
+    *,
+    metadata: dict[str, object] | None = None,
+) -> Path:
+    """Write a validated FP8SR pack from logical OIHW weights and biases.
+
+    ``layers`` must contain the fixed conv0/conv1/conv2 graph.  For FP8 the
+    values supplied in ``weight`` are the already scaled FP8-domain values;
+    the per-layer ``scale`` is stored in the manifest and applied by ASHelper
+    after TensorOps matmul.
+    """
+    if weight_dtype not in SUPPORTED_WEIGHT_DTYPES:
+        raise FP8SRPackError(f"unsupported weight dtype {weight_dtype!r}")
+    if len(layers) != len(EXPECTED_LAYERS):
+        raise FP8SRPackError("layers must contain exactly conv0, conv1, and conv2")
+    pack = Path(pack_path).expanduser().resolve()
+    pack.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, object] = {
+        "format": "FP8SR",
+        "version": LEGACY_VERSION if weight_dtype == "MetalFloat8E4M3" else VARIANT_VERSION,
+        "upscale_factor": 2,
+        "layout": "NHWC",
+        "input_channels": 3,
+        "output_channels": 3,
+        "weight_dtype": weight_dtype,
+        "activation_dtype": "Float16",
+        "accumulation_dtype": "Float16",
+        "weight_row_stride_bytes": ROW_STRIDE_BYTES,
+        "layers": [],
+    }
+    if metadata:
+        manifest["metadata"] = metadata
+    manifest_layers: list[dict[str, object]] = []
+    for layer, expected in zip(layers, EXPECTED_LAYERS):
+        name, kernel, in_channels, out_channels = expected
+        if layer.get("name") != name:
+            raise FP8SRPackError(f"expected layer {name!r}")
+        scale = _scalar_float(layer.get("scale", 1.0))
+        if not math.isfinite(scale) or scale <= 0:
+            raise FP8SRPackError(f"layer {name}: scale must be finite and positive")
+        weight_path = _write_packed_weight(
+            pack,
+            name,
+            kernel,
+            in_channels,
+            out_channels,
+            weight_dtype,
+            layer["weight"],
+        )
+        bias_path = _write_packed_bias(pack, name, out_channels, layer["bias"])
+        manifest_layers.append(
+            {
+                "name": name,
+                "kernel": kernel,
+                "in_channels": in_channels,
+                "out_channels": out_channels,
+                "weights": weight_path.name,
+                "bias": bias_path.name,
+                "scale": scale,
+            }
+        )
+    manifest["layers"] = manifest_layers
+    (pack / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    validate_pack(pack)
+    return pack
+
+
 def _load_manifest(pack: Path) -> dict:
     manifest_path = pack / "manifest.json"
     if not manifest_path.is_file():

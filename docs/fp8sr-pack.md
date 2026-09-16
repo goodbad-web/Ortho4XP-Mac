@@ -70,3 +70,50 @@ Core MLのコンパイル済み参照モデル（`.mlmodelc`）を明示した�
 ## Core ML参照モデル
 
 Core MLは参照品質の検証ランナーから明示的に指定する場合だけ使用する想定です。Core MLモデルがFP8であってもNeural Engine実行は保証されないため、Core ML実行をFP8高速化の証拠にはしません。通常のOrtho4XP実行へCore ML依存を追加しない方針です。
+
+## FP16学習からFP8SR生成
+
+実用モデルを作る場合は、通常のOrtho4XP依存へPyTorchを追加せず、学習用依存だけを導入します。
+
+```sh
+.venv/bin/python -m pip install -r requirements-train.txt
+```
+
+学習データはLR/HRの相対パス対応ペアで、HRがLRの正確な2倍である必要があります。
+
+```text
+dataset/
+  train/lr/
+  train/hr/
+  val/lr/
+  val/hr/
+```
+
+学習・FP16パック生成・FP8量子化・validation検証を個別に実行できます。
+
+```sh
+.venv/bin/python tools/train_fp8sr.py train \
+  --dataset /path/to/aerial-pairs \
+  --output-dir /private/tmp/ortho4xp-fp8sr-training \
+  --device auto
+
+.venv/bin/python tools/train_fp8sr.py export-fp16 \
+  --checkpoint /private/tmp/ortho4xp-fp8sr-training/fp16_best.safetensors \
+  --output-pack /private/tmp/ortho4xp-fp8sr-training/fp16-pack
+
+.venv/bin/python tools/train_fp8sr.py quantize-fp8 \
+  --checkpoint /private/tmp/ortho4xp-fp8sr-training/fp16_best.safetensors \
+  --output-pack /private/tmp/ortho4xp-fp8sr-training/fp8-pack
+
+.venv/bin/python tools/train_fp8sr.py verify \
+  --dataset /path/to/aerial-pairs \
+  --fp16-pack /private/tmp/ortho4xp-fp8sr-training/fp16-pack \
+  --fp8-pack /private/tmp/ortho4xp-fp8sr-training/fp8-pack \
+  --output-dir /private/tmp/ortho4xp-fp8sr-training/verification \
+  --record-jsonl /private/tmp/ortho4xp-fp8sr-training/execution.jsonl \
+  --gpu-tools
+```
+
+`run`サブコマンドでは同じ処理を一括実行できます。FP16のvalidation品質がLanczos以上でない場合はFP8量子化を停止します。FP8はFP16比でPSNR低下0.25 dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値を満たした場合だけ採用候補になります。FP8不合格でも候補パックと検証結果は保存されますが、本番設定へ自動採用しません。
+
+FP8量子化は層単位の対称PTQです。重みはE4M3、活性値・累積・biasはFP16のままで、各層のscaleをmanifestへ保存します。学習済み重みとパックはリポジトリへ同梱せず、出力ディレクトリとSHA-256を実行記録で管理します。

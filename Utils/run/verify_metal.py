@@ -556,6 +556,14 @@ def compare_tensorops_backend(
             "output": str(output),
             "error": str(error),
         }
+    diagnostics = "\n".join(
+        value
+        for value in (
+            warmup.stdout or "",
+            last_result.stdout if last_result is not None else "",
+        )
+        if value
+    ).strip()
     return {
         "status": "PASS",
         "backend": "tensorops",
@@ -571,6 +579,8 @@ def compare_tensorops_backend(
             "scope": "ASHelper process plus image decode, TensorOps dispatch, readback, and PNG encode",
         },
         "quality": quality,
+        "diagnostic": diagnostics,
+        "tensorops_dispatch_observed": "tensorops_dispatch=completed" in diagnostics,
     }
 
 

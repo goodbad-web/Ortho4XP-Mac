@@ -97,6 +97,20 @@ FP8 TensorOpsの固定契約と外部モデルパックは、[FP8SRパック仕�
 .venv/bin/python tools/fp8sr_pack.py --create-fixture /private/tmp/ortho4xp-fp8-fixture
 ```
 
+実用モデルの学習は任意の`requirements-train.txt`を使う。LR/HRの相対パス対応ペアからFP16モデルを学習し、validationでLanczos以上になった場合だけFP8 E4M3へ量子化する。学習、FP16SR v2パック生成、FP8SR v1パック生成、品質検証を一括で行う場合は次を使う。
+
+```sh
+.venv/bin/python -m pip install -r requirements-train.txt
+.venv/bin/python tools/train_fp8sr.py run \
+  --dataset /path/to/aerial-pairs \
+  --output-dir /private/tmp/ortho4xp-fp8sr-training \
+  --device auto \
+  --gpu-tools \
+  --record-jsonl /private/tmp/ortho4xp-fp8sr-training/execution.jsonl
+```
+
+学習成果物は外部ディレクトリへ出力し、PyTorchは通常のOrtho4XP起動経路へ追加しない。小規模な実データ学習とM5 Max実機TensorOps dispatchを最終受入条件とする。
+
 macOS 27、FP8 TensorOps対応Apple Silicon Macでは、ASHelperを再ビルドした後に単画像・batchの実行を確認する。次のコマンドは入力8x8のフィクスチャから16x16 PNGを生成する。
 
 ```sh

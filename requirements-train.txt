@@ -1,0 +1,5 @@
+# Optional dependencies for the FP16 -> FP8SR development pipeline.
+# Keep these out of requirements.txt so normal Ortho4XP startup has no
+# PyTorch or model-training dependency.
+torch>=2.6.0
+safetensors>=0.4.5
