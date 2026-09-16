@@ -445,9 +445,19 @@ def mask_file(til_x_left, til_y_top, zoomlevel, provider_code):
 ##############################################################################
 
 ##############################################################################
-def jpeg_file_name_from_attributes(
-    til_x_left, til_y_top, zoomlevel, provider_code
+def imagery_file_name_from_attributes(
+    til_x_left, til_y_top, zoomlevel, provider_code, file_ext="jpg"
 ):
+    """Return a cache filename for an imagery format.
+
+    The coordinate/provider stem is deliberately shared by JPEG and WebP so
+    that changing the cache codec does not change the imagery identity.
+    """
+    normalized_ext = str(file_ext).strip().lower().lstrip(".")
+    if normalized_ext == "jpeg":
+        normalized_ext = "jpg"
+    if normalized_ext not in ("jpg", "webp"):
+        raise ValueError(f"unsupported imagery cache extension: {file_ext}")
     if provider_code == "g2xpl_16":
         file_name = (
             g2xpl_16_prefix
@@ -457,7 +467,8 @@ def jpeg_file_name_from_attributes(
             + "_"
             + str(2 ** zoomlevel - 16 - til_y_top)
             + g2xpl_16_suffix
-            + ".jpg"
+            + "."
+            + normalized_ext
         )
     else:
         file_name = (
@@ -467,7 +478,8 @@ def jpeg_file_name_from_attributes(
             + "_"
             + provider_code
             + str(zoomlevel)
-            + ".jpg"
+            + "."
+            + normalized_ext
         )
     return file_name
 
@@ -475,7 +487,36 @@ def jpeg_file_name_from_attributes(
 ##############################################################################
 
 ##############################################################################
-def jpeg_file_dir_from_attributes(lat, lon, zoomlevel, provider):
+def imagery_file_names_from_attributes(
+    til_x_left, til_y_top, zoomlevel, provider_code
+):
+    """Return cache candidates in the stable WebP-first lookup order."""
+    return [
+        imagery_file_name_from_attributes(
+            til_x_left, til_y_top, zoomlevel, provider_code, "webp"
+        ),
+        imagery_file_name_from_attributes(
+            til_x_left, til_y_top, zoomlevel, provider_code, "jpg"
+        ),
+    ]
+
+
+##############################################################################
+
+##############################################################################
+def jpeg_file_name_from_attributes(
+    til_x_left, til_y_top, zoomlevel, provider_code
+):
+    """Backward-compatible JPEG cache filename wrapper."""
+    return imagery_file_name_from_attributes(
+        til_x_left, til_y_top, zoomlevel, provider_code, "jpg"
+    )
+
+
+##############################################################################
+
+##############################################################################
+def imagery_file_dir_from_attributes(lat, lon, zoomlevel, provider):
     if not provider:
         file_dir = "."
     elif provider["imagery_dir"] == "normal":
@@ -503,6 +544,14 @@ def jpeg_file_dir_from_attributes(lat, lon, zoomlevel, provider):
             provider["code"] + "_" + str(zoomlevel),
         )
     return file_dir
+
+
+##############################################################################
+
+##############################################################################
+def jpeg_file_dir_from_attributes(lat, lon, zoomlevel, provider):
+    """Backward-compatible imagery cache directory wrapper."""
+    return imagery_file_dir_from_attributes(lat, lon, zoomlevel, provider)
 
 
 ##############################################################################

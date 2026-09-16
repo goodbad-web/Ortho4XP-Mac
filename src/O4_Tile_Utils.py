@@ -546,18 +546,19 @@ def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
             ) == "tensorops":
                 prepared_file = None
             if prepared_file and item_provider in IMG.providers_dict:
-                direct_jpeg = os.path.join(
+                direct_cache = IMG.find_imagery_cache_path(
+                    item_x,
+                    item_y,
+                    item_z,
+                    item_provider,
                     FNAMES.jpeg_file_dir_from_attributes(
                         item_tile.lat,
                         item_tile.lon,
                         item_z,
                         IMG.providers_dict[item_provider],
                     ),
-                    FNAMES.jpeg_file_name_from_attributes(
-                        item_x, item_y, item_z, item_provider
-                    ),
                 )
-                if os.path.abspath(prepared_file) == os.path.abspath(direct_jpeg):
+                if direct_cache and os.path.abspath(prepared_file) == os.path.abspath(direct_cache):
                     prepared_file = None
         if not prepared_file or not os.path.isfile(prepared_file):
             prepared_file = None
@@ -781,6 +782,17 @@ def _finish_standalone_build_transaction(transaction, succeeded):
 
 
 def build_tile(tile, persist_config=True):
+    try:
+        IMG.validate_imagery_cache_settings()
+    except ValueError as error:
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "ERROR: Invalid imagery cache settings: {}".format(error),
+                "エラー: 画像キャッシュ設定が不正です: {}".format(error),
+            ),
+        )
+        return 0
     standalone_transaction = None
     if not UI.is_building_all:
         UI.initialize_build_log(tile.build_dir, tile)
@@ -1019,6 +1031,8 @@ def _build_tile(tile, persist_config=True):
                 'upscale_backend': requested_upscale_backend,
                 'upscale_scope': requested_upscale_scope,
                 'fp8_model_path': getattr(tile, 'fp8_model_path', getattr(IMG, 'fp8_model_path', '')),
+                'imagery_cache_format': getattr(IMG, 'imagery_cache_format', 'jpg'),
+                'imagery_cache_quality': getattr(IMG, 'imagery_cache_quality', ''),
                 'dds_converter': getattr(tile, 'dds_converter', dds_converter),
                 'dds_format': getattr(tile, 'dds_format', dds_format),
                 'use_gpu_acceleration': effective_gpu,
@@ -1033,8 +1047,10 @@ def _build_tile(tile, persist_config=True):
                     convert_list.append(item)
 
             def can_defer_to_gpu_batch(item):
-                _, _, _, _, provider_code = item
-                return IMG.can_defer_gpu_batch(provider_code)
+                item_tile, item_x, item_y, item_zoomlevel, provider_code = item
+                return IMG.can_defer_gpu_batch_for_texture(
+                    item_tile, item_x, item_y, item_zoomlevel, provider_code
+                )
 
             def can_defer_to_tensorops_batch(item):
                 item_tile, item_x, item_y, item_zoomlevel, provider_code = item
@@ -1051,8 +1067,8 @@ def _build_tile(tile, persist_config=True):
                 # The FP8 input remains the opaque RGB JPEG. Supported
                 # color/mask preprocessing is applied by the existing DDS
                 # batch after the model output is produced.
-                return IMG.gpu_batch_color_filter_supported(
-                    IMG.providers_dict[provider_code].get("color_filters", "none")
+                return IMG.can_defer_gpu_batch_for_texture(
+                    item_tile, item_x, item_y, item_zoomlevel, provider_code
                 )
 
             batch_items_eligible = bool(
@@ -1122,17 +1138,16 @@ def _build_tile(tile, persist_config=True):
                     if item_provider not in IMG.providers_dict:
                         tensorops_batch_error = f"provider source unavailable for {out_file_name}"
                         break
-                    jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
-                        item_x, item_y, item_z, item_provider
-                    )
                     file_dir = FNAMES.jpeg_file_dir_from_attributes(
                         item_tile.lat,
                         item_tile.lon,
                         item_z,
                         IMG.providers_dict[item_provider],
                     )
-                    jpeg_path = os.path.join(file_dir, jpeg_file_name)
-                    if not IMG._jpeg_file_is_ready(jpeg_path):
+                    jpeg_path = IMG.find_imagery_cache_path(
+                        item_x, item_y, item_z, item_provider, file_dir
+                    )
+                    if not jpeg_path:
                         tensorops_batch_error = f"input source not found for {out_file_name}"
                         break
                     output_path = os.path.join(
@@ -1276,10 +1291,12 @@ def _build_tile(tile, persist_config=True):
                     )
                     tmp_png = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
                     
+                    source_is_cache = False
                     if provider_code in IMG.providers_dict:
-                        jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
                         file_dir = FNAMES.jpeg_file_dir_from_attributes(tile.lat, tile.lon, zoomlevel, IMG.providers_dict[provider_code])
-                        jpeg_path = os.path.join(file_dir, jpeg_file_name)
+                        jpeg_path = IMG.find_imagery_cache_path(
+                            til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+                        )
                     else:
                         jpeg_path = None
                     
@@ -1295,6 +1312,7 @@ def _build_tile(tile, persist_config=True):
                         temp_files_to_delete.append(tmp_png)
                     elif jpeg_path and IMG._jpeg_file_is_ready(jpeg_path):
                         input_path = jpeg_path
+                        source_is_cache = True
                     else:
                         UI.vprint(1, f"ERROR: Input source image not found for {out_file_name}")
                         conversion_success = False
@@ -1307,7 +1325,7 @@ def _build_tile(tile, persist_config=True):
                         effective_upscale_backend == "tensorops"
                         and input_path == tensorops_upscaled_tmp
                     )
-                    mask_input = input_path == jpeg_path or fp8_batch_input
+                    mask_input = source_is_cache or fp8_batch_input
                     mask_path = "none"
                     if mask_input and tile.imprint_masks_to_dds:
                         try:
@@ -1351,7 +1369,7 @@ def _build_tile(tile, persist_config=True):
                     
                     color_code = "none"
                     color_filter_input = (
-                        input_path == jpeg_path or fp8_batch_input
+                        source_is_cache or fp8_batch_input
                     )
                     if color_filter_input and provider_code in IMG.providers_dict:
                         color_code = IMG.providers_dict[provider_code].get(
@@ -1384,7 +1402,7 @@ def _build_tile(tile, persist_config=True):
                                 )
                         except:
                             pass
-                    if not has_alpha and input_path != jpeg_path:
+                    if not has_alpha and not source_is_cache:
                         has_alpha = IMG._image_has_non_opaque_alpha(input_path)
                     
                     target_fmt = IMG.resolve_dds_format(dds_format, has_alpha)
@@ -1663,6 +1681,17 @@ def _report_metrics_failure(tile):
 
 ################################################################################
 def _start_full_pipeline(tile, include_overlays):
+    try:
+        IMG.validate_imagery_cache_settings()
+    except ValueError as error:
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "ERROR: Invalid imagery cache settings: {}".format(error),
+                "エラー: 画像キャッシュ設定が不正です: {}".format(error),
+            ),
+        )
+        return 0
     if not _recover_build_transaction(tile):
         UI.exit_message_and_bottom_line(
             UI.ui_text(

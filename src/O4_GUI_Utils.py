@@ -347,7 +347,7 @@ class Ortho4XP_GUI(tk.Tk):
             self.frame_aux, border=0, padx=0, pady=0, bg=UI.BG_COLOR
         )
         self.frame_aux_main.grid(row=1, column=0, sticky=N + S + W + E)
-        for i in range(6):
+        for i in range(7):
             self.frame_aux_main.columnconfigure(i, weight=1)
         ttk.Button(
             self.frame_aux_main,
@@ -387,10 +387,17 @@ class Ortho4XP_GUI(tk.Tk):
         ttk.Button(
             self.frame_aux_main,
             takefocus=False,
+            text="Cache",
+            command=self.open_imagery_cache_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=5, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
             text="Exit",
             command=self.exit_prg,
             style="Compact.TButton",
-        ).grid(row=0, column=5, padx=3, pady=0, sticky=N + S + E + W)
+        ).grid(row=0, column=6, padx=3, pady=0, sticky=N + S + E + W)
 
         # Fourth row (Progress bars and controls)
         # Label(self.frame_left,anchor=W,text="DSF/Masks progress",
@@ -785,6 +792,14 @@ class Ortho4XP_GUI(tk.Tk):
             except:
                 return 0
             self.custom_zl_window = Ortho4XP_Custom_ZL(self, lat, lon)
+            return 1
+
+    def open_imagery_cache_window(self):
+        try:
+            self.imagery_cache_window.lift()
+            return 1
+        except Exception:
+            self.imagery_cache_window = Ortho4XP_Imagery_Cache(self)
             return 1
 
     def set_red_flag(self):
@@ -1692,6 +1707,222 @@ class Ortho4XP_Custom_ZL(tk.Toplevel):
         return
 
 ################################################################################
+class Ortho4XP_Imagery_Cache(tk.Toplevel):
+    """Independent GUI for non-destructive Orthophotos cache migration."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title(
+            _ui_text(
+                "Orthophoto Cache Migration",
+                "Orthophotoキャッシュ移行",
+            )
+        )
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(6, weight=1)
+        self.result_queue = queue.Queue()
+        self.running = False
+
+        try:
+            lat, lon = parent.get_lat_lon(check=False)
+            default_tile = FNAMES.short_latlon(lat, lon)
+        except Exception:
+            default_tile = "+34+132"
+        current_quality = getattr(IMG, "imagery_cache_quality", "")
+        self.tile_var = tk.StringVar(value=default_tile)
+        self.provider_var = tk.StringVar()
+        self.zl_var = tk.StringVar()
+        self.quality_var = tk.StringVar(value=str(current_quality or ""))
+        self.workers_var = tk.StringVar(value="2")
+        self.status_var = tk.StringVar(
+            value=_ui_text("Idle", "待機中")
+        )
+
+        fields = (
+            ("Tile", "タイル", self.tile_var),
+            ("Provider filter", "Providerフィルタ", self.provider_var),
+            ("ZL filter", "ZLフィルタ", self.zl_var),
+            ("WebP quality", "WebP品質", self.quality_var),
+            ("Workers", "ワーカー数", self.workers_var),
+        )
+        for row, (english, japanese, variable) in enumerate(fields):
+            ttk.Label(
+                self,
+                text=_ui_text(english, japanese),
+            ).grid(row=row, column=0, padx=6, pady=4, sticky=W)
+            ttk.Entry(self, textvariable=variable, width=32).grid(
+                row=row, column=1, padx=6, pady=4, sticky=E + W
+            )
+
+        button_frame = ttk.Frame(self)
+        button_frame.grid(row=5, column=0, columnspan=2, padx=6, pady=6, sticky=E + W)
+        self.convert_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Convert", "変換"),
+            command=self.start_convert,
+        )
+        self.convert_button.pack(side=LEFT, padx=3)
+        self.cleanup_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Dry-run cleanup", "削除確認（dry-run）"),
+            command=self.start_cleanup_preview,
+        )
+        self.cleanup_button.pack(side=LEFT, padx=3)
+        self.apply_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Apply cleanup", "削除を実行"),
+            command=self.start_cleanup_apply,
+        )
+        self.apply_button.pack(side=LEFT, padx=3)
+        ttk.Button(
+            button_frame,
+            text=_ui_text("Close", "閉じる"),
+            command=self.destroy,
+        ).pack(side=RIGHT, padx=3)
+
+        ttk.Label(self, textvariable=self.status_var).grid(
+            row=6, column=0, columnspan=2, padx=6, pady=(0, 4), sticky=W
+        )
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=1)
+        self.progress.grid(row=7, column=0, columnspan=2, padx=6, pady=4, sticky=E + W)
+        self.output = tk.Text(self, width=100, height=12, state="disabled")
+        self.output.grid(row=8, column=0, columnspan=2, padx=6, pady=6, sticky=N + S + E + W)
+
+    def _scope(self):
+        tiles = [item.strip() for item in self.tile_var.get().split(",") if item.strip()]
+        providers = [
+            item.strip() for item in self.provider_var.get().split(",") if item.strip()
+        ]
+        zoomlevels = [
+            int(item.strip())
+            for item in self.zl_var.get().split(",")
+            if item.strip()
+        ]
+        if not tiles:
+            raise ValueError("Tile is required.")
+        workers = int(self.workers_var.get().strip())
+        if workers < 1:
+            raise ValueError("Workers must be at least 1.")
+        return tiles, providers, zoomlevels, workers
+
+    def _append_output(self, text):
+        self.output.configure(state="normal")
+        self.output.insert(END, text + "\n")
+        self.output.see(END)
+        self.output.configure(state="disabled")
+
+    def _set_buttons(self, state):
+        for button in (self.convert_button, self.cleanup_button, self.apply_button):
+            button.configure(state=state)
+
+    def _start(self, mode, apply=False, confirmed=False):
+        if self.running:
+            return
+        try:
+            tiles, providers, zoomlevels, workers = self._scope()
+            quality = self.quality_var.get().strip() or None
+            if mode == "convert":
+                _, quality = IMG.validate_imagery_cache_settings("webp", quality)
+        except (TypeError, ValueError) as error:
+            from tkinter import messagebox
+
+            messagebox.showerror(
+                _ui_text("Cache migration", "キャッシュ移行"), str(error), parent=self
+            )
+            return
+
+        self.running = True
+        self._set_buttons("disabled")
+        self.progress.configure(value=0, maximum=1)
+        self.status_var.set(
+            _ui_text("Running {}...".format(mode), "{}を実行中...".format(mode))
+        )
+
+        def progress_callback(done, total, result):
+            self.result_queue.put(("progress", done, total, result))
+
+        def worker():
+            try:
+                report = IMG.migrate_imagery_cache(
+                    mode=mode,
+                    tiles=tiles,
+                    providers=providers,
+                    zoomlevels=zoomlevels,
+                    quality=quality,
+                    workers=workers,
+                    dry_run=(mode == "cleanup" and not apply),
+                    apply=apply,
+                    confirmed=confirmed,
+                    progress=progress_callback,
+                )
+                self.result_queue.put(("done", report))
+            except Exception as error:
+                self.result_queue.put(("error", str(error)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_results)
+
+    def _poll_results(self):
+        try:
+            while True:
+                event = self.result_queue.get_nowait()
+                if event[0] == "progress":
+                    _, done, total, result = event
+                    self.progress.configure(value=done, maximum=max(1, total))
+                    self.status_var.set(
+                        _ui_text(
+                            "{} / {}: {}".format(done, total, result["status"]),
+                            "{} / {}: {}".format(done, total, result["status"]),
+                        )
+                    )
+                    self._append_output(
+                        "{}: {} ({})".format(
+                            result["status"], result["jpeg"], result.get("reason", "")
+                        )
+                    )
+                elif event[0] == "done":
+                    report = event[1]
+                    self.running = False
+                    self._set_buttons("normal")
+                    self.status_var.set(
+                        _ui_text("Completed", "完了")
+                    )
+                    self._append_output("JSON report: {}".format(report["report_path"]))
+                    return
+                elif event[0] == "error":
+                    self.running = False
+                    self._set_buttons("normal")
+                    self.status_var.set(_ui_text("Failed", "失敗"))
+                    self._append_output("ERROR: " + event[1])
+                    return
+        except queue.Empty:
+            pass
+        if self.running:
+            self.after(100, self._poll_results)
+
+    def start_convert(self):
+        self._start("convert")
+
+    def start_cleanup_preview(self):
+        self._start("cleanup")
+
+    def start_cleanup_apply(self):
+        from tkinter import messagebox
+
+        if not messagebox.askyesno(
+            _ui_text("Confirm cleanup", "削除の確認"),
+            _ui_text(
+                "Revalidate and delete eligible JPEG cache files?",
+                "検証済みのJPEGキャッシュを再検証して削除しますか？",
+            ),
+            parent=self,
+        ):
+            return
+        self._start("cleanup", apply=True, confirmed=True)
+
+
+################################################################################
 class Ortho4XP_Earth_Preview(tk.Toplevel):
 
     earthzl = 6
@@ -1700,7 +1931,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
     list_del_ckbtn = [
         "OSM data",
         "Mask data",
-        "Jpeg imagery",
+        "Imagery cache",
         "Tile (whole)",
         "Tile (textures)",
     ]
@@ -2167,7 +2398,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 shutil.rmtree(FNAMES.mask_dir(self.active_lat, self.active_lon))
             except Exception as e:
                 UI.vprint(3, e)
-        if self.v_["Jpeg imagery"].get():
+        if self.v_["Imagery cache"].get():
             try:
                 import O4_RAMDisk_Utils
 
@@ -2179,8 +2410,8 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                         UI.vprint(
                             0,
                             _ui_text(
-                                "Jpeg imagery deletion was refused because RAM disk ownership is unknown.",
-                                "RAMディスクの所有状態を確認できないため、JPEG画像の削除を拒否しました。",
+                                "Imagery cache deletion was refused because RAM disk ownership is unknown.",
+                                "RAMディスクの所有状態を確認できないため、画像キャッシュの削除を拒否しました。",
                             ),
                         )
                     else:
@@ -2191,7 +2422,7 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                             )
                         )
             except O4_RAMDisk_Utils.RamDiskError as e:
-                UI.vprint(0, f"[RAMDisk] Jpeg imagery deletion refused: {e}")
+                UI.vprint(0, f"[RAMDisk] Imagery cache deletion refused: {e}")
             except Exception as e:
                 UI.vprint(3, e)
         if self.v_["Tile (whole)"].get() and not self.grouped:

@@ -113,6 +113,23 @@ a particular server.",
         "values": ("AUTO", "BC1", "BC3", "BC7"),
         "hint": "The texture compression format. AUTO selects BC1 (DXT1) for fully opaque images and BC3 (DXT5) when alpha is present. BC7 is only supported when the DDS converter is nvcompress.",
     },
+    "imagery_cache_format": {
+        "module": "IMG",
+        "type": str,
+        "default": "jpg",
+        "values": ("jpg", "webp"),
+        "short_name": "Imagery cache",
+        "short_name_japanese": "画像キャッシュ",
+        "hint": "Format used only for new Orthophotos cache files. Existing JPEG files remain usable and are never converted automatically. WebP is decoded to PNG before DDS conversion.\n\n日本語: 新規のOrthophotosキャッシュだけに使う形式です。既存JPEGはそのまま利用し、自動変換しません。WebPはDDS変換前にPNGへデコードします。",
+    },
+    "imagery_cache_quality": {
+        "module": "IMG",
+        "type": str,
+        "default": "",
+        "short_name": "WebP quality",
+        "short_name_japanese": "WebP品質",
+        "hint": "Required when Imagery cache is WebP. Enter an integer from 80 to 100.\n\n日本語: 画像キャッシュがWebPの場合は必須です。80〜100の整数を入力してください。",
+    },
     "upscale_scope": {
         "module": "IMG",
         "type": str,
@@ -561,6 +578,8 @@ list_app_vars = [
     "ram_disk_size_gb",
     "use_ram_disk_for_orthophotos",
     "max_baddata_retries",
+    "imagery_cache_format",
+    "imagery_cache_quality",
     "ovl_exclude_pol",
     "ovl_exclude_net",
     "custom_scenery_dir",
@@ -1422,6 +1441,24 @@ class Ortho4XP_Config(tk.Toplevel):
         ]
         restart_needed = False
         changed_vars = []
+        try:
+            IMG.validate_imagery_cache_settings(
+                _config_raw_value(
+                    "imagery_cache_format", self.v_["imagery_cache_format"].get()
+                ),
+                _config_raw_value(
+                    "imagery_cache_quality", self.v_["imagery_cache_quality"].get()
+                ),
+            )
+        except ValueError as error:
+            messagebox.showerror(
+                _config_short_name("imagery_cache_format"),
+                UI.ui_text(
+                    "Invalid imagery cache settings: {}".format(error),
+                    "画像キャッシュ設定が不正です: {}".format(error),
+                ),
+            )
+            return 0
         for var in list_tile_vars + list_app_vars:
             try:
                 target = (

@@ -7,6 +7,7 @@ import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_UI_Utils as UI
 import O4_RAMDisk_Utils
+import O4_Imagery_Cache as CACHE
 import time
 import os
 import sys
@@ -80,6 +81,66 @@ use_magick = False
 use_texture_converter = False
 as_helper_cmd = None
 upscale_scope = "all"
+imagery_cache_format = CACHE.DEFAULT_CACHE_FORMAT
+imagery_cache_quality = ""
+
+
+def validate_imagery_cache_settings(cache_format=None, quality=None):
+    """Validate and normalize the global Orthophotos cache settings."""
+    return CACHE.validate_cache_settings(
+        imagery_cache_format if cache_format is None else cache_format,
+        imagery_cache_quality if quality is None else quality,
+    )
+
+
+def imagery_cache_paths(
+    til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+):
+    return CACHE.cache_paths(
+        file_dir, til_x_left, til_y_top, zoomlevel, provider_code
+    )
+
+
+def preferred_imagery_cache_path(
+    til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+):
+    cache_format, _ = validate_imagery_cache_settings()
+    return CACHE.preferred_cache_path(
+        file_dir,
+        til_x_left,
+        til_y_top,
+        zoomlevel,
+        provider_code,
+        cache_format,
+    )
+
+
+def find_imagery_cache_path(
+    til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+):
+    return CACHE.find_cache_path(
+        file_dir, til_x_left, til_y_top, zoomlevel, provider_code
+    )
+
+
+def save_imagery_cache_image(image, file_path):
+    """Save a cache image using the format encoded by its destination path."""
+    extension = os.path.splitext(file_path)[1].lower().lstrip(".")
+    if extension == "webp":
+        _, quality = validate_imagery_cache_settings("webp", imagery_cache_quality)
+        CACHE.save_cache_image(image, file_path, "webp", quality)
+    else:
+        CACHE.save_cache_image(image, file_path, "jpg", None)
+
+
+def prepare_image_for_external_input(source_path):
+    return CACHE.prepare_external_image_input(
+        source_path, os.path.join(UI.Ortho4XP_dir, "tmp")
+    )
+
+
+def migrate_imagery_cache(**kwargs):
+    return CACHE.migrate_cache(**kwargs)
 
 UPSCALE_SCOPES = ("none", "all", "airport")
 
@@ -1845,11 +1906,7 @@ def download_jpeg_ortho(
     os.makedirs(file_dir, exist_ok=True)
     try:
         if super_resol_factor == 1:
-            _save_image_atomically(
-                big_image,
-                os.path.join(file_dir, file_name),
-                format="JPEG",
-            )
+            save_imagery_cache_image(big_image, os.path.join(file_dir, file_name))
         else:
             resized_image = big_image.resize(
                 (
@@ -1858,10 +1915,8 @@ def download_jpeg_ortho(
                 ),
                 Image.BICUBIC,
             )
-            _save_image_atomically(
-                resized_image,
-                os.path.join(file_dir, file_name),
-                format="JPEG",
+            save_imagery_cache_image(
+                resized_image, os.path.join(file_dir, file_name)
             )
     except Exception as e:
         UI.lvprint(
@@ -1903,24 +1958,37 @@ def download_jpeg_ortho(
                     parent_zl,
                     provider,
                 )
-                parent_file_path = os.path.join(
-                    parent_file_dir, parent_file_name
+                parent_cache_path = CACHE.find_cache_path(
+                    parent_file_dir,
+                    til_x_left_16,
+                    til_y_top_16,
+                    parent_zl,
+                    provider_code,
                 )
-                if not _jpeg_file_is_ready(parent_file_path):
+                if not parent_cache_path:
+                    parent_file_path = CACHE.preferred_cache_path(
+                        parent_file_dir,
+                        til_x_left_16,
+                        til_y_top_16,
+                        parent_zl,
+                        provider_code,
+                        validate_imagery_cache_settings()[0],
+                    )
                     UI.vprint(
                         1,
-                        f"   Downloading parent ZL16 orthophoto: {parent_file_name}",
+                        f"   Downloading parent ZL16 orthophoto: {os.path.basename(parent_file_path)}",
                     )
                     download_jpeg_ortho(
                         parent_file_dir,
-                        parent_file_name,
+                        os.path.basename(parent_file_path),
                         til_x_left_16,
                         til_y_top_16,
                         parent_zl,
                         provider_code,
                     )
-                if _jpeg_file_is_ready(parent_file_path):
-                    with Image.open(parent_file_path) as parent_img:
+                    parent_cache_path = parent_file_path
+                if parent_cache_path and _jpeg_file_is_ready(parent_cache_path):
+                    with Image.open(parent_cache_path) as parent_img:
                         offset_x = (til_x_16 - til_x_left_16) * 256
                         offset_y = (til_y_16 - til_y_top_16) * 256
                         crop_size = factor * 256
@@ -1935,12 +2003,7 @@ def download_jpeg_ortho(
                         high_quality_img = cropped.resize(
                             (4096, 4096), Image.BICUBIC
                         )
-                        _save_image_atomically(
-                            high_quality_img,
-                            file_path,
-                            format="JPEG",
-                            quality=90,
-                        )
+                        save_imagery_cache_image(high_quality_img, file_path)
                         UI.vprint(
                             1,
                             f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",
@@ -1954,32 +2017,8 @@ def download_jpeg_ortho(
 
 ################################################################################
 def _jpeg_file_is_ready(jpeg_path):
-    if not jpeg_path:
-        return False
-    if not os.path.exists(jpeg_path):
-        O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path)
-    if not os.path.isfile(jpeg_path):
-        return False
-    try:
-        with Image.open(jpeg_path) as im:
-            im.verify()
-        return True
-    except Exception:
-        try:
-            os.remove(jpeg_path)
-        except:
-            pass
-        if O4_RAMDisk_Utils.check_and_restore_cached_image(jpeg_path):
-            try:
-                with Image.open(jpeg_path) as im:
-                    im.verify()
-                return True
-            except Exception:
-                try:
-                    os.remove(jpeg_path)
-                except:
-                    pass
-        return False
+    """Backward-compatible name; validation now accepts JPEG and WebP."""
+    return CACHE.image_file_is_ready(jpeg_path)
 
 
 ################################################################################
@@ -2040,25 +2079,41 @@ def build_jpeg_ortho(
                     true_zl,
                     providers_dict[rlayer["layer_code"]],
                 )
-                true_jpeg_path = os.path.join(true_file_dir, true_file_name)
-                if not _jpeg_file_is_ready(true_jpeg_path):
+                true_cache_path = CACHE.find_cache_path(
+                    true_file_dir,
+                    true_til_x_left,
+                    true_til_y_top,
+                    true_zl,
+                    rlayer["layer_code"],
+                )
+                if not true_cache_path:
+                    true_cache_path = CACHE.preferred_cache_path(
+                        true_file_dir,
+                        true_til_x_left,
+                        true_til_y_top,
+                        true_zl,
+                        rlayer["layer_code"],
+                        validate_imagery_cache_settings()[0],
+                    )
                     UI.vprint(
                         1,
                         "   Downloading missing orthophoto "
-                        + true_file_name
+                        + os.path.basename(true_cache_path)
                         + " (for combining in "
                         + provider_code
                         + ")",
                     )
                     if not download_jpeg_ortho(
-                        true_file_dir, true_file_name, *true_texture_attributes
+                        true_file_dir,
+                        os.path.basename(true_cache_path),
+                        *true_texture_attributes,
                     ):
                         return 0
                 else:
                     UI.vprint(
                         2,
                         "   The orthophoto "
-                        + true_file_name
+                        + os.path.basename(true_cache_path)
                         + " (for combining in "
                         + provider_code
                         + ") "
@@ -2082,9 +2137,6 @@ def build_jpeg_ortho(
         # useful to use different masks parameters for imagery masks layers and
         # actual masks.
         elif provider_code in providers_dict:
-            file_name = FNAMES.jpeg_file_name_from_attributes(
-                til_x_left, til_y_top, zoomlevel, provider_code
-            )
             file_dir = FNAMES.jpeg_file_dir_from_attributes(
                 tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
             )
@@ -2093,7 +2145,17 @@ def build_jpeg_ortho(
             )
             os.makedirs(file_dir, exist_ok=True)
             try:
-                big_img.convert("RGB").save(os.path.join(file_dir, file_name))
+                save_imagery_cache_image(
+                    big_img,
+                    CACHE.preferred_cache_path(
+                        file_dir,
+                        til_x_left,
+                        til_y_top,
+                        zoomlevel,
+                        provider_code,
+                        validate_imagery_cache_settings()[0],
+                    ),
+                )
             except Exception as e:
                 UI.lvprint(
                     0,
@@ -2103,22 +2165,29 @@ def build_jpeg_ortho(
                 )
                 return 0
     elif provider_code in providers_dict:
-        file_name = FNAMES.jpeg_file_name_from_attributes(
-            til_x_left, til_y_top, zoomlevel, provider_code
-        )
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
-        jpeg_path = os.path.join(file_dir, file_name)
-        if not _jpeg_file_is_ready(jpeg_path):
-            UI.vprint(1, "   Downloading missing orthophoto " + file_name)
+        cache_path = CACHE.find_cache_path(
+            file_dir, til_x_left, til_y_top, zoomlevel, provider_code
+        )
+        if not cache_path:
+            cache_path = CACHE.preferred_cache_path(
+                file_dir,
+                til_x_left,
+                til_y_top,
+                zoomlevel,
+                provider_code,
+                validate_imagery_cache_settings()[0],
+            )
+            UI.vprint(1, "   Downloading missing orthophoto " + os.path.basename(cache_path))
             if not download_jpeg_ortho(
-                file_dir, file_name, *texture_attributes
+                file_dir, os.path.basename(cache_path), *texture_attributes
             ):
                 return 0
         else:
             UI.vprint(
-                2, "   The orthophoto " + file_name + " is already present."
+                2, "   The orthophoto " + os.path.basename(cache_path) + " is already present."
             )
     else:
         (tlat, tlon) = GEO.gtile_to_wgs84(
@@ -2258,14 +2327,24 @@ def build_texture_region(
                 return_mask=False,
                 mask_size=(4096, 4096),
             ):
-                file_name = FNAMES.jpeg_file_name_from_attributes(
-                    til_x_left, til_y_top, zoomlevel, provider_code
+                existing_cache = CACHE.find_cache_path(
+                    dest_dir, til_x_left, til_y_top, zoomlevel, provider_code
                 )
-                if os.path.isfile(os.path.join(dest_dir, file_name)):
+                if existing_cache:
                     print("recycling one")
                     nbr_to_do -= 1
                     continue
                 print("building one")
+                file_name = os.path.basename(
+                    CACHE.preferred_cache_path(
+                        dest_dir,
+                        til_x_left,
+                        til_y_top,
+                        zoomlevel,
+                        provider_code,
+                        validate_imagery_cache_settings()[0],
+                    )
+                )
                 download_jpeg_ortho(
                     dest_dir,
                     file_name,
@@ -2530,6 +2609,21 @@ def can_defer_gpu_batch(provider_code):
     )
 
 
+def can_defer_gpu_batch_for_texture(
+    tile, til_x_left, til_y_top, zoomlevel, provider_code
+):
+    """Keep WebP inputs on the normal path so they are decoded to PNG first."""
+    if not can_defer_gpu_batch(provider_code):
+        return False
+    file_dir = FNAMES.jpeg_file_dir_from_attributes(
+        tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
+    )
+    cache_path = CACHE.find_cache_path(
+        file_dir, til_x_left, til_y_top, zoomlevel, provider_code
+    )
+    return not (cache_path and cache_path.lower().endswith(".webp"))
+
+
 ################################################################################
 
 ################################################################################
@@ -2663,7 +2757,17 @@ def _prepare_combined_layer(
     true_file_dir = FNAMES.jpeg_file_dir_from_attributes(
         tile.lat, tile.lon, true_zl, provider
     )
-    true_file_path = os.path.join(true_file_dir, true_file_name)
+    true_file_path = CACHE.find_cache_path(
+        true_file_dir,
+        true_til_x_left,
+        true_til_y_top,
+        true_zl,
+        rlayer["layer_code"],
+    )
+    if not true_file_path:
+        raise FileNotFoundError(
+            f"missing imagery cache for {rlayer['layer_code']} at {true_file_dir}"
+        )
     UI.vprint(2, "Imprinting for provider", rlayer, til_x_left, til_y_top)
     with Image.open(true_file_path) as source_im:
         true_im = color_transform(source_im, rlayer["color_code"])
@@ -2695,7 +2799,7 @@ def _prepare_combined_layer(
 ################################################################################
 # Support for multiprocessing initialization
 def init_worker(config_data):
-    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd, upscale_backend, upscale_scope, fp8_model_path
+    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd, upscale_backend, upscale_scope, fp8_model_path, imagery_cache_format, imagery_cache_quality
     global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
     global is_worker_process
     
@@ -2716,6 +2820,12 @@ def init_worker(config_data):
     upscale_backend = normalize_upscale_backend(config_data.get('upscale_backend', 'none'))
     upscale_scope = normalize_upscale_scope(config_data.get('upscale_scope', 'all'))
     fp8_model_path = config_data.get('fp8_model_path', globals().get('fp8_model_path', ''))
+    imagery_cache_format = config_data.get(
+        'imagery_cache_format', globals().get('imagery_cache_format', 'jpg')
+    )
+    imagery_cache_quality = config_data.get(
+        'imagery_cache_quality', globals().get('imagery_cache_quality', '')
+    )
     UI.dds_converter = config_data.get('dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
     UI.dds_format = config_data.get('dds_format', getattr(UI, 'dds_format', 'BC3'))
     UI.upscale_scope = upscale_scope
@@ -2934,6 +3044,7 @@ def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds", prepared_file=None
 ):
     upscaled_file_to_delete = None
+    external_file_to_delete = None
     tmp_tif_file_name = None
     dds_tmp_file_path = None
     if type == "dds":
@@ -2984,6 +3095,11 @@ def convert_texture(
             try:
                 os.remove(upscaled_file_to_delete)
             except:
+                pass
+        if external_file_to_delete and not preserve_batch_inputs:
+            try:
+                os.remove(external_file_to_delete)
+            except OSError:
                 pass
         if dds_tmp_file_path:
             try:
@@ -3048,15 +3164,24 @@ def convert_texture(
 
 
     jpeg_path = None
+    jpeg_file_name = None
     if provider_code in providers_dict:
-        jpeg_file_name = FNAMES.jpeg_file_name_from_attributes(
-            til_x_left, til_y_top, zoomlevel, provider_code
-        )
         file_dir = FNAMES.jpeg_file_dir_from_attributes(
             tile.lat, tile.lon, zoomlevel, providers_dict[provider_code]
         )
-        jpeg_path = os.path.join(file_dir, jpeg_file_name)
-    jpeg_ready = _jpeg_file_is_ready(jpeg_path)
+        jpeg_path = CACHE.find_cache_path(
+            file_dir, til_x_left, til_y_top, zoomlevel, provider_code
+        )
+        jpeg_ready = bool(jpeg_path)
+        jpeg_file_name = (
+            os.path.basename(jpeg_path)
+            if jpeg_path
+            else FNAMES.jpeg_file_name_from_attributes(
+                til_x_left, til_y_top, zoomlevel, provider_code
+            )
+        )
+    else:
+        jpeg_ready = False
     is_combined = (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not jpeg_ready
@@ -3079,6 +3204,7 @@ def convert_texture(
         and type == "dds"
         and direct_color_filter_supported
         and prepared_file is None
+        and not (jpeg_path and jpeg_path.lower().endswith(".webp"))
     )
     defer_tensorops_batch = (
         getattr(UI, "defer_fp8_batch", False)
@@ -3089,6 +3215,7 @@ def convert_texture(
         and type == "dds"
         and direct_color_filter_supported
         and prepared_file is None
+        and not (jpeg_path and jpeg_path.lower().endswith(".webp"))
     )
     if defer_tensorops_batch or (defer_gpu_batch and not use_upscale):
         return 1
@@ -3150,8 +3277,8 @@ def convert_texture(
         or masked_texture
         or (int(zoomlevel) >= 18)
     ):
-        jpeg_full_path = os.path.join(file_dir, jpeg_file_name)
-        if not _jpeg_file_is_ready(jpeg_full_path):
+        jpeg_full_path = jpeg_path
+        if not jpeg_full_path or not _jpeg_file_is_ready(jpeg_full_path):
             UI.vprint(1, f"   ERROR: missing orthophoto {jpeg_file_name}")
             return 0
         big_image = Image.open(jpeg_full_path, "r").convert("RGB")
@@ -3183,6 +3310,21 @@ def convert_texture(
     if file_to_convert is None:
         UI.vprint(1, f"   ERROR: orthophoto source unavailable for {out_file_name}")
         return 0
+
+    # External DDS and upscale converters receive a PNG for WebP inputs.
+    # Pillow handles the WebP decode here, while JPEG inputs keep their
+    # historical direct path.
+    if file_to_convert.lower().endswith(".webp"):
+        try:
+            file_to_convert, external_file_created = prepare_image_for_external_input(
+                file_to_convert
+            )
+            if external_file_created:
+                external_file_to_delete = file_to_convert
+        except Exception as error:
+            UI.vprint(1, f"   ERROR: could not decode WebP cache {jpeg_file_name}: {error}")
+            cleanup_conversion_temp_files()
+            return 0
 
     # Optional 2x upscaling. A supplied prepared file already contains the
     # preprocessing requested by the caller; never upscale it a second time.
