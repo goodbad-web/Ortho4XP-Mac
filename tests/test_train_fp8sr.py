@@ -1,4 +1,5 @@
 import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -13,7 +14,13 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import train_fp8sr  # noqa: E402
-from fp8sr_pack import EXPECTED_LAYERS, validate_pack, write_pack  # noqa: E402
+from fp8sr_pack import (  # noqa: E402
+    EXPECTED_LAYERS,
+    FP8SRPackError,
+    fp8sr_fp16_reference,
+    validate_pack,
+    write_pack,
+)
 
 
 def make_pair(root: Path, split: str = "val", size: tuple[int, int] = (8, 6)) -> None:
@@ -82,3 +89,147 @@ def test_cli_exposes_all_pipeline_stages():
     for command, command_args in arguments.items():
         parsed = parser.parse_args([command, *command_args])
         assert parsed.command == command
+
+
+def test_fp16_reference_reports_nonfinite_instead_of_overflowing(tmp_path):
+    layers = []
+    for name, kernel, in_channels, out_channels in EXPECTED_LAYERS:
+        layers.append(
+            {
+                "name": name,
+                "weight": np.full(
+                    (out_channels, in_channels, kernel, kernel),
+                    65504.0,
+                    dtype=np.float32,
+                ),
+                "bias": np.zeros((out_channels,), dtype=np.float32),
+                "scale": 1.0,
+            }
+        )
+    pack = write_pack(tmp_path / "overflow", layers, "Float16")
+    source = tmp_path / "input.png"
+    Image.new("RGB", (1, 1), (255, 255, 255)).save(source)
+
+    with pytest.raises(FP8SRPackError, match="nonfinite"):
+        fp8sr_fp16_reference(
+            pack,
+            source,
+            tmp_path / "output.png",
+            reject_nonfinite=True,
+        )
+
+
+def test_record_contains_timing_and_gpu_evidence_fields():
+    record = train_fp8sr._record(
+        "tensorops",
+        "candidate",
+        "MetalFloat8E4M3",
+        "PASS",
+        None,
+        None,
+        timing_ms={"median": 1.0, "p95": 2.0, "samples": [1.0, 2.0]},
+        gpu_tools={
+            "status": "PASS",
+            "capture": {"path": "/tmp/test.gputrace"},
+            "debug": {"path": "/tmp/gpudebug.json"},
+            "metalperftrace": {
+                "traces": ["/tmp/perf.atrc"],
+                "overviews": ["/tmp/perf.overview.json"],
+            },
+            "tensorops_dispatch_observed": True,
+        },
+    )
+    assert record["timing_ms"]["median"] == 1.0
+    assert record["timing_ms"]["p95"] == 2.0
+    assert record["tensorops_dispatch_observed"] is True
+    assert len(record["gpu_evidence_paths"]) == 4
+    assert record["neural_accelerator_confirmed"] is False
+
+
+def test_fp16_gate_blocks_fp8_reference_execution(tmp_path, monkeypatch):
+    make_pair(tmp_path, size=(8, 6))
+    layers = []
+    for name, kernel, in_channels, out_channels in EXPECTED_LAYERS:
+        layers.append(
+            {
+                "name": name,
+                "weight": np.zeros(
+                    (out_channels, in_channels, kernel, kernel), dtype=np.float32
+                ),
+                "bias": np.zeros((out_channels,), dtype=np.float32),
+                "scale": 1.0,
+            }
+        )
+    fp16_pack = write_pack(tmp_path / "fp16", layers, "Float16")
+    fp8_pack = write_pack(tmp_path / "fp8", layers, "MetalFloat8E4M3")
+    calls = []
+    original = train_fp8sr.fp8sr_fp16_reference
+
+    def counted_reference(pack, *args, **kwargs):
+        calls.append(Path(pack).name)
+        return original(pack, *args, **kwargs)
+
+    monkeypatch.setattr(train_fp8sr, "fp8sr_fp16_reference", counted_reference)
+    args = argparse.Namespace(
+        dataset=tmp_path,
+        fp16_pack=fp16_pack,
+        fp8_pack=fp8_pack,
+        output_dir=tmp_path / "verify",
+        record_jsonl=tmp_path / "verify" / "execution.jsonl",
+        helper=tmp_path / "missing-helper",
+        compare_runs=1,
+        representative_count=1,
+        gpu_tools=False,
+    )
+
+    assert train_fp8sr.verify(args) == 1
+    assert calls == ["fp16"]
+    assert not (tmp_path / "verify/representatives/0000_tile_fp8.png").exists()
+
+
+def test_gpu_failure_changes_verification_exit_status(tmp_path, monkeypatch):
+    make_pair(tmp_path, size=(8, 6))
+    layers = []
+    for name, kernel, in_channels, out_channels in EXPECTED_LAYERS:
+        weight = np.zeros((out_channels, in_channels, kernel, kernel), dtype=np.float32)
+        bias = np.zeros((out_channels,), dtype=np.float32)
+        weight[:, :, kernel // 2, kernel // 2] = 0.25
+        layers.append({"name": name, "weight": weight, "bias": bias, "scale": 1.0})
+    fp16_pack = write_pack(tmp_path / "fp16", layers, "Float16")
+    fp8_pack = write_pack(tmp_path / "fp8", layers, "MetalFloat8E4M3")
+    fp8sr_fp16_reference(
+        fp16_pack,
+        tmp_path / "val/lr/tile.png",
+        tmp_path / "val/hr/tile.png",
+    )
+    helper = tmp_path / "ASHelper"
+    helper.write_text("placeholder")
+
+    import verify_metal
+
+    monkeypatch.setattr(train_fp8sr.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        verify_metal,
+        "compare_tensorops_backend",
+        lambda *args, **kwargs: {
+            "status": "FAIL",
+            "run_exit": 7,
+            "diagnostic": "shader_failed",
+        },
+    )
+    args = argparse.Namespace(
+        dataset=tmp_path,
+        fp16_pack=fp16_pack,
+        fp8_pack=fp8_pack,
+        output_dir=tmp_path / "verify-gpu",
+        record_jsonl=tmp_path / "verify-gpu" / "execution.jsonl",
+        helper=helper,
+        compare_runs=1,
+        representative_count=1,
+        gpu_tools=False,
+    )
+
+    assert train_fp8sr.verify(args) == 1
+    report = json.loads((tmp_path / "verify-gpu/verification.json").read_text())
+    assert report["status"] == "FAIL(gpu_execution)"
+    assert report["gpu"]["status"] == "FAIL"

@@ -445,10 +445,23 @@ def _validate_finite_weights(
 
 
 def _round_fp16(value: float) -> float:
-    return struct.unpack("<e", struct.pack("<e", float(value)))[0]
+    value = float(value)
+    # Python's half-float packer raises OverflowError for finite values above
+    # the FP16 range, while Metal arithmetic produces +/-inf.  Preserve the
+    # latter so the reference path can apply the same non-finite gate as the
+    # GPU path instead of terminating the verifier with a traceback.
+    if math.isfinite(value) and abs(value) > 65504.0:
+        return math.copysign(float("inf"), value)
+    return struct.unpack("<e", struct.pack("<e", value))[0]
 
 
-def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_path: str | Path) -> Path:
+def fp8sr_fp16_reference(
+    pack_path: str | Path,
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    reject_nonfinite: bool = False,
+) -> Path:
     """Run any supported FP8SR weight variant with FP16-rounded arithmetic.
 
     This is intentionally a small verification reference, not a production
@@ -499,8 +512,16 @@ def fp8sr_fp16_reference(pack_path: str | Path, input_path: str | Path, output_p
                                 accumulator = _round_fp16(
                                     accumulator + _round_fp16(activation * weight)
                                 )
+                                if reject_nonfinite and not math.isfinite(accumulator):
+                                    raise FP8SRPackError(
+                                        f"layer {layer['name']}: nonfinite accumulation"
+                                    )
                                 feature += 1
                     value = _round_fp16(accumulator * layer["scale"] + biases[output_channel])
+                    if reject_nonfinite and not math.isfinite(value):
+                        raise FP8SRPackError(
+                            f"layer {layer['name']}: nonfinite postprocess value"
+                        )
                     pixel_values[output_channel] = _round_fp16(max(0.0, value))
                 output.append(pixel_values)
         previous = output

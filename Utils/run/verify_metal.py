@@ -600,6 +600,11 @@ def run_gpu_tool_verification(
     missing = [name for name in required if not _tool_available(name)]
     if missing:
         return {"status": "SKIP(tool_missing)", "missing": missing}
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        return {
+            "status": "SKIP(helper_unavailable)",
+            "diagnostic": f"ASHelper is missing or not executable: {helper}",
+        }
 
     capture_path = artifact_dir / "tensorops.gputrace"
     debug_dir = artifact_dir / "gpudebug"

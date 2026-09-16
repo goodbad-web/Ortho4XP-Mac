@@ -287,6 +287,26 @@ def _aggregate_metrics(values: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _timing_summary(samples: list[float], scope: str) -> dict[str, Any]:
+    return {
+        "samples": samples,
+        "median": _percentile(samples, 0.5),
+        "p95": _percentile(samples, 0.95),
+        "scope": scope,
+    }
+
+
 def _save_checkpoint(model: Any, checkpoint: Path, metadata: dict[str, Any]) -> None:
     _, save_file = _require_safetensors()
     tensors = {
@@ -550,8 +570,24 @@ def _record(
     gate: dict[str, Any] | None = None,
     pack: Path | None = None,
     gpu_tools: dict[str, Any] | None = None,
+    execution_result: dict[str, Any] | None = None,
+    requested_backend: str | None = None,
+    effective_backend: str | None = None,
+    implementation: str | None = None,
+    fallback_reason: str | None = None,
+    timing_ms: dict[str, Any] | None = None,
+    exit_code: int | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    if execution_result is not None:
+        if quality is None:
+            quality = execution_result.get("quality")
+        if timing_ms is None:
+            timing_ms = execution_result.get("timing_ms")
+        if exit_code is None:
+            exit_code = execution_result.get(
+                "run_exit", execution_result.get("warmup_exit")
+            )
     if quality is not None:
         result["quality"] = quality
     if gate is not None:
@@ -567,31 +603,56 @@ def _record(
         "backend": backend,
         "role": role,
         "dtype": dtype,
-        "requested_backend": backend,
-        "effective_backend": backend,
+        "requested_backend": requested_backend or backend,
+        "effective_backend": effective_backend or backend,
         "status": status,
-        "fallback_reason": None,
-        "exit_code": 0 if status.startswith("PASS") else None,
+        "fallback_reason": fallback_reason,
+        "implementation": implementation,
+        "timing_ms": timing_ms
+        or _timing_summary([], "not_run"),
+        "exit_code": exit_code
+        if exit_code is not None
+        else (0 if status.startswith("PASS") else 1 if status.startswith(("FAIL", "BLOCKED")) else None),
+        "gpu_evidence_paths": [],
+        "tensorops_dispatch_observed": False,
+        "neural_accelerator_confirmed": False,
         **result,
     }
     if source is not None:
         record["input"] = str(source)
-        with Image.open(source) as image:
-            record["input_size"] = list(image.size)
+        try:
+            with Image.open(source) as image:
+                record["input_size"] = list(image.size)
+        except (OSError, ValueError) as error:
+            record["input_size"] = None
+            record["size_error"] = str(error)
     if output is not None:
         record["output"] = str(output)
-        with Image.open(output) as image:
-            record["output_size"] = list(image.size)
+        try:
+            with Image.open(output) as image:
+                record["output_size"] = list(image.size)
+        except (OSError, ValueError) as error:
+            record["output_size"] = None
+            record["size_error"] = str(error)
     if gpu_tools is not None:
         record["gpu_tools"] = gpu_tools
-        record["gpu_evidence_paths"] = [
-            str(path)
-            for path in gpu_tools.get("gpu_evidence_paths", [])
-        ]
+        evidence_paths = [str(path) for path in gpu_tools.get("gpu_evidence_paths", [])]
+        capture = gpu_tools.get("capture", {})
+        if capture.get("path"):
+            evidence_paths.append(str(capture["path"]))
+        debug = gpu_tools.get("debug", {})
+        if debug.get("path"):
+            evidence_paths.append(str(debug["path"]))
+        performance = gpu_tools.get("metalperftrace", {})
+        for key in ("traces", "overviews"):
+            evidence_paths.extend(str(path) for path in performance.get(key, []))
+        record["gpu_evidence_paths"] = list(dict.fromkeys(evidence_paths))
         record["tensorops_dispatch_observed"] = bool(
             gpu_tools.get("tensorops_dispatch_observed", False)
         )
-        record["neural_accelerator_confirmed"] = False
+        record["neural_accelerator_confirmed"] = bool(
+            gpu_tools.get("neural_accelerator_confirmed", False)
+        )
     return record
 
 
@@ -613,29 +674,63 @@ def verify(args: argparse.Namespace) -> int:
     fp16_values: list[dict[str, float]] = []
     fp8_values: list[dict[str, float]] = []
     lanczos_values: list[dict[str, float]] = []
+    lanczos_samples: list[float] = []
+    fp16_samples: list[float] = []
+    fp8_samples: list[float] = []
+    pair_artifacts: list[tuple[ImagePair, Path, Path, Path]] = []
+    reference_failure: dict[str, Any] | None = None
+
+    # Run the FP16 reference over the complete validation set first.  FP8 is
+    # deliberately a second pass so a failed FP16 gate never executes the
+    # candidate pack.
     for index, pair in enumerate(val_pairs):
         with Image.open(pair.hr) as hr_image:
             target_size = hr_image.size
         stem = f"{index:04d}_{pair.lr.stem}"
         lanczos_path = representative_dir / f"{stem}_lanczos.png"
         fp16_path = representative_dir / f"{stem}_fp16.png"
+        fp8_path = representative_dir / f"{stem}_fp8.png"
+        pair_artifacts.append((pair, lanczos_path, fp16_path, fp8_path))
+        started = time.perf_counter()
         _lanczos_output(pair.lr, target_size, lanczos_path)
-        fp8sr_fp16_reference(fp16_pack, pair.lr, fp16_path)
+        lanczos_samples.append((time.perf_counter() - started) * 1000.0)
         lanczos_quality = _image_metrics(lanczos_path, pair.hr)
-        fp16_quality = _image_metrics(fp16_path, pair.hr)
         lanczos_values.append(lanczos_quality)
-        fp16_values.append(fp16_quality)
         if index < args.representative_count:
             shutil.copy2(pair.lr, representative_dir / f"{stem}_lr{pair.lr.suffix.lower()}")
             shutil.copy2(pair.hr, representative_dir / f"{stem}_hr{pair.hr.suffix.lower()}")
-        if fp8_pack is not None:
-            fp8_path = representative_dir / f"{stem}_fp8.png"
-            fp8sr_fp16_reference(fp8_pack, pair.lr, fp8_path)
-            fp8_values.append(_image_metrics(fp8_path, pair.hr))
+
+        started = time.perf_counter()
+        try:
+            fp8sr_fp16_reference(
+                fp16_pack,
+                pair.lr,
+                fp16_path,
+                reject_nonfinite=True,
+            )
+            fp16_samples.append((time.perf_counter() - started) * 1000.0)
+            fp16_values.append(_image_metrics(fp16_path, pair.hr))
+        except (FP8SRPackError, OSError, ValueError) as error:
+            reference_failure = {
+                "stage": "FP16",
+                "pair": str(pair.lr),
+                "reason": str(error),
+            }
+            break
 
     lanczos_quality = _aggregate_metrics(lanczos_values)
-    fp16_quality = _aggregate_metrics(fp16_values)
-    fp16_gate = _gate_fp16_against_lanczos(fp16_quality, lanczos_quality)
+    fp16_quality = _aggregate_metrics(fp16_values) if not reference_failure else None
+    if reference_failure is None:
+        fp16_gate = _gate_fp16_against_lanczos(fp16_quality, lanczos_quality)
+    else:
+        fp16_gate = {
+            "status": "FAIL",
+            "reason": "nonfinite_or_reference_failure",
+            "error": reference_failure,
+            "baseline": lanczos_quality,
+            "candidate": fp16_quality,
+            "checks": {"reference_finite": False},
+        }
     first_stem = f"0000_{val_pairs[0].lr.stem}"
     first_lanczos = representative_dir / f"{first_stem}_lanczos.png"
     first_fp16 = representative_dir / f"{first_stem}_fp16.png"
@@ -645,23 +740,33 @@ def verify(args: argparse.Namespace) -> int:
             "ci_lanczos",
             "reference",
             "Float32",
-            "PASS",
+            "PASS" if len(lanczos_values) == len(val_pairs) else "FAIL(reference_incomplete)",
             val_pairs[0].lr,
             first_lanczos,
             lanczos_quality,
+            requested_backend="ci_lanczos",
+            effective_backend="python_pillow_lanczos",
+            implementation="Pillow.Image.Resampling.LANCZOS",
+            fallback_reason="validation_aborted" if len(lanczos_values) != len(val_pairs) else None,
+            timing_ms=_timing_summary(lanczos_samples, "Python reference resize and PNG encode"),
         )
     )
     records.append(
         _record(
             "tensorops",
-            "baseline",
+            "reference_only",
             "Float16",
             "PASS" if fp16_gate["status"] == "PASS" else "FAIL(fp16_gate)",
             val_pairs[0].lr,
-            first_fp16,
+            first_fp16 if first_fp16.is_file() else None,
             fp16_quality,
             fp16_gate,
             fp16_pack,
+            requested_backend="tensorops",
+            effective_backend="python_fp8sr_reference",
+            implementation="fp8sr_fp16_reference",
+            fallback_reason=reference_failure["reason"] if reference_failure else None,
+            timing_ms=_timing_summary(fp16_samples, "Python FP16-rounded FP8SR reference"),
         )
     )
     report: dict[str, Any] = {
@@ -673,77 +778,206 @@ def verify(args: argparse.Namespace) -> int:
         "fp16_gate": fp16_gate,
         "stages": {"FP16": {"status": fp16_gate["status"], "gate": fp16_gate}},
     }
+
+    if reference_failure is not None:
+        report["reference_failure"] = reference_failure
+
     if fp16_gate["status"] != "PASS":
         if fp8_pack is not None:
-            report["stages"]["FP8"] = {"status": "BLOCKED(fp16_gate)"}
+            blocked_status = (
+                "BLOCKED(fp16_reference)"
+                if reference_failure
+                else "BLOCKED(fp16_gate)"
+            )
+            report["stages"]["FP8"] = {"status": blocked_status}
             records.append(
                 _record(
                     "tensorops",
                     "candidate",
                     "MetalFloat8E4M3",
-                    "BLOCKED(fp16_gate)",
+                    blocked_status,
                     val_pairs[0].lr,
                     first_fp8 if first_fp8.is_file() else None,
                     pack=fp8_pack,
+                    requested_backend="tensorops",
+                    effective_backend="not_run",
+                    implementation="fp8sr_fp16_reference",
+                    fallback_reason=blocked_status,
                 )
             )
     elif fp8_pack is not None:
-        fp8_quality = _aggregate_metrics(fp8_values)
-        fp8_gate = _fp8_gate(fp8_quality, fp16_quality)
-        report["fp8"] = fp8_quality
-        report["fp8_gate"] = fp8_gate
-        report["stages"]["FP8"] = {"status": fp8_gate["status"], "gate": fp8_gate}
-        records.append(
-            _record(
-                "tensorops",
-                "candidate",
-                "MetalFloat8E4M3",
-                fp8_gate["status"],
-                val_pairs[0].lr,
-                first_fp8,
-                fp8_quality,
-                fp8_gate,
-                fp8_pack,
-            )
-        )
-        if fp8_gate["status"] == "PASS" and args.helper and sys.platform == "darwin":
-            helper = Path(args.helper).expanduser().resolve()
-            representative = val_pairs[0]
-            with Image.open(representative.hr) as hr_image:
-                target_size = hr_image.size
-            gpu_output = output_dir / "gpu_representative_fp8.png"
-            from verify_metal import compare_tensorops_backend
-
-            gpu_result = compare_tensorops_backend(
-                helper,
-                fp8_pack,
-                representative.lr,
-                representative.hr,
-                gpu_output,
-                args.compare_runs,
-            )
-            diagnostic = str(gpu_result.get("diagnostic", ""))
-            if gpu_result.get("status") != "PASS" and "metal_unavailable" in diagnostic:
-                gpu_result["status"] = "SKIP(metal_unavailable)"
-            dispatch_observed = bool(gpu_result.get("tensorops_dispatch_observed"))
-            gpu_result["tensorops_dispatch_observed"] = dispatch_observed
-            report["gpu"] = gpu_result
-            records.append(_record("tensorops", "candidate", "MetalFloat8E4M3", gpu_result.get("status", "FAIL"), representative.lr, gpu_output if gpu_output.is_file() else None, gpu_result.get("quality"), fp8_gate, fp8_pack, {"tensorops_dispatch_observed": dispatch_observed}))
-            if args.gpu_tools:
-                gpu_tools = run_gpu_tool_verification(
-                    helper,
+        # Only run FP8 after the complete FP16 validation and its gate pass.
+        for pair, _, _, fp8_path in pair_artifacts:
+            started = time.perf_counter()
+            try:
+                fp8sr_fp16_reference(
                     fp8_pack,
-                    representative.lr,
-                    output_dir / "gpu_capture_output.png",
-                    output_dir / "gpu-evidence",
+                    pair.lr,
+                    fp8_path,
+                    reject_nonfinite=True,
                 )
-                report["gpu_tools"] = gpu_tools
-                if gpu_tools.get("status", "").startswith("PASS"):
-                    report["status"] = "PASS" if gpu_tools.get("tensorops_dispatch_observed") else "FAIL(gpu_evidence)"
-                elif not gpu_tools.get("status", "").startswith("SKIP"):
+                fp8_samples.append((time.perf_counter() - started) * 1000.0)
+                fp8_values.append(_image_metrics(fp8_path, pair.hr))
+            except (FP8SRPackError, OSError, ValueError) as error:
+                reference_failure = {
+                    "stage": "FP8",
+                    "pair": str(pair.lr),
+                    "reason": str(error),
+                }
+                break
+
+        if reference_failure is not None:
+            report["reference_failure"] = reference_failure
+            fp8_gate = {
+                "status": "FAIL",
+                "reason": "nonfinite_or_reference_failure",
+                "error": reference_failure,
+                "baseline": fp16_quality,
+                "candidate": _aggregate_metrics(fp8_values) if fp8_values else None,
+                "checks": {"reference_finite": False},
+            }
+            report["status"] = "FAIL(fp8_reference)"
+            report["fp8_gate"] = fp8_gate
+            report["stages"]["FP8"] = {"status": "FAIL(fp8_reference)", "gate": fp8_gate}
+            records.append(
+                _record(
+                    "tensorops",
+                    "reference_only",
+                    "MetalFloat8E4M3",
+                    "FAIL(fp8_reference)",
+                    val_pairs[0].lr,
+                    first_fp8 if first_fp8.is_file() else None,
+                    fp8_gate.get("candidate"),
+                    fp8_gate,
+                    fp8_pack,
+                    requested_backend="tensorops",
+                    effective_backend="python_fp8sr_reference",
+                    implementation="fp8sr_fp16_reference",
+                    fallback_reason=reference_failure["reason"],
+                    timing_ms=_timing_summary(fp8_samples, "Python FP8-rounded FP8SR reference"),
+                )
+            )
+        else:
+            fp8_quality = _aggregate_metrics(fp8_values)
+            fp8_gate = _fp8_gate(fp8_quality, fp16_quality)
+            report["fp8"] = fp8_quality
+            report["fp8_gate"] = fp8_gate
+            report["stages"]["FP8"] = {"status": fp8_gate["status"], "gate": fp8_gate}
+            records.append(
+                _record(
+                    "tensorops",
+                    "reference_only",
+                    "MetalFloat8E4M3",
+                    fp8_gate["status"],
+                    val_pairs[0].lr,
+                    first_fp8,
+                    fp8_quality,
+                    fp8_gate,
+                    fp8_pack,
+                    requested_backend="tensorops",
+                    effective_backend="python_fp8sr_reference",
+                    implementation="fp8sr_fp16_reference",
+                    timing_ms=_timing_summary(fp8_samples, "Python FP8-rounded FP8SR reference"),
+                )
+            )
+            if fp8_gate["status"] != "PASS":
+                report["status"] = "FAIL(fp8_gate)"
+
+            if fp8_gate["status"] == "PASS":
+                helper = Path(args.helper).expanduser().resolve() if args.helper else None
+                representative = val_pairs[0]
+                gpu_output = output_dir / "gpu_representative_fp8.png"
+                gpu_result: dict[str, Any]
+                if sys.platform != "darwin":
+                    gpu_result = {
+                        "status": "SKIP(platform_unavailable)",
+                        "diagnostic": f"TensorOps verification requires macOS: {sys.platform}",
+                    }
+                elif helper is None or not helper.is_file():
+                    gpu_result = {
+                        "status": "SKIP(helper_missing)",
+                        "diagnostic": f"ASHelper is missing: {helper}",
+                    }
+                else:
+                    from verify_metal import compare_tensorops_backend
+
+                    try:
+                        gpu_result = compare_tensorops_backend(
+                            helper,
+                            fp8_pack,
+                            representative.lr,
+                            representative.hr,
+                            gpu_output,
+                            args.compare_runs,
+                        )
+                    except OSError as error:
+                        gpu_result = {
+                            "status": "SKIP(helper_unavailable)",
+                            "diagnostic": str(error),
+                        }
+                    diagnostic = str(gpu_result.get("diagnostic", ""))
+                    if gpu_result.get("status") != "PASS" and "metal_unavailable" in diagnostic:
+                        gpu_result["status"] = "SKIP(metal_unavailable)"
+
+                dispatch_observed = bool(gpu_result.get("tensorops_dispatch_observed"))
+                gpu_result["tensorops_dispatch_observed"] = dispatch_observed
+                report["gpu"] = gpu_result
+                gpu_tools: dict[str, Any] | None = None
+                if args.gpu_tools and helper is not None and helper.is_file() and sys.platform == "darwin":
+                    gpu_tools = run_gpu_tool_verification(
+                        helper,
+                        fp8_pack,
+                        representative.lr,
+                        output_dir / "gpu_capture_output.png",
+                        output_dir / "gpu-evidence",
+                    )
+                    report["gpu_tools"] = gpu_tools
+
+                gpu_status = str(gpu_result.get("status", "FAIL"))
+                if gpu_status.startswith("FAIL"):
+                    report["status"] = "FAIL(gpu_execution)"
+                elif gpu_status == "PASS" and not dispatch_observed:
                     report["status"] = "FAIL(gpu_evidence)"
-        elif fp8_gate["status"] != "PASS":
-            report["status"] = "FAIL(fp8_gate)"
+                if gpu_tools is not None:
+                    tool_status = str(gpu_tools.get("status", "FAIL"))
+                    if tool_status.startswith("FAIL"):
+                        report["status"] = "FAIL(gpu_evidence)"
+                    elif tool_status.startswith("PASS") and not gpu_tools.get(
+                        "tensorops_dispatch_observed", False
+                    ):
+                        report["status"] = "FAIL(gpu_evidence)"
+
+                record_gpu_status = gpu_status
+                if gpu_status == "PASS" and not dispatch_observed:
+                    record_gpu_status = "FAIL(gpu_evidence)"
+                if (
+                    gpu_tools is not None
+                    and str(gpu_tools.get("status", "")).startswith("PASS")
+                    and not gpu_tools.get("tensorops_dispatch_observed", False)
+                ):
+                    record_gpu_status = "FAIL(gpu_evidence)"
+
+                records.append(
+                    _record(
+                        "tensorops",
+                        "candidate",
+                        "MetalFloat8E4M3",
+                        record_gpu_status,
+                        representative.lr,
+                        gpu_output if gpu_output.is_file() else None,
+                        gpu_result.get("quality"),
+                        fp8_gate,
+                        fp8_pack,
+                        gpu_tools,
+                        execution_result=gpu_result,
+                        requested_backend="tensorops",
+                        effective_backend="tensorops" if record_gpu_status == "PASS" else "unavailable",
+                        implementation="ASHelper",
+                        fallback_reason=gpu_result.get("diagnostic")
+                        if gpu_status.startswith("SKIP")
+                        else None,
+                    )
+                )
     record_path = Path(args.record_jsonl).expanduser().resolve() if args.record_jsonl else output_dir / "execution.jsonl"
     record_path.parent.mkdir(parents=True, exist_ok=True)
     with record_path.open("w", encoding="utf-8") as stream:
