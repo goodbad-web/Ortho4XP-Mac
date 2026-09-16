@@ -3871,6 +3871,412 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
     return writeDDS(output, to: outputPath)
 }
 
+private let rasterMetalSource = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct RasterBlurParams {
+    uint width;
+    uint height;
+    uint stride;
+    uint radius;
+    bool vertical;
+};
+
+kernel void o4_raster_blur_u8(
+    device const uchar *input [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant RasterBlurParams &params [[buffer(2)]],
+    constant float *weights [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    float value = 0.0;
+    int radius = int(params.radius);
+    for (int offset = -radius; offset <= radius; offset++) {
+        int x = int(gid.x);
+        int y = int(gid.y);
+        if (params.vertical) y += offset;
+        else x += offset;
+        if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
+        value += float(input[y * int(params.stride) + x]) * weights[offset + radius];
+    }
+    output[gid.y * params.stride + gid.x] = uchar(clamp(value + 0.5, 0.0, 255.0));
+}
+
+kernel void o4_raster_blur_f32(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant RasterBlurParams &params [[buffer(2)]],
+    constant float *weights [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    float value = 0.0;
+    int radius = int(params.radius);
+    for (int offset = -radius; offset <= radius; offset++) {
+        int x = int(gid.x);
+        int y = int(gid.y);
+        if (params.vertical) y += offset;
+        else x += offset;
+        if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
+        value += input[y * int(params.stride) + x] * weights[offset + radius];
+    }
+    output[gid.y * params.stride + gid.x] = value;
+}
+"""
+
+private enum RasterMetalError: Error, CustomStringConvertible {
+    case unavailable(String)
+    case invalid(String)
+    case execution(String)
+
+    var description: String {
+        switch self {
+        case .unavailable(let message): return "unavailable_\(message)"
+        case .invalid(let message): return "invalid_\(message)"
+        case .execution(let message): return "execution_\(message)"
+        }
+    }
+}
+
+private struct RasterBlurParams {
+    var width: UInt32
+    var height: UInt32
+    var stride: UInt32
+    var radius: UInt32
+    var vertical: Bool
+}
+
+private final class RasterMetalRuntime {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let u8Pipeline: MTLComputePipelineState
+    private let f32Pipeline: MTLComputePipelineState
+
+    init() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw RasterMetalError.unavailable("device")
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw RasterMetalError.unavailable("command_queue")
+        }
+        guard let library = try? device.makeLibrary(source: rasterMetalSource, options: nil),
+              let u8Function = library.makeFunction(name: "o4_raster_blur_u8"),
+              let f32Function = library.makeFunction(name: "o4_raster_blur_f32"),
+              let u8Pipeline = try? device.makeComputePipelineState(function: u8Function),
+              let f32Pipeline = try? device.makeComputePipelineState(function: f32Function) else {
+            throw RasterMetalError.unavailable("raster_pipelines")
+        }
+        self.device = device
+        self.commandQueue = commandQueue
+        self.u8Pipeline = u8Pipeline
+        self.f32Pipeline = f32Pipeline
+    }
+
+    private func makeBuffer(data: Data) throws -> MTLBuffer {
+        guard let buffer = data.withUnsafeBytes({ bytes in
+            device.makeBuffer(
+                bytes: bytes.baseAddress!,
+                length: data.count,
+                options: .storageModeShared
+            )
+        }) else {
+            throw RasterMetalError.execution("buffer")
+        }
+        return buffer
+    }
+
+    func blur(
+        data: Data,
+        width: Int,
+        height: Int,
+        stride: Int,
+        weights: [Float],
+        float32: Bool
+    ) throws -> Data {
+        guard width > 0, height > 0, stride >= width else {
+            throw RasterMetalError.invalid("shape")
+        }
+        guard weights.count >= 3, weights.count % 2 == 1 else {
+            throw RasterMetalError.invalid("kernel")
+        }
+        let elementBytes = float32 ? MemoryLayout<Float>.size : MemoryLayout<UInt8>.size
+        guard stride * elementBytes >= width * elementBytes,
+              data.count >= stride * elementBytes * height else {
+            throw RasterMetalError.invalid("stride")
+        }
+        let radius = weights.count / 2
+        let length = stride * elementBytes * height
+        let inputBuffer = try makeBuffer(data: data)
+        guard let horizontalBuffer = device.makeBuffer(
+            length: length,
+            options: .storageModeShared
+        ),
+        let outputBuffer = device.makeBuffer(
+            length: length,
+            options: .storageModeShared
+        ),
+        let weightBuffer = weights.withUnsafeBytes({ bytes in
+            device.makeBuffer(
+                bytes: bytes.baseAddress!,
+                length: weights.count * MemoryLayout<Float>.size,
+                options: .storageModeShared
+            )
+        }),
+        let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw RasterMetalError.execution("command_buffer")
+        }
+
+        func encode(
+            pipeline: MTLComputePipelineState,
+            input: MTLBuffer,
+            output: MTLBuffer,
+            vertical: Bool
+        ) throws {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw RasterMetalError.execution("encoder")
+            }
+            var params = RasterBlurParams(
+                width: UInt32(width),
+                height: UInt32(height),
+                stride: UInt32(stride),
+                radius: UInt32(radius),
+                vertical: vertical
+            )
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(input, offset: 0, index: 0)
+            encoder.setBuffer(output, offset: 0, index: 1)
+            encoder.setBytes(&params, length: MemoryLayout<RasterBlurParams>.size, index: 2)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+            let widthThreads = max(1, min(pipeline.threadExecutionWidth, width))
+            let heightThreads = max(
+                1,
+                min(pipeline.maxTotalThreadsPerThreadgroup / widthThreads, height)
+            )
+            encoder.dispatchThreads(
+                MTLSize(width: width, height: height, depth: 1),
+                threadsPerThreadgroup: MTLSize(
+                    width: widthThreads,
+                    height: heightThreads,
+                    depth: 1
+                )
+            )
+            encoder.endEncoding()
+        }
+
+        try encode(
+            pipeline: float32 ? f32Pipeline : u8Pipeline,
+            input: inputBuffer,
+            output: horizontalBuffer,
+            vertical: false
+        )
+        try encode(
+            pipeline: float32 ? f32Pipeline : u8Pipeline,
+            input: horizontalBuffer,
+            output: outputBuffer,
+            vertical: true
+        )
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            throw RasterMetalError.execution("command_status")
+        }
+        return Data(
+            bytes: outputBuffer.contents(),
+            count: length
+        )
+    }
+
+    func maskedDEM(
+        raster: Data,
+        mask: Data,
+        width: Int,
+        height: Int,
+        stride: Int,
+        maskStride: Int,
+        weights: [Float]
+    ) throws -> Data {
+        let count = width * height
+        var weighted = [Float](repeating: 0, count: count)
+        var maskValues = [Float](repeating: 0, count: count)
+        raster.withUnsafeBytes { bytes in
+            let values = bytes.bindMemory(to: Float.self)
+            mask.withUnsafeBytes { maskBytes in
+                let maskValuesRaw = maskBytes.bindMemory(to: UInt8.self)
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let rasterIndex = (y * stride / MemoryLayout<Float>.size) + x
+                        let maskIndex = y * maskStride + x
+                        let index = y * width + x
+                        let weight = Float(maskValuesRaw[maskIndex]) / 255.0
+                        maskValues[index] = weight
+                        weighted[index] = values[rasterIndex] * weight
+                    }
+                }
+            }
+        }
+        let weightedData = weighted.withUnsafeBytes { Data($0) }
+        let maskData = maskValues.withUnsafeBytes { Data($0) }
+        let blurredWeighted = try blur(
+            data: weightedData,
+            width: width,
+            height: height,
+            stride: width,
+            weights: weights,
+            float32: true
+        )
+        let blurredMask = try blur(
+            data: maskData,
+            width: width,
+            height: height,
+            stride: width,
+            weights: weights,
+            float32: true
+        )
+        var output = [Float](repeating: 0, count: count)
+        blurredWeighted.withUnsafeBytes { weightedBytes in
+            let weightedValues = weightedBytes.bindMemory(to: Float.self)
+            blurredMask.withUnsafeBytes { maskBytes in
+                let blurredMaskValues = maskBytes.bindMemory(to: Float.self)
+                raster.withUnsafeBytes { rasterBytes in
+                    let source = rasterBytes.bindMemory(to: Float.self)
+                    for index in 0..<count {
+                        output[index] = blurredMaskValues[index] > 0.000001
+                            ? weightedValues[index] / blurredMaskValues[index]
+                            : source[index]
+                    }
+                }
+            }
+        }
+        var outputData = Data(count: stride * height)
+        outputData.withUnsafeMutableBytes { outputBytes in
+            let destination = outputBytes.bindMemory(to: UInt8.self)
+            output.withUnsafeBytes { sourceBytes in
+                let source = sourceBytes.bindMemory(to: UInt8.self)
+                for row in 0..<height {
+                    let destinationOffset = row * stride
+                    let sourceOffset = row * width * MemoryLayout<Float>.size
+                    destination.baseAddress!.advanced(by: destinationOffset)
+                        .assign(from: source.baseAddress!.advanced(by: sourceOffset), count: width * MemoryLayout<Float>.size)
+                }
+            }
+        }
+        return outputData
+    }
+}
+
+private let rasterRuntimeLock = NSLock()
+private var rasterRuntime: RasterMetalRuntime?
+
+private func sharedRasterRuntime() throws -> RasterMetalRuntime {
+    rasterRuntimeLock.lock()
+    defer { rasterRuntimeLock.unlock() }
+    if let rasterRuntime { return rasterRuntime }
+    let runtime = try RasterMetalRuntime()
+    rasterRuntime = runtime
+    return runtime
+}
+
+private func serverFloatArray(_ value: Any?) -> [Float]? {
+    guard let values = value as? [NSNumber], !values.isEmpty else { return nil }
+    return values.map(\.floatValue)
+}
+
+private func serverKernel(_ task: [String: Any]) -> [Float] {
+    if let explicit = serverFloatArray(task["kernel"]) { return explicit }
+    let radius = max(1, (task["radius"] as? NSNumber)?.intValue ?? 1)
+    let denominator = Float((radius + 1) * (radius + 1))
+    return (0..<(radius * 2 + 1)).map { index in
+        let distance = index <= radius ? index + 1 : (radius * 2 + 1 - index)
+        return Float(distance) / denominator
+    }
+}
+
+private func serverRawRasterBatch(
+    _ request: [String: Any],
+    operation: String
+) -> [[String: Any]] {
+    guard let tasks = request["tasks"] as? [[String: Any]], !tasks.isEmpty else {
+        return [serverTaskResult("batch", success: false, backend: "metal", error: "tasks_required")]
+    }
+    do {
+        let runtime = try sharedRasterRuntime()
+        return tasks.enumerated().map { index, task in
+            let taskID = serverTaskID(task, index: index)
+            guard let input = serverString(task, "input"),
+                  let output = serverString(task, "output"),
+                  let width = (task["width"] as? NSNumber)?.intValue,
+                  let height = (task["height"] as? NSNumber)?.intValue,
+                  let stride = (task["stride"] as? NSNumber)?.intValue else {
+                return serverTaskResult(taskID, success: false, backend: "metal", error: "invalid_raster_task")
+            }
+            do {
+                let inputData = try Data(contentsOf: URL(fileURLWithPath: input))
+                let kernel = serverKernel(task)
+                let outputData: Data
+                if operation == "dem_smooth_batch" {
+                    let maskPath = serverString(task, "mask")
+                    if let maskPath {
+                        let maskData = try Data(contentsOf: URL(fileURLWithPath: maskPath))
+                        let maskStride = (task["mask_stride"] as? NSNumber)?.intValue ?? width
+                        outputData = try runtime.maskedDEM(
+                            raster: inputData,
+                            mask: maskData,
+                            width: width,
+                            height: height,
+                            stride: stride,
+                            maskStride: maskStride,
+                            weights: kernel
+                        )
+                    } else {
+                        outputData = try runtime.blur(
+                            data: inputData,
+                            width: width,
+                            height: height,
+                            stride: stride / MemoryLayout<Float>.size,
+                            weights: kernel,
+                            float32: true
+                        )
+                    }
+                } else {
+                    outputData = try runtime.blur(
+                        data: inputData,
+                        width: width,
+                        height: height,
+                        stride: stride,
+                        weights: kernel,
+                        float32: false
+                    )
+                }
+                try outputData.write(to: URL(fileURLWithPath: output), options: .atomic)
+                return serverTaskResult(
+                    taskID,
+                    success: true,
+                    backend: "metal",
+                    extra: ["operation": operation]
+                )
+            } catch {
+                return serverTaskResult(
+                    taskID,
+                    success: false,
+                    backend: "metal",
+                    error: String(describing: error)
+                )
+            }
+        }
+    } catch {
+        return tasks.enumerated().map { index, task in
+            serverTaskResult(
+                serverTaskID(task, index: index),
+                success: false,
+                backend: "metal",
+                error: String(describing: error)
+            )
+        }
+    }
+}
+
 // MARK: - Resident JSON Lines server
 
 // The server protocol deliberately carries only paths and scalar options.  It
@@ -4101,7 +4507,7 @@ private func runJSONLRequest(_ request: [String: Any]) -> ([String: Any], Bool) 
             results: serverTensorOpsUpscaleBatch(request)
         ), false)
     case "mask_blur_batch", "dem_smooth_batch":
-        let results = serverUnsupportedBatch(request, backend: "cpu", operation: operation)
+        let results = serverRawRasterBatch(request, operation: operation)
         return (serverResponse(id: requestID, operation: operation, results: results), false)
     case "shutdown":
         return (serverResponse(id: requestID, operation: operation, results: [], shutdown: true), true)
