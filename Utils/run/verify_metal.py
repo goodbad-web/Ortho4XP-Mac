@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import struct
@@ -258,6 +259,41 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
+def tensorops_dispatch_metadata(diagnostics: str) -> dict[str, Any]:
+    """Extract tiled TensorOps execution details from ASHelper diagnostics."""
+    metadata: dict[str, Any] = {
+        "tensorops_dispatch": "single",
+        "tile_count": None,
+        "tile_core_size": None,
+        "tile_input_sizes": [],
+        "tile_halo": None,
+    }
+    tile_pattern = re.compile(
+        r"tensorops_dispatch=tiled\s+tile=(\d+)/(\d+)\s+"
+        r"core=(\d+)x(\d+)\s+input=(\d+)x(\d+)\s+halo=(\d+)"
+    )
+    for match in tile_pattern.finditer(diagnostics):
+        metadata["tensorops_dispatch"] = "tiled"
+        metadata["tile_count"] = int(match.group(2))
+        metadata["tile_core_size"] = [int(match.group(3)), int(match.group(4))]
+        metadata["tile_input_sizes"].append([int(match.group(5)), int(match.group(6))])
+        metadata["tile_halo"] = int(match.group(7))
+    output_match = re.search(
+        r"tensorops_dispatch=completed.*?output=(\d+)x(\d+)", diagnostics
+    )
+    if output_match:
+        metadata["tensorops_output_size"] = [
+            int(output_match.group(1)),
+            int(output_match.group(2)),
+        ]
+    return metadata
+
+
+def diagnostic_fallback_reason(diagnostics: str) -> str | None:
+    match = re.search(r"fallback reason=([^\s]+)", diagnostics)
+    return match.group(1) if match else None
+
+
 QUALITY_PSNR_DROP_DB = 0.25
 QUALITY_ERROR_INCREASE_RATIO = 0.05
 
@@ -368,6 +404,27 @@ def execution_record(
         for key in ("pack", "manifest_sha256", "pack_version"):
             if key in result:
                 record[key] = result[key]
+        for key in (
+            "requested_backend",
+            "effective_backend",
+            "dispatch",
+            "alpha_mode",
+            "batch_tasks",
+            "batch_success",
+            "batch_fallback",
+            "model_manifest_hash",
+            "tensorops_dispatch",
+            "tile_count",
+            "tile_core_size",
+            "tile_input_sizes",
+            "tile_halo",
+            "tensorops_output_size",
+            "diagnostic",
+        ):
+            if key in result:
+                record[key] = result[key]
+        if record["fallback_reason"] is None and result.get("fallback_reason"):
+            record["fallback_reason"] = result["fallback_reason"]
         if "timing_ms" in result:
             record["timing_ms"] = result["timing_ms"]
         if "quality" in result:
@@ -378,6 +435,9 @@ def execution_record(
             record["exit_code"] = result["run_exit"]
         elif "warmup_exit" in result:
             record["exit_code"] = result["warmup_exit"]
+        for key in ("tensorops_dispatch_observed", "neural_accelerator_confirmed"):
+            if key in result:
+                record[key] = bool(result[key])
     if gpu_tools is not None:
         record["gpu_tools"] = gpu_tools
         evidence_paths: list[str] = []
@@ -495,6 +555,119 @@ def compare_upscale_backend(
     }
 
 
+def compare_metalfx_batch(
+    helper: Path,
+    pairs: list[tuple[Path, Path, Path]],
+    runs: int,
+) -> dict[str, Any]:
+    """Measure one MetalFX batch and validate every output independently."""
+    from PIL import Image
+
+    if not pairs:
+        return {"status": "FAIL", "backend": "metalfx_spatial", "error": "empty_batch"}
+
+    def command(outputs: list[Path]) -> list[str]:
+        arguments = [str(helper), "--metalfx-spatial-upscale-batch"]
+        for (source, _, _), output in zip(pairs, outputs):
+            arguments.extend([str(source), str(output)])
+        return arguments
+
+    outputs = [output for _, output, _ in pairs]
+    warmup_outputs = [
+        output.with_name(output.stem + "_warmup.png") for output in outputs
+    ]
+    warmup = subprocess.run(
+        command(warmup_outputs),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if warmup.returncode != 0 or not all(path.is_file() for path in warmup_outputs):
+        return {
+            "status": "FAIL",
+            "backend": "metalfx_spatial",
+            "dispatch": "batch",
+            "batch_tasks": len(pairs),
+            "warmup_exit": warmup.returncode,
+            "diagnostic": (warmup.stdout or "").strip(),
+        }
+
+    samples_ms: list[float] = []
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for _ in range(runs):
+        for output in outputs:
+            try:
+                output.unlink()
+            except FileNotFoundError:
+                pass
+        started = time.perf_counter()
+        last_result = subprocess.run(
+            command(outputs),
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        samples_ms.append((time.perf_counter() - started) * 1000.0)
+        if last_result.returncode != 0 or not all(path.is_file() for path in outputs):
+            return {
+                "status": "FAIL",
+                "backend": "metalfx_spatial",
+                "dispatch": "batch",
+                "batch_tasks": len(pairs),
+                "run_exit": last_result.returncode,
+                "diagnostic": (last_result.stdout or "").strip(),
+            }
+
+    quality: list[dict[str, Any]] = []
+    try:
+        for (_, output, reference) in pairs:
+            with Image.open(output) as image, Image.open(reference) as ref:
+                if image.size != (ref.width, ref.height):
+                    raise ValueError(
+                        f"batch output size {image.size} != reference {ref.size}"
+                    )
+            quality.append(image_quality_metrics(output, reference))
+    except (OSError, ValueError) as error:
+        return {
+            "status": "FAIL",
+            "backend": "metalfx_spatial",
+            "dispatch": "batch",
+            "batch_tasks": len(pairs),
+            "error": str(error),
+        }
+    diagnostics = "\n".join(
+        value
+        for value in (
+            warmup.stdout or "",
+            last_result.stdout if last_result is not None else "",
+        )
+        if value
+    ).strip()
+    return {
+        "status": "PASS",
+        "backend": "metalfx_spatial",
+        "effective_backend": "metalfx_spatial",
+        "requested_backend": "metalfx_spatial",
+        "dispatch": "batch",
+        "alpha_mode": "opaque",
+        "batch_tasks": len(pairs),
+        "batch_success": len(pairs),
+        "batch_fallback": diagnostics.count("effective_backend=ci_lanczos"),
+        "runs": runs,
+        "timing_ms": {
+            "samples": samples_ms,
+            "median": percentile(samples_ms, 0.5),
+            "p95": percentile(samples_ms, 0.95),
+            "first_measured": samples_ms[0],
+            "scope": "ASHelper batch process plus image decode, MetalFX, readback, and PNG encode",
+        },
+        "quality": quality,
+        "diagnostic": diagnostics,
+    }
+
+
 def compare_tensorops_backend(
     helper: Path,
     pack: Path,
@@ -518,12 +691,14 @@ def compare_tensorops_backend(
         stderr=subprocess.STDOUT,
     )
     if warmup.returncode != 0 or not warmup_output.is_file():
+        diagnostic = (warmup.stdout or "").strip()
         return {
             "status": "FAIL",
             "backend": "tensorops",
             "warmup_exit": warmup.returncode,
             "output": str(output),
-            "diagnostic": (warmup.stdout or "").strip(),
+            "diagnostic": diagnostic,
+            "fallback_reason": diagnostic_fallback_reason(diagnostic),
         }
 
     samples_ms: list[float] = []
@@ -543,13 +718,15 @@ def compare_tensorops_backend(
         )
         samples_ms.append((time.perf_counter() - started) * 1000.0)
         if last_result.returncode != 0 or not output.is_file():
+            diagnostic = (last_result.stdout or "").strip()
             return {
                 "status": "FAIL",
                 "backend": "tensorops",
                 "warmup_exit": warmup.returncode,
                 "run_exit": last_result.returncode,
                 "output": str(output),
-                "diagnostic": (last_result.stdout or "").strip(),
+                "diagnostic": diagnostic,
+                "fallback_reason": diagnostic_fallback_reason(diagnostic),
             }
 
     try:
@@ -569,6 +746,7 @@ def compare_tensorops_backend(
         )
         if value
     ).strip()
+    dispatch_metadata = tensorops_dispatch_metadata(diagnostics)
     return {
         "status": "PASS",
         "backend": "tensorops",
@@ -585,6 +763,7 @@ def compare_tensorops_backend(
         },
         "quality": quality,
         "diagnostic": diagnostics,
+        **dispatch_metadata,
         "tensorops_dispatch_observed": "tensorops_dispatch=completed" in diagnostics,
     }
 
@@ -1515,19 +1694,64 @@ def main() -> int:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
-                alpha_status = (
-                    "PASS"
-                    if alpha_rejection.returncode != 0
-                    and "opaque input image" in (alpha_rejection.stdout or "")
-                    and not transparent_output.exists()
-                    else "FAIL"
-                )
+                alpha_status = "FAIL"
+                alpha_quality: dict[str, Any] = {}
+                if alpha_rejection.returncode == 0 and transparent_output.is_file():
+                    try:
+                        with Image.open(transparent_source).convert("RGBA") as input_image:
+                            with Image.open(transparent_output) as output_image:
+                                output_rgba = output_image.convert("RGBA")
+                                alpha_rgb_mean = tuple(
+                                    sum(pixel[channel] for pixel in output_rgba.getdata())
+                                    / (output_rgba.width * output_rgba.height)
+                                    for channel in range(3)
+                                )
+                                alpha_range = output_rgba.getchannel("A").getextrema()
+                                expected_size = (input_image.width * 2, input_image.height * 2)
+                                alpha_quality = {
+                                    "size": list(output_rgba.size),
+                                    "expected_size": list(expected_size),
+                                    "rgb_mean": alpha_rgb_mean,
+                                    "alpha_range": alpha_range,
+                                }
+                                alpha_status = (
+                                    "PASS"
+                                    if output_rgba.size == expected_size
+                                    and alpha_range[0] < 255
+                                    and alpha_rgb_mean[0] > 100.0
+                                    and alpha_rgb_mean[1] > 45.0
+                                    else "FAIL(rgba_split_or_premultiplied)"
+                                )
+                    except (OSError, ValueError) as error:
+                        alpha_quality = {"error": str(error)}
                 comparison_report["transparent_input"] = {
                     "status": alpha_status,
                     "exit": alpha_rejection.returncode,
                     "diagnostic": (alpha_rejection.stdout or "").strip(),
+                    "quality": alpha_quality,
                 }
                 print(f"upscale comparison transparent input={alpha_status}")
+                records.append(
+                    execution_record(
+                        backend="metalfx_spatial",
+                        role="rgba_comparison",
+                        dtype="RGBA8+alpha_bicubic",
+                        status=alpha_status,
+                        requested_backend="metalfx_spatial",
+                        effective_backend=(
+                            "metalfx_spatial" if alpha_status == "PASS" else "ci_lanczos"
+                        ),
+                        source=transparent_source,
+                        output=transparent_output,
+                        result={
+                            "dispatch": "single",
+                            "alpha_mode": "rgba_split_bicubic",
+                            "diagnostic": (alpha_rejection.stdout or "").strip(),
+                            "quality": alpha_quality,
+                            "run_exit": alpha_rejection.returncode,
+                        },
+                    )
+                )
                 if alpha_status != "PASS":
                     comparison_report["status"] = "FAIL"
                     overall_ok = False
@@ -1571,6 +1795,42 @@ def main() -> int:
                         if result["status"] != "PASS":
                             comparison_report["status"] = "FAIL"
                             overall_ok = False
+                    batch_outputs = [
+                        artifact_dir / f"comparison_metalfx_batch_{target_size}_{index}.png"
+                        for index in range(2)
+                    ]
+                    batch_result = compare_metalfx_batch(
+                        args.helper,
+                        [
+                            (comparison_source, batch_outputs[0], comparison_reference),
+                            (comparison_source, batch_outputs[1], comparison_reference),
+                        ],
+                        args.compare_runs,
+                    )
+                    case_report["metalfx_spatial_batch"] = batch_result
+                    records.append(
+                        execution_record(
+                            backend="metalfx_spatial",
+                            role="comparison",
+                            dtype="RGBA8",
+                            status=batch_result["status"],
+                            requested_backend="metalfx_spatial",
+                            effective_backend=batch_result.get(
+                                "effective_backend", "metalfx_spatial"
+                            ),
+                            source=comparison_source,
+                            output=batch_outputs[0],
+                            result=batch_result,
+                        )
+                    )
+                    print(
+                        f"upscale comparison {target_size}px metalfx_spatial batch="
+                        f"{batch_result['status']} "
+                        f"timing={json.dumps(batch_result.get('timing_ms', {}), sort_keys=True)}"
+                    )
+                    if batch_result["status"] != "PASS":
+                        comparison_report["status"] = "FAIL"
+                        overall_ok = False
                     comparison_report[str(target_size)] = case_report
             report["upscale_comparison"] = comparison_report
 

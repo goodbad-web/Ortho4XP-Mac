@@ -23,6 +23,20 @@ struct DDSHeaderDX10 {
     func toData() -> Data { var d = Data(); var t = self; withUnsafeBytes(of: &t) { d.append(contentsOf: $0) }; return d }
 }
 
+func checkedMultiply(_ values: Int..., label: String) throws -> Int {
+    var result = 1
+    for value in values {
+        let multiplication = result.multipliedReportingOverflow(by: value)
+        guard value >= 0, !multiplication.overflow else {
+            throw NSError(domain: "ASHelper", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "integer_overflow_\(label)"
+            ])
+        }
+        result = multiplication.partialValue
+    }
+    return result
+}
+
 let stderrLock = NSLock()
 
 func reportError(_ message: String) {
@@ -353,6 +367,7 @@ struct FP8SRIm2ColParams {
     uint sourceStride;
     uint targetK;
     uint kernelSize;
+    ulong baseIndex;
 };
 
 struct FP8SRPostParams {
@@ -379,13 +394,14 @@ kernel void fp8sr_im2col_image(
     device half *destination [[buffer(1)]],
     constant FP8SRIm2ColParams &params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
-    uint pixelCount = params.width * params.height;
-    uint total = pixelCount * params.targetK;
-    if (gid >= total) return;
-    uint pixel = gid / params.targetK;
-    uint feature = gid % params.targetK;
+    ulong pixelCount = ulong(params.width) * ulong(params.height);
+    ulong total = pixelCount * ulong(params.targetK);
+    ulong logicalIndex = params.baseIndex + ulong(gid);
+    if (logicalIndex >= total) return;
+    uint pixel = uint(logicalIndex / ulong(params.targetK));
+    uint feature = uint(logicalIndex % ulong(params.targetK));
     if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
-        destination[gid] = half(0.0h);
+        destination[logicalIndex] = half(0.0h);
         return;
     }
     uint inputChannel = feature % params.sourceChannels;
@@ -395,7 +411,7 @@ kernel void fp8sr_im2col_image(
     x = clamp(x, 0, int(params.width) - 1);
     y = clamp(y, 0, int(params.height) - 1);
     float4 value = source.read(uint2(x, y));
-    destination[gid] = half(inputChannel == 0 ? value.r : (inputChannel == 1 ? value.g : value.b));
+    destination[logicalIndex] = half(inputChannel == 0 ? value.r : (inputChannel == 1 ? value.g : value.b));
 }
 
 kernel void fp8sr_im2col_features(
@@ -403,13 +419,14 @@ kernel void fp8sr_im2col_features(
     device half *destination [[buffer(1)]],
     constant FP8SRIm2ColParams &params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
-    uint pixelCount = params.width * params.height;
-    uint total = pixelCount * params.targetK;
-    if (gid >= total) return;
-    uint pixel = gid / params.targetK;
-    uint feature = gid % params.targetK;
+    ulong pixelCount = ulong(params.width) * ulong(params.height);
+    ulong total = pixelCount * ulong(params.targetK);
+    ulong logicalIndex = params.baseIndex + ulong(gid);
+    if (logicalIndex >= total) return;
+    uint pixel = uint(logicalIndex / ulong(params.targetK));
+    uint feature = uint(logicalIndex % ulong(params.targetK));
     if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
-        destination[gid] = half(0.0h);
+        destination[logicalIndex] = half(0.0h);
         return;
     }
     uint inputChannel = feature % params.sourceChannels;
@@ -422,7 +439,7 @@ kernel void fp8sr_im2col_features(
     // TensorOps output tensors use [channels, pixels] extents, where the
     // innermost dimension is the channel.  Keep the intermediate buffer in
     // that physical pixel-major layout for the next im2col pass.
-    destination[gid] = source[sourcePixel * params.sourceStride + inputChannel];
+    destination[logicalIndex] = source[sourcePixel * params.sourceStride + inputChannel];
 }
 
 kernel void fp8sr_matmul(
@@ -656,6 +673,31 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
     ctx?.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h)); return raw
 }
 
+// MetalFX consumes an opaque RGB image in this path.  Keep a separate
+// unassociated-alpha conversion for RGBA inputs so transparent RGB values are
+// not darkened by Core Graphics premultiplication before they reach MetalFX.
+func getRawRGBAUnassociated(cgImage: CGImage) -> [UInt8]? {
+    let width = cgImage.width
+    let height = cgImage.height
+    guard width > 0, height > 0,
+          let byteCount = try? checkedMultiply(width, height, 4, label: "rgba_bytes") else {
+        return nil
+    }
+    var raw = [UInt8](repeating: 0, count: byteCount)
+    let bitmapInfo = CGImageByteOrderInfo.order32Big.rawValue | CGImageAlphaInfo.last.rawValue
+    guard let context = CGContext(
+        data: &raw,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: bitmapInfo
+    ) else { return nil }
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return raw
+}
+
 func cgImageFromRGBA(_ input: [UInt8], width: Int, height: Int) -> CGImage? {
     var raw = input
     guard let context = CGContext(
@@ -668,6 +710,79 @@ func cgImageFromRGBA(_ input: [UInt8], width: Int, height: Int) -> CGImage? {
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
     ) else { return nil }
     return context.makeImage()
+}
+
+func cgImageFromRGBAUnassociated(_ input: [UInt8], width: Int, height: Int) -> CGImage? {
+    guard width > 0, height > 0,
+          let byteCount = try? checkedMultiply(width, height, 4, label: "rgba_bytes"),
+          input.count == byteCount else { return nil }
+    var raw = input
+    let bitmapInfo = CGImageByteOrderInfo.order32Big.rawValue | CGImageAlphaInfo.last.rawValue
+    guard let context = CGContext(
+        data: &raw,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: bitmapInfo
+    ) else { return nil }
+    return context.makeImage()
+}
+
+func writePNG(_ raw: [UInt8], width: Int, height: Int, outputPath: String) -> Bool {
+    guard width > 0, height > 0 else { return false }
+    let pixelProduct = width.multipliedReportingOverflow(by: height)
+    guard !pixelProduct.overflow else { return false }
+    let byteProduct = pixelProduct.partialValue.multipliedReportingOverflow(by: 4)
+    guard !byteProduct.overflow,
+          raw.count == byteProduct.partialValue,
+          let image = cgImageFromRGBA(raw, width: width, height: height) else {
+        return false
+    }
+    let destinationURL = URL(fileURLWithPath: outputPath)
+    do {
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+    } catch {
+        return false
+    }
+    guard let destination = CGImageDestinationCreateWithURL(
+        destinationURL as CFURL,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    ) else { return false }
+    CGImageDestinationAddImage(destination, image, nil)
+    return CGImageDestinationFinalize(destination)
+}
+
+func writePNGUnassociated(_ raw: [UInt8], width: Int, height: Int, outputPath: String) -> Bool {
+    guard width > 0, height > 0,
+          let byteCount = try? checkedMultiply(width, height, 4, label: "rgba_bytes"),
+          raw.count == byteCount,
+          let image = cgImageFromRGBAUnassociated(raw, width: width, height: height) else {
+        return false
+    }
+    let destinationURL = URL(fileURLWithPath: outputPath)
+    do {
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+    } catch {
+        return false
+    }
+    guard let destination = CGImageDestinationCreateWithURL(
+        destinationURL as CFURL,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    ) else { return false }
+    CGImageDestinationAddImage(destination, image, nil)
+    return CGImageDestinationFinalize(destination)
 }
 
 func cpuPreprocessedImage(
@@ -1523,140 +1638,331 @@ func lanczosUpscale(inputPath: String, outputPath: String) -> Bool {
 }
 
 @available(macOS 13.0, *)
+private enum MetalFXSpatialError: Error, CustomStringConvertible {
+    case invalidInput
+    case unsupported
+    case execution(String)
+    case output
+
+    var description: String {
+        switch self {
+        case .invalidInput: return "invalid_input"
+        case .unsupported: return "unsupported"
+        case .execution(let message): return message
+        case .output: return "output_write"
+        }
+    }
+}
+
+@available(macOS 13.0, *)
+private final class MetalFXSpatialRuntime {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let ciContext: CIContext
+
+    init() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw MetalFXSpatialError.execution("metal_device")
+        }
+        guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+            throw MetalFXSpatialError.unsupported
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw MetalFXSpatialError.execution("command_queue")
+        }
+        self.device = device
+        self.commandQueue = commandQueue
+        self.ciContext = CIContext(mtlDevice: device, options: nil)
+    }
+
+    private func scaleOpaque(
+        raw: [UInt8],
+        width: Int,
+        height: Int
+    ) throws -> [UInt8] {
+        guard width > 0, height > 0,
+              let inputBytes = try? checkedMultiply(width, height, 4, label: "metalfx_input"),
+              raw.count == inputBytes,
+              let outputWidth = try? checkedMultiply(width, 2, label: "metalfx_output_width"),
+              let outputHeight = try? checkedMultiply(height, 2, label: "metalfx_output_height"),
+              let outputBytes = try? checkedMultiply(outputWidth, outputHeight, 4, label: "metalfx_output") else {
+            throw MetalFXSpatialError.invalidInput
+        }
+
+        let descriptor = MTLFXSpatialScalerDescriptor()
+        descriptor.colorTextureFormat = .rgba8Unorm
+        descriptor.outputTextureFormat = .rgba8Unorm
+        descriptor.inputWidth = width
+        descriptor.inputHeight = height
+        descriptor.outputWidth = outputWidth
+        descriptor.outputHeight = outputHeight
+        descriptor.colorProcessingMode = .perceptual
+        guard let scaler = descriptor.makeSpatialScaler(device: device) else {
+            throw MetalFXSpatialError.execution("scaler")
+        }
+
+        let inputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        inputDescriptor.storageMode = .shared
+        inputDescriptor.usage = scaler.colorTextureUsage
+        guard let inputTexture = device.makeTexture(descriptor: inputDescriptor) else {
+            throw MetalFXSpatialError.execution("input_texture")
+        }
+        raw.withUnsafeBytes { bytes in
+            inputTexture.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: width * 4
+            )
+        }
+
+        let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: outputWidth,
+            height: outputHeight,
+            mipmapped: false
+        )
+        outputDescriptor.storageMode = .private
+        outputDescriptor.usage = scaler.outputTextureUsage
+        guard let outputTexture = device.makeTexture(descriptor: outputDescriptor),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let readback = device.makeBuffer(length: outputBytes, options: .storageModeShared) else {
+            throw MetalFXSpatialError.execution("output_resources")
+        }
+
+        scaler.colorTexture = inputTexture
+        scaler.inputContentWidth = width
+        scaler.inputContentHeight = height
+        scaler.outputTexture = outputTexture
+        scaler.encode(commandBuffer: commandBuffer)
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            throw MetalFXSpatialError.execution("readback_encoder")
+        }
+        blit.copy(
+            from: outputTexture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOriginMake(0, 0, 0),
+            sourceSize: MTLSizeMake(outputWidth, outputHeight, 1),
+            to: readback,
+            destinationOffset: 0,
+            destinationBytesPerRow: outputWidth * 4,
+            destinationBytesPerImage: outputBytes
+        )
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            throw MetalFXSpatialError.execution(
+                "command_buffer_" + (commandBuffer.error?.localizedDescription ?? "failed")
+            )
+        }
+        return Array(UnsafeBufferPointer(
+            start: readback.contents().assumingMemoryBound(to: UInt8.self),
+            count: outputBytes
+        ))
+    }
+
+    private func scaleAlphaBicubic(
+        _ alpha: [UInt8],
+        width: Int,
+        height: Int
+    ) throws -> [UInt8] {
+        guard let alphaBytes = try? checkedMultiply(width, height, label: "alpha_input"),
+              alpha.count == alphaBytes else {
+            throw MetalFXSpatialError.invalidInput
+        }
+        var sourceBytes = alpha
+        guard let sourceContext = CGContext(
+            data: &sourceBytes,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let sourceImage = sourceContext.makeImage() else {
+            throw MetalFXSpatialError.execution("alpha_source")
+        }
+        let input = CIImage(cgImage: sourceImage)
+        guard let filter = CIFilter(name: "CIBicubicScaleTransform") else {
+            throw MetalFXSpatialError.execution("bicubic_filter")
+        }
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(2.0, forKey: kCIInputScaleKey)
+        filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
+        guard let output = filter.outputImage,
+              let outputWidth = try? checkedMultiply(width, 2, label: "alpha_output_width"),
+              let outputHeight = try? checkedMultiply(height, 2, label: "alpha_output_height"),
+              let rendered = ciContext.createCGImage(
+                  output,
+                  from: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+              ) else {
+            throw MetalFXSpatialError.execution("alpha_render")
+        }
+        var result = [UInt8](repeating: 0, count: outputWidth * outputHeight)
+        guard let outputContext = CGContext(
+            data: &result,
+            width: outputWidth,
+            height: outputHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: outputWidth,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            throw MetalFXSpatialError.execution("alpha_output")
+        }
+        outputContext.draw(rendered, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
+        return result
+    }
+
+    func upscale(image: CGImage) throws -> (raw: [UInt8], alphaMode: String) {
+        let width = image.width
+        let height = image.height
+        guard let source = getRawRGBAUnassociated(cgImage: image),
+              let pixelCount = try? checkedMultiply(width, height, label: "metalfx_pixels"),
+              source.count == pixelCount * 4 else {
+            throw MetalFXSpatialError.invalidInput
+        }
+        let hasAlpha = stride(from: 3, to: source.count, by: 4).contains { source[$0] < 255 }
+        if !hasAlpha {
+            return (try scaleOpaque(raw: source, width: width, height: height), "opaque")
+        }
+
+        var opaque = source
+        for offset in stride(from: 3, to: opaque.count, by: 4) {
+            opaque[offset] = 255
+        }
+        let rgbOutput = try scaleOpaque(raw: opaque, width: width, height: height)
+        let alphaInput = stride(from: 3, to: source.count, by: 4).map { source[$0] }
+        let alphaOutput = try scaleAlphaBicubic(alphaInput, width: width, height: height)
+        guard rgbOutput.count == alphaOutput.count * 4 else {
+            throw MetalFXSpatialError.execution("alpha_size")
+        }
+        var combined = rgbOutput
+        for pixel in 0..<alphaOutput.count {
+            combined[pixel * 4 + 3] = alphaOutput[pixel]
+        }
+        return (combined, "rgba_split_bicubic")
+    }
+
+    func render(inputPath: String, outputPath: String) throws -> String {
+        let sourceURL = URL(fileURLWithPath: inputPath)
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw MetalFXSpatialError.execution("input_load")
+        }
+        let result = try upscale(image: image)
+        guard writePNGUnassociated(
+            result.raw,
+            width: image.width * 2,
+            height: image.height * 2,
+            outputPath: outputPath
+        ) else {
+            throw MetalFXSpatialError.output
+        }
+        return result.alphaMode
+    }
+}
+
+@available(macOS 13.0, *)
+private func metalFXSpatialProcess(
+    runtime: MetalFXSpatialRuntime?,
+    inputPath: String,
+    outputPath: String,
+    fallbackAlphaProcessing: Bool
+) -> (success: Bool, effectiveBackend: String, alphaMode: String, reason: String?) {
+    do {
+        let activeRuntime = try runtime ?? MetalFXSpatialRuntime()
+        let mode = try activeRuntime.render(inputPath: inputPath, outputPath: outputPath)
+        return (true, "metalfx_spatial", mode, nil)
+    } catch {
+        let reason = String(describing: error)
+        if fallbackAlphaProcessing && lanczosUpscale(inputPath: inputPath, outputPath: outputPath) {
+            return (true, "ci_lanczos", "rgba_fallback", reason)
+        }
+        reportError("ASHelper: MetalFX Spatial failed input=\(inputPath) reason=\(reason)")
+        return (false, "metalfx_spatial", "unknown", reason)
+    }
+}
+
+@available(macOS 13.0, *)
 func metalFXSpatialUpscale(inputPath: String, outputPath: String) -> Bool {
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        reportError("ASHelper: MetalFX Spatial requires a Metal device.")
-        return false
+    let hasAlpha: Bool
+    if let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: inputPath) as CFURL, nil),
+       let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+        let raw = getRawRGBA(cgImage: image)
+        let explicitAlpha: Bool
+        switch image.alphaInfo {
+        case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly:
+            explicitAlpha = true
+        case .none, .noneSkipFirst, .noneSkipLast:
+            explicitAlpha = false
+        @unknown default:
+            explicitAlpha = false
+        }
+        hasAlpha = explicitAlpha
+            || stride(from: 3, to: raw.count, by: 4).contains { raw[$0] < 255 }
+    } else {
+        hasAlpha = false
     }
-    guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
-        reportError("ASHelper: MetalFX Spatial is not supported by '\(device.name)'.")
-        return false
-    }
-    let sourceURL = URL(fileURLWithPath: inputPath)
-    guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        reportError("ASHelper: Failed to load MetalFX Spatial input '\(inputPath)'.")
-        return false
-    }
-
-    let raw = getRawRGBA(cgImage: image)
-    guard raw.count == image.width * image.height * 4 else {
-        reportError("ASHelper: Failed to normalize MetalFX Spatial input '\(inputPath)'.")
-        return false
-    }
-    if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
-        reportError("ASHelper: MetalFX Spatial requires an opaque input image (alpha must be 255).")
-        return false
-    }
-
-    let descriptor = MTLFXSpatialScalerDescriptor()
-    descriptor.colorTextureFormat = .rgba8Unorm
-    descriptor.outputTextureFormat = .rgba8Unorm
-    descriptor.inputWidth = image.width
-    descriptor.inputHeight = image.height
-    descriptor.outputWidth = image.width * 2
-    descriptor.outputHeight = image.height * 2
-    descriptor.colorProcessingMode = .perceptual
-    guard let scaler = descriptor.makeSpatialScaler(device: device) else {
-        reportError("ASHelper: Failed to create MetalFX Spatial scaler.")
-        return false
-    }
-
-    let inputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rgba8Unorm,
-        width: image.width,
-        height: image.height,
-        mipmapped: false
+    let result = metalFXSpatialProcess(
+        runtime: nil,
+        inputPath: inputPath,
+        outputPath: outputPath,
+        fallbackAlphaProcessing: hasAlpha
     )
-    inputDescriptor.storageMode = .shared
-    inputDescriptor.usage = scaler.colorTextureUsage
-    guard let inputTexture = device.makeTexture(descriptor: inputDescriptor) else {
-        reportError("ASHelper: Failed to allocate MetalFX Spatial input texture.")
-        return false
-    }
-    raw.withUnsafeBytes { bytes in
-        inputTexture.replace(
-            region: MTLRegionMake2D(0, 0, image.width, image.height),
-            mipmapLevel: 0,
-            withBytes: bytes.baseAddress!,
-            bytesPerRow: image.width * 4
+    print(
+        "backend=metalfx_spatial effective_backend=\(result.effectiveBackend) "
+            + "dispatch=single alpha_mode=\(result.alphaMode)"
+            + (result.reason.map { " fallback_reason=\($0)" } ?? "")
+    )
+    return result.success
+}
+
+@available(macOS 13.0, *)
+func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
+    guard !pairs.isEmpty else { return false }
+    let runtime = try? MetalFXSpatialRuntime()
+    var allSuccessful = true
+    var successCount = 0
+    var fallbackCount = 0
+    let started = CFAbsoluteTimeGetCurrent()
+    for (index, pair) in pairs.enumerated() {
+        let itemStarted = CFAbsoluteTimeGetCurrent()
+        let result = metalFXSpatialProcess(
+            runtime: runtime,
+            inputPath: pair.0,
+            outputPath: pair.1,
+            fallbackAlphaProcessing: true
+        )
+        if result.success {
+            successCount += 1
+            if result.effectiveBackend == "ci_lanczos" { fallbackCount += 1 }
+        } else {
+            allSuccessful = false
+        }
+        let duration = (CFAbsoluteTimeGetCurrent() - itemStarted) * 1000.0
+        print(
+            "metalfx_batch_item=\(index + 1)/\(pairs.count) "
+                + "backend=metalfx_spatial effective_backend=\(result.effectiveBackend) "
+                + "dispatch=batch alpha_mode=\(result.alphaMode) "
+                + "duration_ms=\(String(format: "%.2f", duration))"
+                + (result.reason.map { " fallback_reason=\($0)" } ?? "")
         )
     }
-
-    let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rgba8Unorm,
-        width: image.width * 2,
-        height: image.height * 2,
-        mipmapped: false
+    let duration = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+    print(
+        "backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=batch "
+            + "batch_tasks=\(pairs.count) batch_success=\(successCount) "
+            + "batch_fallback=\(fallbackCount) duration_ms=\(String(format: "%.2f", duration))"
     )
-    outputDescriptor.storageMode = .private
-    outputDescriptor.usage = scaler.outputTextureUsage
-    guard let outputTexture = device.makeTexture(descriptor: outputDescriptor),
-          let queue = device.makeCommandQueue(),
-          let commandBuffer = queue.makeCommandBuffer(),
-          let readback = device.makeBuffer(
-              length: image.width * image.height * 16,
-              options: .storageModeShared
-          ) else {
-        reportError("ASHelper: Failed to allocate MetalFX Spatial output resources.")
-        return false
-    }
-
-    scaler.colorTexture = inputTexture
-    scaler.inputContentWidth = image.width
-    scaler.inputContentHeight = image.height
-    scaler.outputTexture = outputTexture
-    scaler.encode(commandBuffer: commandBuffer)
-    guard let blit = commandBuffer.makeBlitCommandEncoder() else {
-        reportError("ASHelper: Failed to create MetalFX Spatial readback encoder.")
-        return false
-    }
-    blit.copy(
-        from: outputTexture,
-        sourceSlice: 0,
-        sourceLevel: 0,
-        sourceOrigin: MTLOriginMake(0, 0, 0),
-        sourceSize: MTLSizeMake(image.width * 2, image.height * 2, 1),
-        to: readback,
-        destinationOffset: 0,
-        destinationBytesPerRow: image.width * 2 * 4,
-        destinationBytesPerImage: image.width * image.height * 16
-    )
-    blit.endEncoding()
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
-    guard commandBuffer.status == .completed else {
-        reportError(
-            "ASHelper: MetalFX Spatial command buffer failed: "
-                + (commandBuffer.error?.localizedDescription ?? "unknown error")
-        )
-        return false
-    }
-
-    guard let outputContext = CGContext(
-        data: readback.contents(),
-        width: image.width * 2,
-        height: image.height * 2,
-        bitsPerComponent: 8,
-        bytesPerRow: image.width * 2 * 4,
-        space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-    ), let outputImage = outputContext.makeImage(),
-          let destination = CGImageDestinationCreateWithURL(
-              URL(fileURLWithPath: outputPath) as CFURL,
-              UTType.png.identifier as CFString,
-              1,
-              nil
-          ) else {
-        reportError("ASHelper: Failed to create MetalFX Spatial output '\(outputPath)'.")
-        return false
-    }
-    CGImageDestinationAddImage(destination, outputImage, nil)
-    guard CGImageDestinationFinalize(destination) else {
-        reportError("ASHelper: Failed to write MetalFX Spatial output '\(outputPath)'.")
-        return false
-    }
-    return true
+    return allSuccessful
 }
 
 func metalFXSpatialAvailable() -> Bool {
@@ -1812,6 +2118,7 @@ private struct FP8SRIm2ColParams {
     var sourceStride: UInt32
     var targetK: UInt32
     var kernelSize: UInt32
+    var baseIndex: UInt64
 }
 
 @available(macOS 27.0, *)
@@ -2200,18 +2507,29 @@ private final class FP8SRRuntime {
         image: MTLTexture,
         destination: MTLBuffer,
         params: inout FP8SRIm2ColParams,
-        pixelCount: Int
+        elementCount: Int
     ) throws {
-        let paramsBuffer = try makeParamsBuffer(&params)
-        argumentTable.setTexture(image.gpuResourceID, index: 0)
-        argumentTable.setAddress(destination.gpuAddress, index: 1)
-        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
-        encoder.setComputePipelineState(imageIm2ColPipeline)
-        encoder.setArgumentTable(argumentTable)
-        encoder.dispatchThreads(
-            threadsPerGrid: MTLSize(width: pixelCount * Int(params.targetK), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
-        )
+        let maxChunk = 1 << 30
+        var baseIndex = 0
+        while baseIndex < elementCount {
+            let chunk = min(maxChunk, elementCount - baseIndex)
+            var chunkParams = params
+            chunkParams.baseIndex = UInt64(baseIndex)
+            let paramsBuffer = try makeParamsBuffer(&chunkParams)
+            argumentTable.setTexture(image.gpuResourceID, index: 0)
+            argumentTable.setAddress(destination.gpuAddress, index: 1)
+            argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+            encoder.setComputePipelineState(imageIm2ColPipeline)
+            encoder.setArgumentTable(argumentTable)
+            encoder.dispatchThreads(
+                threadsPerGrid: MTLSize(width: chunk, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+            )
+            baseIndex += chunk
+            if baseIndex < elementCount {
+                encodeDispatchBarrier(encoder)
+            }
+        }
         encodeDispatchBarrier(encoder)
     }
 
@@ -2220,18 +2538,29 @@ private final class FP8SRRuntime {
         source: MTLBuffer,
         destination: MTLBuffer,
         params: inout FP8SRIm2ColParams,
-        pixelCount: Int
+        elementCount: Int
     ) throws {
-        let paramsBuffer = try makeParamsBuffer(&params)
-        argumentTable.setAddress(source.gpuAddress, index: 0)
-        argumentTable.setAddress(destination.gpuAddress, index: 1)
-        argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
-        encoder.setComputePipelineState(featureIm2ColPipeline)
-        encoder.setArgumentTable(argumentTable)
-        encoder.dispatchThreads(
-            threadsPerGrid: MTLSize(width: pixelCount * Int(params.targetK), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
-        )
+        let maxChunk = 1 << 30
+        var baseIndex = 0
+        while baseIndex < elementCount {
+            let chunk = min(maxChunk, elementCount - baseIndex)
+            var chunkParams = params
+            chunkParams.baseIndex = UInt64(baseIndex)
+            let paramsBuffer = try makeParamsBuffer(&chunkParams)
+            argumentTable.setAddress(source.gpuAddress, index: 0)
+            argumentTable.setAddress(destination.gpuAddress, index: 1)
+            argumentTable.setAddress(paramsBuffer.gpuAddress, index: 2)
+            encoder.setComputePipelineState(featureIm2ColPipeline)
+            encoder.setArgumentTable(argumentTable)
+            encoder.dispatchThreads(
+                threadsPerGrid: MTLSize(width: chunk, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+            )
+            baseIndex += chunk
+            if baseIndex < elementCount {
+                encodeDispatchBarrier(encoder)
+            }
+        }
         encodeDispatchBarrier(encoder)
     }
 
@@ -2303,6 +2632,154 @@ private final class FP8SRRuntime {
         encodeDispatchBarrier(encoder)
     }
 
+    private static let coreTileDimension = 2048
+    private static let tileHalo = 1
+    private static let maxSingleTileDimension = coreTileDimension + tileHalo * 2
+    private static let safeActivationBytes = 3 * 1024 * 1024 * 1024
+
+    private func validateSingleTileGeometry(width: Int, height: Int) throws -> Int {
+        guard width > 0, height > 0,
+              width <= Self.maxSingleTileDimension,
+              height <= Self.maxSingleTileDimension else {
+            throw FP8SRError.execution("oversize_preflight")
+        }
+        let pixelCount = try checkedMultiply(width, height, label: "pixel_count")
+        guard pixelCount <= Int(UInt32.max) else {
+            throw FP8SRError.execution("im2col_index_overflow")
+        }
+        for layer in layers {
+            let kPadded = FP8SRRuntime.paddedKernelElements(layer.manifest)
+            let activationBytes = try checkedMultiply(
+                kPadded, pixelCount, 2, label: "activation_bytes"
+            )
+            guard activationBytes <= Self.safeActivationBytes else {
+                throw FP8SRError.execution("oversize_preflight")
+            }
+            let im2colElements = try checkedMultiply(
+                pixelCount, kPadded, label: "im2col_elements"
+            )
+            guard im2colElements <= Int(UInt32.max) else {
+                throw FP8SRError.execution("im2col_index_overflow")
+            }
+        }
+        let postprocessElements = try checkedMultiply(pixelCount, 32, label: "postprocess_elements")
+        guard postprocessElements <= Int(UInt32.max) else {
+            throw FP8SRError.execution("im2col_index_overflow")
+        }
+        return pixelCount
+    }
+
+    private func cropRGBA(
+        _ raw: [UInt8],
+        sourceWidth: Int,
+        sourceHeight: Int,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int
+    ) throws -> [UInt8] {
+        guard x >= 0, y >= 0, width > 0, height > 0,
+              x + width <= sourceWidth, y + height <= sourceHeight else {
+            throw FP8SRError.execution("tile_bounds")
+        }
+        let outputCount = try checkedMultiply(width, height, 4, label: "tile_rgba")
+        var result = [UInt8](repeating: 0, count: outputCount)
+        let sourceRowBytes = try checkedMultiply(sourceWidth, 4, label: "source_row_bytes")
+        let tileRowBytes = try checkedMultiply(width, 4, label: "tile_row_bytes")
+        for row in 0..<height {
+            let sourceOffset = try checkedMultiply(y + row, sourceRowBytes, label: "tile_source_offset")
+                + x * 4
+            let destinationOffset = row * tileRowBytes
+            result[destinationOffset..<(destinationOffset + tileRowBytes)] =
+                raw[sourceOffset..<(sourceOffset + tileRowBytes)]
+        }
+        return result
+    }
+
+    private func upscaleTiled(raw: [UInt8], width: Int, height: Int) throws -> [UInt8] {
+        let outputWidth = try checkedMultiply(width, 2, label: "tiled_output_width")
+        let outputHeight = try checkedMultiply(height, 2, label: "tiled_output_height")
+        let outputCount = try checkedMultiply(outputWidth, outputHeight, 4, label: "tiled_output")
+        var result = [UInt8](repeating: 0, count: outputCount)
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ortho4xp-tensorops-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let tileColumns = (width + Self.coreTileDimension - 1) / Self.coreTileDimension
+        let tileRows = (height + Self.coreTileDimension - 1) / Self.coreTileDimension
+        let tileCount = tileColumns * tileRows
+        var tileIndex = 0
+        for coreY in stride(from: 0, to: height, by: Self.coreTileDimension) {
+            let coreHeight = min(Self.coreTileDimension, height - coreY)
+            for coreX in stride(from: 0, to: width, by: Self.coreTileDimension) {
+                let coreWidth = min(Self.coreTileDimension, width - coreX)
+                let tileX = max(0, coreX - Self.tileHalo)
+                let tileY = max(0, coreY - Self.tileHalo)
+                let tileMaxX = min(width, coreX + coreWidth + Self.tileHalo)
+                let tileMaxY = min(height, coreY + coreHeight + Self.tileHalo)
+                let tileWidth = tileMaxX - tileX
+                let tileHeight = tileMaxY - tileY
+                let tileRaw = try cropRGBA(
+                    raw,
+                    sourceWidth: width,
+                    sourceHeight: height,
+                    x: tileX,
+                    y: tileY,
+                    width: tileWidth,
+                    height: tileHeight
+                )
+                let tileInput = temporaryDirectory.appendingPathComponent("tile_\(tileIndex)_input.png")
+                let tileOutput = temporaryDirectory.appendingPathComponent("tile_\(tileIndex)_output.png")
+                guard writePNG(tileRaw, width: tileWidth, height: tileHeight, outputPath: tileInput.path) else {
+                    throw FP8SRError.execution("tile_input_write")
+                }
+                do {
+                    try upscaleSingle(
+                        inputPath: tileInput.path,
+                        outputPath: tileOutput.path,
+                        emitCompletionLog: false
+                    )
+                } catch let error as FP8SRError {
+                    switch error {
+                    case .execution("nonfinite"):
+                        throw FP8SRError.execution("tile_nonfinite")
+                    case .execution("gpu_timeout"):
+                        throw FP8SRError.execution("tensorops_gpu_failure")
+                    default:
+                        throw error
+                    }
+                }
+                guard let outputSource = CGImageSourceCreateWithURL(tileOutput as CFURL, nil),
+                      let outputImage = CGImageSourceCreateImageAtIndex(outputSource, 0, nil) else {
+                    throw FP8SRError.execution("tile_output_decode")
+                }
+                let tileOutputRaw = getRawRGBA(cgImage: outputImage)
+                guard outputImage.width == tileWidth * 2,
+                      outputImage.height == tileHeight * 2 else {
+                    throw FP8SRError.execution("tile_output_invalid")
+                }
+                let copyX = (coreX - tileX) * 2
+                let copyY = (coreY - tileY) * 2
+                let destinationRowBytes = outputWidth * 4
+                let sourceRowBytes = outputImage.width * 4
+                let copyRowBytes = coreWidth * 2 * 4
+                for row in 0..<(coreHeight * 2) {
+                    let sourceOffset = (copyY + row) * sourceRowBytes + copyX * 4
+                    let destinationOffset = (coreY * 2 + row) * destinationRowBytes + coreX * 2 * 4
+                    result[destinationOffset..<(destinationOffset + copyRowBytes)] =
+                        tileOutputRaw[sourceOffset..<(sourceOffset + copyRowBytes)]
+                }
+                tileIndex += 1
+                print("tensorops_dispatch=tiled tile=\(tileIndex)/\(tileCount) core=\(coreWidth)x\(coreHeight) input=\(tileWidth)x\(tileHeight) halo=\(Self.tileHalo)")
+            }
+        }
+        return result
+    }
+
     func upscale(inputPath: String, outputPath: String) throws {
         let sourceURL = URL(fileURLWithPath: inputPath)
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
@@ -2310,17 +2787,50 @@ private final class FP8SRRuntime {
             throw FP8SRError.execution("input_decode")
         }
         let raw = getRawRGBA(cgImage: image)
-        guard raw.count == image.width * image.height * 4 else {
+        let inputByteCount = try checkedMultiply(image.width, image.height, 4, label: "input_rgba")
+        guard raw.count == inputByteCount else {
             throw FP8SRError.execution("input_normalize")
-        }
-        if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
-            throw FP8SRError.execution("alpha")
         }
         guard image.width > 0, image.height > 0,
               image.width <= 8192, image.height <= 8192 else {
             throw FP8SRError.execution("input_dimensions")
         }
-        let pixelCount = image.width * image.height
+        if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
+            throw FP8SRError.execution("alpha")
+        }
+        if max(image.width, image.height) > Self.coreTileDimension {
+            let tiledOutput = try upscaleTiled(raw: raw, width: image.width, height: image.height)
+            let outputWidth = image.width * 2
+            let outputHeight = image.height * 2
+            guard writePNG(tiledOutput, width: outputWidth, height: outputHeight, outputPath: outputPath) else {
+                throw FP8SRError.execution("output_write")
+            }
+            let dtype = layers.first?.weightDType ?? "unknown"
+            print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 dispatch=tiled output=\(outputWidth)x\(outputHeight)")
+            return
+        }
+        try upscaleSingle(inputPath: inputPath, outputPath: outputPath)
+    }
+
+    private func upscaleSingle(
+        inputPath: String,
+        outputPath: String,
+        emitCompletionLog: Bool = true
+    ) throws {
+        let sourceURL = URL(fileURLWithPath: inputPath)
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw FP8SRError.execution("input_decode")
+        }
+        let raw = getRawRGBA(cgImage: image)
+        let pixelCount = try validateSingleTileGeometry(width: image.width, height: image.height)
+        let inputByteCount = try checkedMultiply(image.width, image.height, 4, label: "input_rgba")
+        guard raw.count == inputByteCount else {
+            throw FP8SRError.execution("input_normalize")
+        }
+        if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
+            throw FP8SRError.execution("alpha")
+        }
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
             width: image.width,
@@ -2344,7 +2854,7 @@ private final class FP8SRRuntime {
         guard let commandBuffer = device.makeCommandBuffer(),
               let errorBuffer = device.makeBuffer(length: 128, options: .storageModeShared),
               let outputBuffer = device.makeBuffer(
-                  length: max(128, image.width * image.height * 16),
+                  length: max(128, try checkedMultiply(image.width, image.height, 16, label: "output_buffer")),
                   options: .storageModeShared
               ) else {
             throw FP8SRError.execution("command_buffer")
@@ -2352,6 +2862,17 @@ private final class FP8SRRuntime {
         errorBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: errorBuffer.length)
         outputBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: outputBuffer.length)
         transientBuffers.removeAll(keepingCapacity: true)
+        var temporaryResources: [MTLAllocation] = [inputTexture, errorBuffer, outputBuffer]
+        defer {
+            for resource in temporaryResources {
+                residencySet.removeAllocation(resource)
+            }
+            for buffer in transientBuffers {
+                residencySet.removeAllocation(buffer)
+            }
+            transientBuffers.removeAll(keepingCapacity: true)
+            residencySet.commit()
+        }
         residencySet.addAllocation(inputTexture)
         residencySet.addAllocation(errorBuffer)
         residencySet.addAllocation(outputBuffer)
@@ -2367,9 +2888,10 @@ private final class FP8SRRuntime {
             let kPadded = FP8SRRuntime.paddedKernelElements(layer.manifest)
             let activationBuffer = try FP8SRRuntime.makeSharedBuffer(
                 device: device,
-                data: Data(count: max(128, kPadded * pixelCount * 2))
+                data: Data(count: max(128, try checkedMultiply(kPadded, pixelCount, 2, label: "activation_buffer")))
             )
             residencySet.addAllocation(activationBuffer)
+            temporaryResources.append(activationBuffer)
             _ = try makeTensor(
                 buffer: activationBuffer,
                 dimensions: [kPadded, pixelCount],
@@ -2380,36 +2902,37 @@ private final class FP8SRRuntime {
                 var params = FP8SRIm2ColParams(
                     width: UInt32(image.width), height: UInt32(image.height),
                     sourceChannels: 3, sourceStride: 3,
-                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel)
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel), baseIndex: 0
                 )
                 try encodeImageIm2Col(
                     encoder: encoder,
                     image: inputTexture,
                     destination: activationBuffer,
                     params: &params,
-                    pixelCount: pixelCount
+                    elementCount: try checkedMultiply(pixelCount, kPadded, label: "image_im2col")
                 )
             } else if let previousOutput {
                 var params = FP8SRIm2ColParams(
                     width: UInt32(image.width), height: UInt32(image.height),
                     sourceChannels: UInt32(layer.manifest.inChannels), sourceStride: 32,
-                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel)
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel), baseIndex: 0
                 )
                 try encodeFeatureIm2Col(
                     encoder: encoder,
                     source: previousOutput,
                     destination: activationBuffer,
                     params: &params,
-                    pixelCount: pixelCount
+                    elementCount: try checkedMultiply(pixelCount, kPadded, label: "feature_im2col")
                 )
             }
 
-            let outputLength = max(128, 32 * pixelCount * 2 + 128)
+            let outputLength = max(128, try checkedMultiply(32, pixelCount, 2, label: "layer_output") + 128)
             guard let layerOutput = device.makeBuffer(length: outputLength, options: .storageModeShared) else {
                 throw FP8SRError.execution("layer_output")
             }
             layerOutput.contents().initializeMemory(as: UInt8.self, repeating: 0, count: layerOutput.length)
             residencySet.addAllocation(layerOutput)
+            temporaryResources.append(layerOutput)
             _ = try makeTensor(
                 buffer: layerOutput,
                 dimensions: [32, pixelCount],
@@ -2503,8 +3026,10 @@ private final class FP8SRRuntime {
         guard CGImageDestinationFinalize(destination) else {
             throw FP8SRError.execution("output_write")
         }
-        let dtype = layers.first?.weightDType ?? "unknown"
-        print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 output=\(image.width * 2)x\(image.height * 2)")
+        if emitCompletionLog {
+            let dtype = layers.first?.weightDType ?? "unknown"
+            print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 output=\(image.width * 2)x\(image.height * 2)")
+        }
     }
 }
 
@@ -2593,6 +3118,26 @@ else if args[1] == "--metalfx-spatial-upscale" {
         fail("ASHelper: MetalFX Spatial requires macOS 13 or newer.")
     }
     if !metalFXSpatialUpscale(inputPath: args[2], outputPath: args[3]) {
+        exit(1)
+    }
+}
+else if args[1] == "--metalfx-spatial-upscale-batch" {
+    guard args.count >= 4 else {
+        fail("ASHelper: --metalfx-spatial-upscale-batch expects at least one input/output pair.")
+    }
+    guard (args.count - 2) % 2 == 0 else {
+        fail("ASHelper: --metalfx-spatial-upscale-batch argument count is invalid.")
+    }
+    guard #available(macOS 13.0, *) else {
+        fail("ASHelper: MetalFX Spatial requires macOS 13 or newer.")
+    }
+    var pairs: [(String, String)] = []
+    var index = 2
+    while index + 1 < args.count {
+        pairs.append((args[index], args[index + 1]))
+        index += 2
+    }
+    if !metalFXSpatialUpscaleBatch(pairs: pairs) {
         exit(1)
     }
 }

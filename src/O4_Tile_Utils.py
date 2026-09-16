@@ -497,6 +497,29 @@ def _ashelper_metal_available(as_helper):
     return available
 
 
+def _ashelper_metalfx_available(as_helper):
+    """Probe MetalFX separately from the generic Metal DDS capability."""
+    try:
+        result = subprocess.run(
+            [as_helper, "--capabilities"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        UI.vprint(1, f"WARNING: Could not probe ASHelper MetalFX capability: {error}")
+        return False
+    available = (
+        result.returncode == 0
+        and "metalfx_spatial_available=true" in (result.stdout or "").splitlines()
+    )
+    if not available and (result.stdout or "").strip():
+        UI.vprint(1, "WARNING: ASHelper MetalFX Spatial is unavailable; using per-image fallback.")
+    return available
+
+
 def _ashelper_tensorops_available(as_helper):
     """Probe the macOS 27 TensorOps capability before batch deferral."""
     try:
@@ -543,7 +566,7 @@ def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
             # later batch fails.
             if IMG.normalize_upscale_backend(
                 getattr(item_tile, "upscale_backend", "none")
-            ) == "tensorops":
+            ) in ("tensorops", "metalfx_spatial"):
                 prepared_file = None
             if prepared_file and item_provider in IMG.providers_dict:
                 direct_cache = IMG.find_imagery_cache_path(
@@ -998,6 +1021,12 @@ def _build_tile(tile, persist_config=True):
                 if gpu_converter_requested
                 else False
             )
+            metalfx_available = (
+                _ashelper_metalfx_available(as_helper)
+                if gpu_converter_requested
+                and requested_upscale_backend == "metalfx_spatial"
+                else False
+            )
             tensorops_available = (
                 _ashelper_tensorops_available(as_helper)
                 if gpu_converter_requested
@@ -1071,9 +1100,37 @@ def _build_tile(tile, persist_config=True):
                     item_tile, item_x, item_y, item_zoomlevel, provider_code
                 )
 
+            def can_defer_to_metalfx_batch(item):
+                item_tile, item_x, item_y, item_zoomlevel, provider_code = item
+                if requested_upscale_backend != "metalfx_spatial":
+                    return False
+                if not gpu_batch_enabled or not metalfx_available:
+                    return False
+                if not IMG.should_upscale_texture(
+                    item_tile, item_x, item_y, item_zoomlevel, provider_code
+                ):
+                    return False
+                # Only direct provider cache images are sent to MetalFX. A
+                # prepared/combined/RGBA image remains on the per-image path,
+                # where ASHelper can perform its RGBA split safely.
+                if provider_code not in IMG.providers_dict:
+                    return False
+                if provider_code in IMG.local_combined_providers_dict:
+                    return False
+                return IMG.can_defer_gpu_batch_for_texture(
+                    item_tile, item_x, item_y, item_zoomlevel, provider_code
+                )
+
+            metalfx_batch_items = [
+                item for item in convert_list if can_defer_to_metalfx_batch(item)
+            ]
+            regular_convert_list = [
+                item for item in convert_list if item not in metalfx_batch_items
+            ]
+
             batch_items_eligible = bool(
-                convert_list
-                and all(can_defer_to_gpu_batch(item) for item in convert_list)
+                regular_convert_list
+                and all(can_defer_to_gpu_batch(item) for item in regular_convert_list)
             )
             tensorops_model_path = getattr(
                 tile, 'fp8_model_path', getattr(IMG, 'fp8_model_path', '')
@@ -1094,6 +1151,7 @@ def _build_tile(tile, persist_config=True):
             defer_gpu_batch = bool(
                 gpu_batch_enabled
                 and batch_items_eligible
+                and requested_upscale_backend != "metalfx_spatial"
                 and (
                     requested_upscale_backend != "tensorops"
                     or defer_tensorops_batch
@@ -1108,16 +1166,168 @@ def _build_tile(tile, persist_config=True):
                 success_count = 0
                 conversion_success = False
             else:
-                pool_success = multiprocessing_pool(
-                    IMG.convert_texture,
-                    convert_list,
-                    max_convert_slots,
-                    progress=dico_conv_progress,
-                    init_func=IMG.init_worker,
-                    init_args=config_data
+                if regular_convert_list:
+                    pool_success = multiprocessing_pool(
+                        IMG.convert_texture,
+                        regular_convert_list,
+                        max_convert_slots,
+                        progress=dico_conv_progress,
+                        init_func=IMG.init_worker,
+                        init_args=config_data
+                    )
+                    success_count = len(regular_convert_list) if pool_success else 0
+                    conversion_success = bool(pool_success)
+                else:
+                    success_count = 0
+                    conversion_success = True
+
+            # Direct provider JPEGs are upscaled first in one ASHelper process.
+            # The generated PNGs are consumed by the existing DDS batch below,
+            # which is where provider color correction and masks are applied.
+            metalfx_batch_outputs = []
+            metalfx_batch_error = None
+            if conversion_success and metalfx_batch_items:
+                import O4_RAMDisk_Utils
+                UI.vprint(
+                    1,
+                    "-> Executing MetalFX Spatial upscale batch "
+                    f"({len(metalfx_batch_items)} images)...",
                 )
-                success_count = len(convert_list) if pool_success else 0
-                conversion_success = bool(pool_success)
+                metalfx_args = []
+                for item in metalfx_batch_items:
+                    item_tile, item_x, item_y, item_z, item_provider = item
+                    out_file_name = FNAMES.dds_file_name_from_attributes(
+                        item_x, item_y, item_z, item_provider
+                    )
+                    file_dir = FNAMES.jpeg_file_dir_from_attributes(
+                        item_tile.lat,
+                        item_tile.lon,
+                        item_z,
+                        IMG.providers_dict[item_provider],
+                    )
+                    input_path = IMG.find_imagery_cache_path(
+                        item_x, item_y, item_z, item_provider, file_dir
+                    )
+                    if not input_path or not IMG._jpeg_file_is_ready(input_path):
+                        metalfx_batch_error = f"input source not found for {out_file_name}"
+                        break
+                    output_path = os.path.join(
+                        UI.Ortho4XP_dir,
+                        "tmp",
+                        out_file_name.replace(
+                            ".dds", "_metalfx_spatial_upscaled.png"
+                        ),
+                    )
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    metalfx_args.extend([input_path, output_path])
+                    metalfx_batch_outputs.append((item, input_path, output_path))
+
+                if metalfx_batch_error is None and metalfx_batch_outputs:
+                    batch_started = time.perf_counter()
+                    batch_tasks = len(metalfx_batch_outputs)
+                    batch_success = 0
+                    batch_fallback = 0
+                    # Keep argv bounded for large tiles while preserving one
+                    # ASHelper runtime per chunk (device/queue/CIContext are
+                    # reused for every image in that process).
+                    chunk_pairs = 32
+                    for chunk_start in range(0, batch_tasks, chunk_pairs):
+                        chunk_outputs = metalfx_batch_outputs[
+                            chunk_start : chunk_start + chunk_pairs
+                        ]
+                        chunk_args = []
+                        for _, input_path, output_path in chunk_outputs:
+                            chunk_args.extend([input_path, output_path])
+                        try:
+                            batch_result = subprocess.run(
+                                [as_helper, "--metalfx-spatial-upscale-batch"]
+                                + chunk_args,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                check=False,
+                            )
+                            if batch_result.stdout:
+                                output_level = 0 if batch_result.returncode != 0 else 2
+                                for line in batch_result.stdout.splitlines():
+                                    UI.vprint(output_level, "      " + line)
+                                    if line.startswith("metalfx_batch_item="):
+                                        batch_success += int(
+                                            "effective_backend=metalfx_spatial" in line
+                                        )
+                                        batch_fallback += int(
+                                            "effective_backend=ci_lanczos" in line
+                                        )
+                            if batch_result.returncode != 0:
+                                metalfx_batch_error = (
+                                    f"ASHelper returned {batch_result.returncode}"
+                                )
+                                break
+                            invalid_outputs = [
+                                output_path
+                                for _, input_path, output_path in chunk_outputs
+                                if not IMG._valid_upscale_output(input_path, output_path)
+                            ]
+                            if invalid_outputs:
+                                metalfx_batch_error = (
+                                    "invalid output: " + ", ".join(invalid_outputs)
+                                )
+                                break
+                        except Exception as error:
+                            metalfx_batch_error = f"ASHelper execution failed: {error}"
+                            break
+                    duration_ms = (time.perf_counter() - batch_started) * 1000.0
+                    UI.vprint(
+                        1,
+                        "   MetalFX batch summary: "
+                        f"batch_tasks={batch_tasks} batch_success={batch_success} "
+                        f"batch_fallback={batch_fallback} duration_ms={duration_ms:.2f}",
+                    )
+
+                if metalfx_batch_error is not None:
+                    # ASHelper keeps successful per-image outputs even when
+                    # another item could not be recovered. Preserve those
+                    # outputs for inspection and remove only invalid files.
+                    for _, input_path, output_path in metalfx_batch_outputs:
+                        if IMG._valid_upscale_output(input_path, output_path):
+                            continue
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                    UI.vprint(
+                        1,
+                        "WARNING: MetalFX batch failed "
+                        f"({metalfx_batch_error}); falling back to per-texture processing.",
+                    )
+                    fallback_progress = {
+                        "done": 0,
+                        "bar": 3,
+                        "message": "MetalFX fallback DDS conversion",
+                    }
+                    fallback_success = _run_cpu_fallback(
+                        metalfx_batch_items,
+                        config_data,
+                        max_convert_slots,
+                        fallback_progress,
+                    )
+                    success_count += len(metalfx_batch_items) if fallback_success else 0
+                    conversion_success = bool(fallback_success)
+                    metalfx_batch_items = []
+                    metalfx_batch_outputs = []
+                elif metalfx_batch_outputs:
+                    success_count += len(metalfx_batch_outputs)
+                    # The existing DDS batch below applies masks and color
+                    # correction to these MetalFX PNGs.
+                    defer_gpu_batch = True
+
+            batch_convert_list = (
+                metalfx_batch_items if metalfx_batch_items else convert_list
+            )
 
             # TensorOps image work is intentionally batched in one ASHelper
             # process.  FP8SRRuntime caches the validated pack in that
@@ -1231,7 +1441,7 @@ def _build_tile(tile, persist_config=True):
                 batch_args = []
                 temp_files_to_delete = []
                 batch_generated_mask_files = []
-                prepared_input_paths = [None] * len(convert_list)
+                prepared_input_paths = [None] * len(batch_convert_list)
                 batch_output_specs = []
                 batch_attempted = False
 
@@ -1249,7 +1459,7 @@ def _build_tile(tile, persist_config=True):
                         except OSError:
                             pass
                 
-                for item_index, item in enumerate(convert_list):
+                for item_index, item in enumerate(batch_convert_list):
                     tile, til_x_left, til_y_top, zoomlevel, provider_code = item
                     out_file_name = FNAMES.dds_file_name_from_attributes(til_x_left, til_y_top, zoomlevel, provider_code)
                     out_file_path = os.path.join(tile.build_dir, "textures", out_file_name)
@@ -1325,7 +1535,11 @@ def _build_tile(tile, persist_config=True):
                         effective_upscale_backend == "tensorops"
                         and input_path == tensorops_upscaled_tmp
                     )
-                    mask_input = source_is_cache or fp8_batch_input
+                    metalfx_batch_input = (
+                        effective_upscale_backend == "metalfx_spatial"
+                        and input_path == metalfx_upscaled_tmp
+                    )
+                    mask_input = source_is_cache or fp8_batch_input or metalfx_batch_input
                     mask_path = "none"
                     if mask_input and tile.imprint_masks_to_dds:
                         try:
@@ -1369,7 +1583,7 @@ def _build_tile(tile, persist_config=True):
                     
                     color_code = "none"
                     color_filter_input = (
-                        source_is_cache or fp8_batch_input
+                        source_is_cache or fp8_batch_input or metalfx_batch_input
                     )
                     if color_filter_input and provider_code in IMG.providers_dict:
                         color_code = IMG.providers_dict[provider_code].get(
@@ -1486,9 +1700,9 @@ def _build_tile(tile, persist_config=True):
                     cleanup_batch_outputs()
                     UI.vprint(1, "-> Falling back to CPU DDS conversion via ASHelper...")
                     fallback_convert_list = _cpu_fallback_convert_args(
-                        convert_list, prepared_input_paths
+                        batch_convert_list, prepared_input_paths
                     )
-                    for item in convert_list:
+                    for item in batch_convert_list:
                         item_out_name = FNAMES.dds_file_name_from_attributes(
                             item[1], item[2], item[3], item[4]
                         )
@@ -1519,7 +1733,7 @@ def _build_tile(tile, persist_config=True):
                         max_convert_slots,
                         fallback_progress,
                     )
-                    success_count = len(convert_list) if fallback_success else 0
+                    success_count = len(batch_convert_list) if fallback_success else 0
                     conversion_success = bool(fallback_success)
 
                 if conversion_success:

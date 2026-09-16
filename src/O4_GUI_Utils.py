@@ -1040,7 +1040,9 @@ class Ortho4XP_GUI(tk.Tk):
 
     def _finish_exit(self):
         worker = getattr(self, "working_thread", None)
-        cache_window = getattr(self, "imagery_cache_window", None)
+        # A partially constructed Tk test double has no ``tk`` attribute;
+        # tkinter's __getattr__ would recurse while probing an absent window.
+        cache_window = self.__dict__.get("imagery_cache_window")
         cache_worker = (
             getattr(cache_window, "worker_thread", None)
             if cache_window is not None

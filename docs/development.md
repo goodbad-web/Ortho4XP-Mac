@@ -65,7 +65,17 @@ MetalFX SpatialとCore Image Lanczosの2倍アップスケールをM5 Max上で�
 ./Utils/run/verify_metal.sh --compare-upscale --compare-runs 5 --keep-artifacts
 ```
 
-この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。バックエンドの正規記録名は`ci_lanczos`、`metalfx_spatial`、`tensorops`で、旧`lanczos`と`fp8_tensorops`は互換aliasとして受け付ける。MetalFX Spatialは本番設定で明示的に選択した場合だけ使用し、透明度を含む画像や非対応・実行失敗時はCore Image Lanczosへフォールバックする。
+この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。バックエンドの正規記録名は`ci_lanczos`、`metalfx_spatial`、`tensorops`で、旧`lanczos`と`fp8_tensorops`は互換aliasとして受け付ける。MetalFX Spatialは本番設定で明示的に選択した場合だけ使用する。不透明RGBは直接MetalFXへ送り、直接プロバイダのJPEGはMetalFX batch後に色補正・マスク・DDS化する。RGBAはRGBをstraight-alphaのままMetalFXで処理し、alphaを`CIBicubicScaleTransform`で2倍化して再合成する。alpha分離・再合成に失敗した場合、または非対応・GPU実行失敗時はCore Image Lanczosへフォールバックする。
+
+MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
+
+```sh
+./Utils/mac/ASHelper --metalfx-spatial-upscale input-rgba.png output.png
+./Utils/mac/ASHelper --metalfx-spatial-upscale-batch \
+  input-1.jpg output-1.png input-2.png output-2.png
+```
+
+ログの`backend`、`effective_backend`、`alpha_mode`、`dispatch`、`duration_ms`と、batchの`batch_tasks`、`batch_success`、`batch_fallback`を記録する。`verify_metal.py --compare-upscale`はopaque、RGBA、batchを測定する。MetalFXを利用できない環境でRGBA単画像を実行した場合も、ASHelper内のLanczos fallbackが成功すれば出力を残し、実際にMetalFX dispatchが発生したかはログの`effective_backend`で区別する。
 
 精度ラダーはFP16基準、FP8、FP4、INT2の順に実行する。FP8が画質ゲートを通過しない限りFP4以降は実行せず、FP4が通過しない限りINT2も実行しない。既定ゲートは、共通参照画像に対するFP16比でPSNR低下0.25dB以内、MAE/RMSE増加5%以内、2倍サイズ、有限値、継ぎ目なしである。
 
@@ -126,5 +136,7 @@ Utils/mac/ASHelper --tensorops-upscale-batch \
 ```
 
 `tensorops_dispatch=ready`はTensorOpsパイプライン初期化、`tensorops_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。`--gpu-tools`のprofile結果、またはXcode GPU traceのNeural Acceleratorカウンタで別途確認する。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認とGPU traceの確認は未実行として分けて報告する。
+
+TensorOpsの入力幅または高さが2048pxを超える場合、ASHelperは2048px以下の中心領域と1px haloへ自動分割する。4096x4096は4タイルを処理し、各タイルの中心2倍領域だけを最終画像へコピーする。`tensorops_dispatch=tiled`、`tile_count`、`tile_core_size`、`tile_input_sizes`、`tile_halo`は実行記録へ保存される。タイルのGPU失敗・非有限値・出力サイズ不正は部分出力を採用せず、上位の既存Lanczosフォールバックへ渡す。4GiB相当のアドレス境界は公式Metal上限ではなく、M5 Max/macOS 27で観測した単一ディスパッチの安全運用上の閾値として扱う。
 
 構文確認、ビルド、限定的なスクリプト実行だけでは、実際のProvider応答、長時間のタイル生成、GUI操作、利用者データへの影響まで保証しない。未実行の範囲を最終報告に明記する。
