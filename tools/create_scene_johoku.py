@@ -427,6 +427,8 @@ def _write_dsf(path: Path, config: dict[str, object]) -> None:
     astro_lat, astro_lon, astro_heading = _coordinate(config, "astro")
     west_lat, west_lon, west_heading = _coordinate(config, "west_star")
     east_lat, east_lon, east_heading = _coordinate(config, "east_star")
+    podium_lat = (west_lat + east_lat) / 2.0
+    podium_lon = (west_lon + east_lon) / 2.0
     lines = [
         "PROPERTY sim/planet earth", "PROPERTY sim/overlay 1",
         f"PROPERTY sim/west {int(tile['lon'])}", f"PROPERTY sim/east {int(tile['lon']) + 1}",
@@ -438,7 +440,7 @@ def _write_dsf(path: Path, config: dict[str, object]) -> None:
         f"OBJECT 0 {astro_lon:.7f} {astro_lat:.7f} {astro_heading:.2f}",
         f"OBJECT 1 {west_lon:.7f} {west_lat:.7f} {west_heading:.2f}",
         f"OBJECT 2 {east_lon:.7f} {east_lat:.7f} {east_heading:.2f}",
-        f"OBJECT 3 {astro_lon:.7f} {astro_lat:.7f} {astro_heading:.2f}",
+        f"OBJECT 3 {podium_lon:.7f} {podium_lat:.7f} 0.00",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

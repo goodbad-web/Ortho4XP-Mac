@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,63 @@ def test_corrupt_http_response_is_recorded(monkeypatch):
 
     assert success == 0
     assert "corrupt_image" in state.reasons
+
+
+def test_wrong_sized_http_response_is_retried_and_recorded(monkeypatch):
+    payload = io.BytesIO()
+    Image.new("RGB", (1, 1), "blue").save(payload, format="JPEG")
+
+    class Response:
+        headers = {"Content-Type": "image/jpeg"}
+        content = payload.getvalue()
+
+        def __str__(self):
+            return "[200]"
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    state = IMG._TextureFetchState()
+    monkeypatch.setattr(IMG, "max_baddata_retries", 1)
+    success, _data = IMG.http_request_to_image(
+        256, 256, "https://example.invalid/image.jpg", {}, Session(), state
+    )
+
+    assert success == 0
+    assert "unexpected_image_dimensions" in state.reasons
+
+
+def test_transient_corrupt_http_response_does_not_degrade_successful_retry(
+    monkeypatch,
+):
+    payload = io.BytesIO()
+    Image.new("RGB", (256, 256), "blue").save(payload, format="JPEG")
+    responses = []
+
+    class Response:
+        def __init__(self, content):
+            self.headers = {"Content-Type": "image/jpeg"}
+            self.content = content
+
+        def __str__(self):
+            return "[200]"
+
+    responses.extend((Response(b"bad"), Response(payload.getvalue())))
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return responses.pop(0)
+
+    state = IMG._TextureFetchState()
+    monkeypatch.setattr(IMG, "max_baddata_retries", 2)
+    success, image = IMG.http_request_to_image(
+        256, 256, "https://example.invalid/image.jpg", {}, Session(), state
+    )
+
+    assert success == 1
+    assert image.size == (256, 256)
+    assert not state.degraded
 
 
 def test_provider_max_zl_is_not_degraded(monkeypatch):
@@ -225,6 +283,151 @@ def test_repair_cli_extracts_55_unique_targets(tmp_path):
     assert targets[0]["tile_lon"] == 139
 
 
+def test_repair_cli_extracts_japanese_targets(tmp_path):
+    repair = _load_repair_cli()
+    tile_dir = tmp_path / "zOrtho4XP_+35+139"
+    tile_dir.mkdir()
+    log = tile_dir / "Ortho4XP_build.log"
+    log.write_text(
+        "[品質確認] 206720_465760_BI19.jpg を 25840_58208_BI16.jpg から再構成しました。\n",
+        encoding="utf-8",
+    )
+
+    targets = repair.extract_targets([log])
+
+    assert len(targets) == 1
+    assert targets[0]["provider_code"] == "BI"
+
+
+def test_repair_cli_extracts_custom_build_dir_from_tile_config(tmp_path):
+    repair = _load_repair_cli()
+    build_dir = tmp_path / "custom-build"
+    build_dir.mkdir()
+    (build_dir / "Ortho4XP_+35+139.cfg").write_text("", encoding="utf-8")
+    log = build_dir / "Ortho4XP_build.log"
+    log.write_text(
+        "[Quality Check] Rebuilt 206720_465760_BI19.jpg from 25840_58208_BI16.jpg.\n",
+        encoding="utf-8",
+    )
+
+    targets = repair.extract_targets([log])
+
+    assert len(targets) == 1
+    assert targets[0]["tile_lat"] == 35
+    assert targets[0]["tile_lon"] == 139
+    assert targets[0]["tile_build_dir"] == str(build_dir.resolve())
+
+
+def test_repair_cli_loads_tile_from_log_build_dir(monkeypatch, tmp_path):
+    repair = _load_repair_cli()
+    captured = {}
+
+    class FakeTile:
+        def __init__(self, lat, lon, custom_build_dir):
+            captured.update(
+                lat=lat, lon=lon, custom_build_dir=custom_build_dir
+            )
+
+        def read_from_config(self):
+            return True
+
+    monkeypatch.setattr(repair.CFG, "Tile", FakeTile)
+    build_dir = tmp_path / "custom-build"
+    target = {
+        "tile_lat": 35,
+        "tile_lon": 139,
+        "tile_build_dir": str(build_dir.resolve()),
+    }
+
+    assert isinstance(repair._load_tile(target), FakeTile)
+    assert captured == {
+        "lat": 35,
+        "lon": 139,
+        "custom_build_dir": str(build_dir.resolve()),
+    }
+
+
+def test_repair_cli_uses_tile_upscale_settings_and_restores_globals(monkeypatch):
+    repair = _load_repair_cli()
+    previous_values = {
+        name: getattr(repair.IMG, name, None)
+        for name in ("upscale_backend", "upscale_scope", "fp8_model_path")
+    }
+    tile = SimpleNamespace(
+        upscale_backend="tensorops",
+        upscale_scope="airport",
+        fp8_model_path="/tmp/fp8sr",
+        dds_converter="nvcompress",
+        dds_format="BC3",
+        use_gpu_acceleration=False,
+        use_gpu_for_color_filters=False,
+    )
+
+    previous = repair._configure_direct_conversion(tile)
+    try:
+        assert repair.IMG.upscale_backend == "tensorops"
+        assert repair.IMG.upscale_scope == "airport"
+        assert repair.IMG.fp8_model_path == "/tmp/fp8sr"
+    finally:
+        repair._restore_direct_conversion(previous)
+
+    for name, value in previous_values.items():
+        assert getattr(repair.IMG, name, None) == value
+
+
+def test_repair_cli_validates_upscaled_dds_dimensions(monkeypatch, tmp_path):
+    repair = _load_repair_cli()
+    target_path = tmp_path / "target.jpg"
+    dds_path = tmp_path / "target.dds"
+    target = {
+        "name": target_path.name,
+        "til_x_left": 465760,
+        "til_y_top": 206720,
+        "zoomlevel": 19,
+        "provider_code": "BI",
+    }
+    tile = SimpleNamespace(
+        upscale_backend="metalfx_spatial",
+        upscale_scope="all",
+        build_dir=str(tmp_path),
+    )
+    backup_entries = [
+        {"path": str(target_path), "exists": False, "backup_path": None},
+        {"path": str(dds_path), "exists": False, "backup_path": None},
+    ]
+    expected = {}
+
+    monkeypatch.setattr(
+        repair,
+        "_target_context",
+        lambda *_args: (str(tmp_path), str(target_path), str(dds_path)),
+    )
+    monkeypatch.setattr(
+        repair.IMG,
+        "_rebuild_from_parent",
+        lambda *_args, **_kwargs: (
+            1,
+            Image.new("RGB", (4096, 4096), "blue"),
+            18,
+            "parent.jpg",
+        ),
+    )
+    monkeypatch.setattr(repair.IMG, "save_imagery_cache_image", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repair, "_image_is_4096", lambda _path: True)
+    monkeypatch.setattr(repair.IMG, "convert_texture", lambda *_args, **_kwargs: 1)
+
+    def validate(_path, **kwargs):
+        expected.update(kwargs)
+        return True, None
+
+    monkeypatch.setattr(repair.IMG, "validate_dds_file", validate)
+
+    result = repair._repair_one(target, tile, backup_entries)
+
+    assert result["status"] == "repaired"
+    assert expected["expected_dimensions"] == (8192, 8192)
+
+
 def test_repair_cli_apply_rolls_back_one_target_and_records_sha256(
     monkeypatch, tmp_path
 ):
@@ -247,6 +450,9 @@ def test_repair_cli_apply_rolls_back_one_target_and_records_sha256(
         dds_format="BC3",
         use_gpu_acceleration=False,
         use_gpu_for_color_filters=False,
+        upscale_backend="none",
+        upscale_scope="none",
+        fp8_model_path="",
     )
 
     monkeypatch.setattr(repair, "_initialize_imagery", lambda: None)
@@ -267,7 +473,13 @@ def test_repair_cli_apply_rolls_back_one_target_and_records_sha256(
             "parent.jpg",
         ),
     )
-    monkeypatch.setattr(repair.IMG, "convert_texture", lambda *_args, **_kwargs: 0)
+    convert_kwargs = {}
+
+    def fake_convert(*_args, **kwargs):
+        convert_kwargs.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(repair.IMG, "convert_texture", fake_convert)
 
     backup_dir = tmp_path / "backup"
     report_path = tmp_path / "report.json"
@@ -287,6 +499,8 @@ def test_repair_cli_apply_rolls_back_one_target_and_records_sha256(
     assert result == 1
     assert target_path.read_bytes() == old_target
     assert dds_path.read_bytes() == old_dds
+    assert convert_kwargs["source_file"] == str(target_path)
+    assert convert_kwargs["cleanup_preserved_inputs"] is True
     manifest = (backup_dir / "manifest.json").read_text(encoding="utf-8")
     assert "sha256" in manifest
     assert report_path.is_file()

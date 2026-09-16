@@ -80,6 +80,8 @@ def test_package_writes_three_buildings_and_report(tmp_path):
     assert "OBJECT_DEF objects/scene_johoku_west_star.obj" in dsf
     assert "OBJECT_DEF objects/scene_johoku_east_star.obj" in dsf
     assert "OBJECT_DEF objects/scene_johoku_podium.obj" in dsf
+    assert "OBJECT 3 136.9126900 35.2157800 0.00" in dsf
+    assert "OBJECT 3 136.9126889 35.2163944 0.00" not in dsf
     assert saved_report["landmark_spec"]["astro_tower_height_m"] == 160.0
     assert (output / "objects" / "scene_johoku_astro_tower.obj").is_file()
     assert (output / "objects" / "scene_johoku_podium.obj").is_file()

@@ -1363,6 +1363,7 @@ def http_request_to_image(
     tentative_request = 0
     tentative_image = 0
     r = False
+    observed_quality_failures = set()
     while True:
         try:
             if request_headers:
@@ -1396,10 +1397,18 @@ def http_request_to_image(
             ):
                 try:
                     small_image = Image.open(io.BytesIO(r.content))
-                    return (1, small_image)
+                    if small_image.size == (width, height):
+                        return (1, small_image)
+                    observed_quality_failures.add("unexpected_image_dimensions")
+                    UI.vprint(
+                        2,
+                        "Server said 'OK', but the received image dimensions were",
+                        small_image.size,
+                        "instead of",
+                        (width, height),
+                    )
                 except:
-                    if quality_state is not None:
-                        quality_state.mark("corrupt_image")
+                    observed_quality_failures.add("corrupt_image")
                     UI.vprint(
                         2,
                         "Server said 'OK', but the received ",
@@ -1411,8 +1420,7 @@ def http_request_to_image(
                 UI.vprint(3, url, r.headers)
                 break
             elif "[200]" in status_code:
-                if quality_state is not None:
-                    quality_state.mark("unexpected_content")
+                observed_quality_failures.add("unexpected_content")
                 UI.vprint(
                     2, "Server said 'OK' but sent us the wrong Content-Type."
                 )
@@ -1451,6 +1459,9 @@ def http_request_to_image(
             or tentative_image == max_baddata_retries
         ):
             break
+    if quality_state is not None:
+        for reason in sorted(observed_quality_failures):
+            quality_state.mark(reason)
     return (0, status_code)
 
 
@@ -3448,7 +3459,15 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
     return None, None, failure_reason
 
 def convert_texture(
-    tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds", prepared_file=None
+    tile,
+    til_x_left,
+    til_y_top,
+    zoomlevel,
+    provider_code,
+    type="dds",
+    prepared_file=None,
+    source_file=None,
+    cleanup_preserved_inputs=False,
 ):
     upscaled_file_to_delete = None
     external_file_to_delete = None
@@ -3487,7 +3506,10 @@ def convert_texture(
     masked_texture = False
 
     def cleanup_conversion_temp_files():
-        preserve_batch_inputs = getattr(UI, "preserve_batch_inputs", False)
+        preserve_batch_inputs = (
+            getattr(UI, "preserve_batch_inputs", False)
+            and not cleanup_preserved_inputs
+        )
         if erase_tmp_png and not preserve_batch_inputs:
             try:
                 os.remove(os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name))
@@ -3589,6 +3611,11 @@ def convert_texture(
         )
     else:
         jpeg_ready = False
+    if source_file is not None:
+        source_file = os.path.abspath(source_file)
+        jpeg_path = source_file if os.path.isfile(source_file) else None
+        jpeg_ready = bool(jpeg_path)
+        jpeg_file_name = os.path.basename(source_file)
     is_combined = (provider_code in local_combined_providers_dict) and (
         (provider_code not in providers_dict)
         or not jpeg_ready
@@ -3630,7 +3657,7 @@ def convert_texture(
     file_to_convert = (
         prepared_file
         if prepared_file is not None
-        else (jpeg_path if (provider_code in providers_dict and jpeg_ready) else None)
+        else (jpeg_path if jpeg_ready else None)
     )
     if prepared_file is not None:
         if not os.path.isfile(prepared_file):

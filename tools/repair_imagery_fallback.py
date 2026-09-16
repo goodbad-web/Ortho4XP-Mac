@@ -35,12 +35,20 @@ _REBUILT_LINE = re.compile(
     r"(?P<target>\S+\.(?:jpg|webp))\s+from\s+"
     r"(?P<parent>\S+\.(?:jpg|webp))\."
 )
+_REBUILT_LINE_JAPANESE = re.compile(
+    r"\[品質確認\]\s+"
+    r"(?P<target>\S+\.(?:jpg|webp))\s+を\s+"
+    r"(?P<parent>\S+\.(?:jpg|webp))\s+から再構成しました。"
+)
 _IMAGE_NAME = re.compile(
     r"(?P<y>-?\d+)_(?P<x>-?\d+)_(?P<provider>.+?)"
     r"(?P<zl>1[5-9]|2[0-9])\."
     r"(?P<ext>jpg|webp)$"
 )
 _TILE_DIR = re.compile(r"zOrtho4XP_(?P<lat>[+-]\d{1,3})(?P<lon>[+-]\d{1,3})$")
+_TILE_CONFIG = re.compile(
+    r"Ortho4XP_(?P<lat>[+-]\d{1,3})(?P<lon>[+-]\d{1,3})\.cfg$"
+)
 
 
 def _parse_image_name(name):
@@ -62,6 +70,22 @@ def _tile_coordinates(log_path):
         match = _TILE_DIR.fullmatch(part)
         if match:
             return int(match.group("lat")), int(match.group("lon"))
+    config_matches = []
+    for config_path in Path(log_path).resolve().parent.glob("Ortho4XP_*.cfg"):
+        match = _TILE_CONFIG.fullmatch(config_path.name)
+        if match:
+            config_matches.append(match)
+    if len(config_matches) == 1:
+        match = config_matches[0]
+        return int(match.group("lat")), int(match.group("lon"))
+    return None
+
+
+def _match_rebuilt_line(line):
+    for pattern in (_REBUILT_LINE, _REBUILT_LINE_JAPANESE):
+        match = pattern.search(line)
+        if match:
+            return match
     return None
 
 
@@ -78,7 +102,7 @@ def extract_targets(log_paths):
         except OSError as error:
             raise ValueError(f"could not read log {log_path}: {error}") from error
         for line_number, line in enumerate(lines, 1):
-            match = _REBUILT_LINE.search(line)
+            match = _match_rebuilt_line(line)
             if not match:
                 continue
             target = _parse_image_name(match.group("target"))
@@ -115,7 +139,11 @@ def extract_targets(log_paths):
 
 
 def _load_tile(target):
-    tile = CFG.Tile(target["tile_lat"], target["tile_lon"], "")
+    tile = CFG.Tile(
+        target["tile_lat"],
+        target["tile_lon"],
+        target.get("tile_build_dir", ""),
+    )
     if not tile.read_from_config():
         raise ValueError(
             f"could not load tile configuration for "
@@ -125,6 +153,7 @@ def _load_tile(target):
 
 
 def _initialize_imagery():
+    IMG.validate_imagery_cache_settings()
     IMG.initialize_extents_dict()
     IMG.initialize_color_filters_dict()
     IMG.initialize_providers_dict()
@@ -250,7 +279,7 @@ def _write_json(path, payload):
 
 
 def _configure_direct_conversion(tile):
-    previous = {
+    previous_ui = {
         name: getattr(UI, name, None)
         for name in (
             "red_flag",
@@ -262,6 +291,10 @@ def _configure_direct_conversion(tile):
             "use_gpu_acceleration",
             "use_gpu_for_color_filters",
         )
+    }
+    previous_img = {
+        name: getattr(IMG, name, None)
+        for name in ("upscale_backend", "upscale_scope", "fp8_model_path")
     }
     UI.red_flag = False
     UI.defer_gpu_batch = False
@@ -277,16 +310,32 @@ def _configure_direct_conversion(tile):
     UI.use_gpu_for_color_filters = getattr(
         tile, "use_gpu_for_color_filters", UI.use_gpu_for_color_filters
     )
-    return previous
+    IMG.upscale_backend = getattr(
+        tile, "upscale_backend", previous_img["upscale_backend"]
+    )
+    IMG.upscale_scope = getattr(tile, "upscale_scope", previous_img["upscale_scope"])
+    IMG.fp8_model_path = getattr(
+        tile, "fp8_model_path", previous_img["fp8_model_path"]
+    )
+    return {"ui": previous_ui, "img": previous_img}
 
 
 def _restore_direct_conversion(previous):
-    for name, value in previous.items():
+    for name, value in previous["ui"].items():
         setattr(UI, name, value)
+    for name, value in previous["img"].items():
+        setattr(IMG, name, value)
 
 
 def _repair_one(target, tile, backup_entries, parent_download_cache=None):
     file_dir, target_path, dds_path = _target_context(target, tile)
+    expected_dimensions = IMG.expected_texture_dimensions(
+        tile,
+        target["til_x_left"],
+        target["til_y_top"],
+        target["zoomlevel"],
+        target["provider_code"],
+    )
     rebuilt, image, parent_zl, parent_path = IMG._rebuild_from_parent(
         file_dir,
         target["til_x_left"],
@@ -320,11 +369,13 @@ def _repair_one(target, tile, backup_entries, parent_download_cache=None):
             target["zoomlevel"],
             target["provider_code"],
             type="dds",
+            source_file=target_path,
+            cleanup_preserved_inputs=True,
         ):
             raise ValueError("DDS conversion failed")
         valid, error = IMG.validate_dds_file(
             dds_path,
-            expected_dimensions=(4096, 4096),
+            expected_dimensions=expected_dimensions,
             require_mipmaps=True,
         )
         if not valid:
