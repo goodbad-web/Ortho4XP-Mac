@@ -193,12 +193,28 @@ class TileConversionScheduler:
         # failure handler drains accepted-but-undispatched work and injects
         # route sentinels; this short grace period only covers a dispatcher
         # that was already in progress when the failure occurred.
-        if timeout is None and self.error is not None:
-            timeout = 1.0
         deadline = None if timeout is None else time.monotonic() + timeout
+        failure_deadline = None
         for thread in self._threads:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            thread.join(remaining)
+            while thread.is_alive():
+                now = time.monotonic()
+                if timeout is None and self.error is not None:
+                    if failure_deadline is None:
+                        failure_deadline = now + 1.0
+                join_deadline = deadline
+                if failure_deadline is not None:
+                    join_deadline = (
+                        failure_deadline
+                        if join_deadline is None
+                        else min(join_deadline, failure_deadline)
+                    )
+                if join_deadline is None:
+                    thread.join(0.05)
+                    continue
+                remaining = join_deadline - now
+                if remaining <= 0:
+                    raise TimeoutError("conversion scheduler did not drain before timeout")
+                thread.join(min(0.05, remaining))
         if any(thread.is_alive() for thread in self._threads):
             raise TimeoutError("conversion scheduler did not drain before timeout")
         with self._results_lock:

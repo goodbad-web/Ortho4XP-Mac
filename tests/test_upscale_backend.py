@@ -442,6 +442,45 @@ def test_tensorops_direct_dds_summary_reports_lanczos_fallback(tmp_path, monkeyp
     assert result["fallback_reasons"] == {"alpha": 1}
 
 
+def test_tensorops_direct_dds_summary_reports_mixed_failure_and_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(TILE.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    monkeypatch.setattr(
+        TILE.IMG,
+        "validate_dds_file",
+        lambda path, **kwargs: (Path(path).is_file(), None),
+    )
+    helper = tmp_path / "fake_tensorops_mixed_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import sys\n"
+        "request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        "for index, item in enumerate(request['items'], 1):\n"
+        "    if item['input'].endswith('image-fail.jpg'):\n"
+        "        print('tensorops_dds_item={}/{} backend=tensorops effective_backend=ci_lanczos dispatch=direct_dds fallback_reason=gpu_failure'.format(index, len(request['items'])))\n"
+        "        continue\n"
+        "    open(item['output'], 'wb').write(b'DDS fallback')\n"
+        "    print('tensorops_dds_item={}/{} backend=tensorops effective_backend=ci_lanczos dispatch=direct_dds fallback_reason=alpha'.format(index, len(request['items'])))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    specs = [
+        _direct_dds_spec(tmp_path, "image-ok", 0),
+        _direct_dds_spec(tmp_path, "image-fail", 1),
+    ]
+
+    result = TILE._run_tensorops_direct_dds_batch(
+        str(helper), str(tmp_path / "model.fp8sr"), specs
+    )
+
+    assert result["effective_backend"] == "mixed"
+    assert result["batch_success"] == 1
+    assert result["batch_fallback"] == 1
+    assert result["batch_failed"] == 1
+
+
 def test_streaming_gpu_eligibility_does_not_build_spec_or_materialize_mask(monkeypatch):
     from types import SimpleNamespace
 
@@ -460,6 +499,19 @@ def test_streaming_gpu_eligibility_does_not_build_spec_or_materialize_mask(monke
     )
 
     assert runner._gpu_eligible(SimpleNamespace(payload=("payload",)))
+
+
+def test_parallel_imagery_stage_reserves_gpu_for_color_filters():
+    from types import SimpleNamespace
+
+    tile = SimpleNamespace(
+        use_gpu_acceleration=True,
+        use_gpu_for_color_filters=True,
+        dds_converter="nvcompress",
+        upscale_backend="none",
+    )
+
+    assert TILE._parallel_tile_stage_uses_gpu(tile, "imagery/DSF")
 
 
 def test_tensorops_direct_dds_keeps_completed_chunk_on_sigkill(tmp_path, monkeypatch):

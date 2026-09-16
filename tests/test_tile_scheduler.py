@@ -126,3 +126,65 @@ def test_worker_failure_drains_accepted_work_without_hanging():
         "queued-2",
     }
     assert all(not result.ok for result in results)
+
+
+def test_worker_failure_during_wait_does_not_join_forever():
+    entered = threading.Event()
+    release = threading.Event()
+    allow_failure = threading.Event()
+    wait_observation_armed = threading.Event()
+    wait_checked = threading.Event()
+
+    class ObservedScheduler(TileConversionScheduler):
+        @property
+        def error(self):
+            value = super().error
+            if wait_observation_armed.is_set():
+                wait_checked.set()
+            return value
+
+    def dispatch_cpu(tasks):
+        entered.set()
+        release.wait()
+        return True
+
+    def gpu_eligible(task):
+        if task.task_id == "boom":
+            allow_failure.wait()
+            raise RuntimeError("eligibility failure")
+        return False
+
+    scheduler = ObservedScheduler(
+        dispatch_cpu=dispatch_cpu,
+        dispatch_gpu=lambda tasks: True,
+        gpu_eligible=gpu_eligible,
+        batch_wait_ms=0,
+    )
+    assert scheduler.submit(ConversionTask("normal", ()))
+    assert entered.wait(1)
+    assert scheduler.submit(ConversionTask("boom", ()))
+    scheduler.close()
+
+    wait_errors = []
+    wait_done = threading.Event()
+
+    def wait_for_scheduler():
+        try:
+            scheduler.wait()
+        except BaseException as error:
+            wait_errors.append(error)
+        finally:
+            wait_done.set()
+
+    wait_thread = threading.Thread(target=wait_for_scheduler, daemon=True)
+    wait_observation_armed.set()
+    wait_thread.start()
+    try:
+        assert wait_checked.wait(1)
+        allow_failure.set()
+        assert wait_done.wait(2)
+        assert len(wait_errors) == 1
+        assert isinstance(wait_errors[0], TimeoutError)
+    finally:
+        release.set()
+        wait_thread.join(2)

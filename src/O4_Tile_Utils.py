@@ -1761,6 +1761,8 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
     stats["duration_ms"] = (time.perf_counter() - started) * 1000.0
     if stats["batch_success"] == 0:
         stats["effective_backend"] = "failed"
+    elif stats["batch_failed"] > 0:
+        stats["effective_backend"] = "mixed"
     elif stats["batch_fallback"] == stats["batch_success"]:
         stats["effective_backend"] = "ci_lanczos"
     elif stats["batch_fallback"] == 0 and stats["batch_failed"] == 0:
@@ -3615,15 +3617,25 @@ def _parallel_tile_stage_uses_gpu(tile, stage_name):
         )
     if stage_name != "imagery/DSF":
         return False
-    if not getattr(tile, "use_gpu_acceleration", False):
+    use_gpu_acceleration = bool(getattr(tile, "use_gpu_acceleration", False))
+    use_gpu_for_color_filters = bool(
+        getattr(tile, "use_gpu_for_color_filters", False)
+    )
+    if not use_gpu_acceleration and not use_gpu_for_color_filters:
         return False
     dds_converter = getattr(tile, "dds_converter", "nvcompress")
     upscale_backend = IMG.normalize_upscale_backend(
         getattr(tile, "upscale_backend", "none")
     )
     return bool(
-        dds_converter == "TextureConverter"
-        or upscale_backend in ("metalfx_spatial", "tensorops")
+        use_gpu_for_color_filters
+        or (
+            use_gpu_acceleration
+            and (
+                dds_converter == "TextureConverter"
+                or upscale_backend in ("metalfx_spatial", "tensorops")
+            )
+        )
     )
 
 
