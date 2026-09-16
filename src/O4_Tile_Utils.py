@@ -14,6 +14,7 @@ from contextlib import contextmanager, nullcontext
 from itertools import count
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
+import O4_OSM_Utils as OSM
 import O4_Imagery_Utils as IMG
 import O4_Vector_Map as VMAP
 import O4_Mesh_Utils as MESH
@@ -415,6 +416,7 @@ class _BuildTransaction:
 
     def _move_current_to(self, snapshot_name):
         snapshot_root = os.path.join(self.root, snapshot_name)
+        os.makedirs(snapshot_root, exist_ok=True)
         for kind, source_path in self._current_output_paths():
             source_root = self.mask_dir if kind == "mask" else self.build_dir
             relative_path = os.path.relpath(source_path, source_root)
@@ -514,6 +516,49 @@ class _BuildTransaction:
             if names:
                 return True
         return False
+
+    def export_snapshot(self, snapshot_name, status):
+        """Copy a candidate to persistent, non-published degraded staging."""
+        source_root = os.path.join(self.root, snapshot_name)
+        if not os.path.isdir(source_root):
+            raise FileNotFoundError(source_root)
+        staging_root = tempfile.mkdtemp(
+            prefix=".o4xp-degraded-{}-".format(
+                FNAMES.short_latlon(self.tile_lat, self.tile_lon)
+            ),
+            dir=self.parent_dir,
+        )
+        try:
+            for kind in ("tile", "shared", "mask"):
+                source_kind_root = os.path.join(source_root, kind)
+                if not os.path.isdir(source_kind_root):
+                    continue
+                destination_kind_root = os.path.join(staging_root, kind)
+                for dir_path, _, names in os.walk(source_kind_root):
+                    for name in names:
+                        source_path = os.path.join(dir_path, name)
+                        relative_path = os.path.relpath(source_path, source_kind_root)
+                        destination_path = os.path.join(
+                            destination_kind_root, relative_path
+                        )
+                        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                        if source_path.lower().endswith(".dds"):
+                            try:
+                                os.link(source_path, destination_path)
+                            except OSError:
+                                shutil.copy2(source_path, destination_path)
+                        else:
+                            shutil.copy2(source_path, destination_path)
+            status_path = os.path.join(staging_root, "status.json")
+            with open(status_path, "w", encoding="utf-8") as stream:
+                json.dump(status, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            return staging_root
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
 
     def cleanup(self):
         shutil.rmtree(self.root)
@@ -3623,6 +3668,7 @@ def _run_pipeline_once(tile, start_stage="vector data"):
         raise ValueError("unknown pipeline start stage: {}".format(start_stage))
     stages = stages[stage_names.index(start_stage):]
     tile.last_pipeline_failure = None
+    pipeline_result = OSM.OSM_COMPLETE
     for stage_name, stage in stages:
         stage_error = None
         stage_traceback = None
@@ -3630,17 +3676,33 @@ def _run_pipeline_once(tile, start_stage="vector data"):
         stage_context = metrics.stage(stage_name) if metrics is not None else nullcontext()
         try:
             with stage_context:
-                stage_succeeded = bool(stage(tile))
+                stage_result = stage(tile)
+                stage_succeeded = bool(stage_result)
         except Exception as error:
+            stage_result = OSM.OSM_FAILED
             stage_succeeded = False
             stage_error = error
             stage_traceback = traceback.format_exc()
+        if stage_result == OSM.OSM_DEGRADED:
+            pipeline_result = OSM.OSM_DEGRADED
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "WARNING: {} completed as degraded; final output will not be published.".format(
+                        stage_name
+                    ),
+                    "警告: {} はdegraded状態で完了しました。最終出力は公開されません。".format(
+                        stage_name
+                    ),
+                ),
+            )
+            continue
         if not stage_succeeded or UI.red_flag:
             _report_pipeline_failure(
                 tile, stage_name, stage_error, stage_traceback
             )
-            return 0
-    return 1
+            return OSM.OSM_FAILED
+    return pipeline_result
 
 
 def _snapshot_auto_reduce_settings(tile):
@@ -3802,6 +3864,50 @@ def _build_all(tile, include_overlays=True):
                 if retry_stage == "vector data"
                 else _run_pipeline_once(tile, start_stage=retry_stage)
             )
+            if pipeline_result == OSM.OSM_DEGRADED:
+                degraded_snapshot = transaction.capture_candidate(
+                    "degraded-{}".format(attempt)
+                )
+                status = {
+                    "status": "DEGRADED",
+                    "tile": FNAMES.short_latlon(tile.lat, tile.lon),
+                    "missing_layers": sorted(
+                        getattr(tile, "osm_degraded_layers", set())
+                    ),
+                    "failures": getattr(tile, "osm_failures", []),
+                    "cache": [
+                        failure.get("cache", {"used": False})
+                        for failure in getattr(tile, "osm_failures", [])
+                    ],
+                    "snapshot": degraded_snapshot,
+                    "created_at": time.time(),
+                }
+                staging_path = transaction.export_snapshot(
+                    degraded_snapshot, status
+                )
+                status["staging_path"] = staging_path
+                with open(
+                    os.path.join(staging_path, "status.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as stream:
+                    json.dump(status, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                    stream.write("\n")
+                transaction._write_marker("restoring", None, None, "initial")
+                transaction.restore_snapshot_files("initial")
+                transaction.cleanup()
+                _restore_auto_reduce_settings(tile, base_settings)
+                tile.last_pipeline_result = OSM.OSM_DEGRADED
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Degraded build was kept for inspection at {}. Existing tile output was restored.",
+                        "警告: degradedビルドを検証用に{}へ保存し、既存タイル出力を復元しました。",
+                    ).format(staging_path),
+                )
+                if performance_metrics is not None:
+                    performance_metrics.end_attempt("degraded")
+                return OSM.OSM_DEGRADED
             if not pipeline_result:
                 failure = getattr(tile, "last_pipeline_failure", {})
                 if best_candidate is None or failure.get("cancelled"):
@@ -4073,8 +4179,10 @@ def _build_all(tile, include_overlays=True):
 def _run_batch_stage(tile, stage_name, stage):
     stage_error = None
     try:
-        succeeded = bool(stage(tile))
+        stage_result = stage(tile)
+        succeeded = stage_result == OSM.OSM_COMPLETE
     except Exception as error:
+        stage_result = OSM.OSM_FAILED
         succeeded = False
         stage_error = error
         UI.logprint(
@@ -4087,8 +4195,10 @@ def _run_batch_stage(tile, stage_name, stage):
             "\n",
             traceback.format_exc(),
         )
+    if not UI.red_flag and stage_result == OSM.OSM_DEGRADED:
+        return OSM.OSM_DEGRADED
     if succeeded and not UI.red_flag:
-        return True
+        return OSM.OSM_COMPLETE
     if UI.red_flag:
         UI.exit_message_and_bottom_line(
             UI.ui_text(
@@ -4249,6 +4359,7 @@ def _parallel_tile_worker(payload):
     try:
         import O4_Config_Utils as CFG
         import O4_UI_Utils as worker_ui
+        import O4_OSM_Utils as worker_osm
 
         lat = int(payload["lat"])
         lon = int(payload["lon"])
@@ -4261,8 +4372,16 @@ def _parallel_tile_worker(payload):
         tile.build_dir = FNAMES.build_dir(lat, lon, tile.custom_build_dir)
         tile.make_dirs()
         tile._parallel_tile_worker = True
+        worker_osm.osm_download_failure_policy = worker_osm.normalize_osm_failure_policy(
+            payload.get("osm_download_failure_policy", worker_osm.osm_download_failure_policy)
+        )
         worker_ui.is_working = 0
         worker_ui.red_flag = False
+
+        transaction = None
+        if payload.get("do_osm"):
+            transaction = _BuildTransaction(tile, preserve_inputs=True)
+            tile._allow_degraded_intermediate = True
 
         stages = []
         if payload.get("do_osm"):
@@ -4281,18 +4400,77 @@ def _parallel_tile_worker(payload):
                 )
             )
 
+        tile_degraded = False
         for stage_name, stage in stages:
+            if stage_name == "overlay extraction" and tile_degraded:
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Skipping overlay publication for degraded tile.",
+                        "警告: degradedタイルのオーバーレイ公開をスキップします。",
+                    ),
+                )
+                continue
             stage_context = _host_gpu_semaphore(
                 _parallel_tile_stage_uses_gpu(tile, stage_name)
             )
             with stage_context:
                 try:
-                    succeeded = bool(stage(tile))
+                    stage_result = stage(tile)
                 except Exception as error:
-                    return lat, lon, False, "{}: {}".format(stage_name, error)
-            if not succeeded or worker_ui.red_flag:
-                return lat, lon, False, "{} failed".format(stage_name)
-        return lat, lon, True, None
+                    if transaction is not None:
+                        transaction.restore_snapshot("worker-exception")
+                        transaction.cleanup()
+                    return lat, lon, OSM.OSM_FAILED, "{}: {}".format(stage_name, error)
+            if worker_ui.red_flag:
+                if transaction is not None:
+                    transaction.restore_snapshot("worker-cancelled")
+                    transaction.cleanup()
+                return lat, lon, OSM.OSM_FAILED, "{} cancelled".format(stage_name)
+            if stage_result == OSM.OSM_DEGRADED:
+                tile_degraded = True
+                continue
+            if stage_result != OSM.OSM_COMPLETE:
+                if transaction is not None:
+                    transaction.restore_snapshot("worker-failed")
+                    transaction.cleanup()
+                return lat, lon, OSM.OSM_FAILED, "{} failed".format(stage_name)
+
+        if transaction is not None:
+            if tile_degraded:
+                degraded_snapshot = transaction.capture_candidate("degraded")
+                status = {
+                    "status": "DEGRADED",
+                    "tile": FNAMES.short_latlon(tile.lat, tile.lon),
+                    "missing_layers": sorted(
+                        getattr(tile, "osm_degraded_layers", set())
+                    ),
+                    "failures": getattr(tile, "osm_failures", []),
+                    "cache": [
+                        failure.get("cache", {"used": False})
+                        for failure in getattr(tile, "osm_failures", [])
+                    ],
+                    "snapshot": degraded_snapshot,
+                    "created_at": time.time(),
+                }
+                staging_path = transaction.export_snapshot(
+                    degraded_snapshot, status
+                )
+                status["staging_path"] = staging_path
+                with open(
+                    os.path.join(staging_path, "status.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as stream:
+                    json.dump(status, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                    stream.write("\n")
+                transaction.restore_snapshot_files("initial")
+                transaction.cleanup()
+                tile._allow_degraded_intermediate = False
+                return lat, lon, OSM.OSM_DEGRADED, staging_path
+            transaction.cleanup()
+            tile._allow_degraded_intermediate = False
+        return lat, lon, OSM.OSM_COMPLETE, None
     except Exception as error:
         return int(payload.get("lat", 0)), int(payload.get("lon", 0)), False, str(error)
 
@@ -4337,11 +4515,15 @@ def _build_tile_list_parallel(
             "do_dsf": do_dsf,
             "do_ovl": do_ovl,
             "do_ptc": do_ptc,
+            "osm_download_failure_policy": getattr(
+                OSM, "osm_download_failure_policy", "abort"
+            ),
         }
         for lat, lon in list_lat_lon
     ]
     context = multiprocessing.get_context("spawn")
     failed = False
+    degraded = False
     completed = 0
     for batch_start in range(0, len(payloads), worker_count):
         batch = payloads[batch_start : batch_start + worker_count]
@@ -4405,7 +4587,7 @@ def _build_tile_list_parallel(
                     )
                 else:
                     result = matching
-                lat, lon, succeeded, detail = result
+                lat, lon, stage_result, detail = result
                 completed += 1
                 UI.vprint(
                     1,
@@ -4413,7 +4595,20 @@ def _build_tile_list_parallel(
                         completed, len(payloads), FNAMES.short_latlon(lat, lon)
                     ),
                 )
-                if not succeeded:
+                if stage_result == OSM.OSM_DEGRADED:
+                    degraded = True
+                    UI.lvprint(
+                        0,
+                        UI.ui_text(
+                            "WARNING: Parallel tile {} completed as degraded: {}".format(
+                                FNAMES.short_latlon(lat, lon), detail or "staging"
+                            ),
+                            "警告: 並列タイル{}はdegraded状態で完了しました: {}".format(
+                                FNAMES.short_latlon(lat, lon), detail or "staging"
+                            ),
+                        ),
+                    )
+                elif stage_result != OSM.OSM_COMPLETE:
                     failed = True
                     UI.lvprint(
                         0,
@@ -4433,7 +4628,11 @@ def _build_tile_list_parallel(
                 process.join(timeout=2)
             result_queue.close()
             result_queue.join_thread()
-    return 0 if failed else 1
+    if failed:
+        return OSM.OSM_FAILED
+    if degraded:
+        return OSM.OSM_DEGRADED
+    return OSM.OSM_COMPLETE
 
 
 ################################################################################
@@ -4469,6 +4668,7 @@ def build_tile_list(
         0, "Batch build launched for a number of", len(list_lat_lon), "tiles."
     )
     batch_failed = False
+    batch_degraded = False
     k = 0
     for (lat, lon) in list_lat_lon:
         k += 1
@@ -4553,6 +4753,26 @@ def build_tile_list(
                 UI.is_working = 0
                 continue
 
+        batch_transaction = None
+        if do_osm:
+            try:
+                batch_transaction = _BuildTransaction(tile, preserve_inputs=True)
+                tile._allow_degraded_intermediate = True
+            except Exception as error:
+                batch_failed = True
+                UI.lvprint(
+                    0,
+                    UI.ui_text(
+                        "ERROR: Could not start the safe OSM build transaction for tile {}: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                        "エラー: タイル {} のOSM安全トランザクションを開始できません: {}".format(
+                            FNAMES.short_latlon(lat, lon), error
+                        ),
+                    ),
+                )
+                continue
+
         stages = []
         if do_osm:
             stages.append(("vector data", VMAP.build_poly_file))
@@ -4576,14 +4796,99 @@ def build_tile_list(
             )
 
         tile_succeeded = True
+        tile_degraded = False
         for stage_name, stage in stages:
+            if stage_name == "overlay extraction" and tile_degraded:
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Skipping overlay publication for degraded tile.",
+                        "警告: degradedタイルのオーバーレイ公開をスキップします。",
+                    ),
+                )
+                continue
             stage_result = _run_batch_stage(tile, stage_name, stage)
             if stage_result is None:
-                return 0
-            if not stage_result:
+                tile_succeeded = False
+                batch_failed = True
+                break
+            if stage_result == OSM.OSM_DEGRADED:
+                tile_degraded = True
+                continue
+            if stage_result != OSM.OSM_COMPLETE:
                 batch_failed = True
                 tile_succeeded = False
                 break
+
+        if batch_transaction is not None:
+            try:
+                if tile_succeeded and tile_degraded:
+                    degraded_snapshot = batch_transaction.capture_candidate(
+                        "degraded"
+                    )
+                    status = {
+                        "status": "DEGRADED",
+                        "tile": FNAMES.short_latlon(tile.lat, tile.lon),
+                        "missing_layers": sorted(
+                            getattr(tile, "osm_degraded_layers", set())
+                        ),
+                        "failures": getattr(tile, "osm_failures", []),
+                        "cache": [
+                            failure.get("cache", {"used": False})
+                            for failure in getattr(tile, "osm_failures", [])
+                        ],
+                        "snapshot": degraded_snapshot,
+                        "created_at": time.time(),
+                    }
+                    staging_path = batch_transaction.export_snapshot(
+                        degraded_snapshot, status
+                    )
+                    status["staging_path"] = staging_path
+                    with open(
+                        os.path.join(staging_path, "status.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as stream:
+                        json.dump(
+                            status,
+                            stream,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            indent=2,
+                        )
+                        stream.write("\n")
+                    batch_transaction.restore_snapshot_files("initial")
+                    batch_transaction.cleanup()
+                    batch_degraded = True
+                    tile_succeeded = False
+                    UI.vprint(
+                        0,
+                        UI.ui_text(
+                            "WARNING: Degraded tile {} was kept for inspection at {}.".format(
+                                FNAMES.short_latlon(tile.lat, tile.lon), staging_path
+                            ),
+                            "警告: degradedタイル{}を検証用に{}へ保存しました。".format(
+                                FNAMES.short_latlon(tile.lat, tile.lon), staging_path
+                            ),
+                        ),
+                    )
+                elif tile_succeeded:
+                    batch_transaction.cleanup()
+                else:
+                    batch_transaction.restore_snapshot("failed")
+                    batch_transaction.cleanup()
+            except Exception as error:
+                batch_failed = True
+                tile_succeeded = False
+                UI.logprint(
+                    "ERROR: Could not finalize batch OSM transaction:",
+                    repr(error),
+                    "\n",
+                    traceback.format_exc(),
+                )
+                UI.lvprint(0, "ERROR: Could not finalize safe batch output:", error)
+            finally:
+                tile._allow_degraded_intermediate = False
 
         if tile_succeeded:
             try:
@@ -4606,6 +4911,15 @@ def build_tile_list(
             ),
         )
         return 0
+    if batch_degraded:
+        UI.lvprint(
+            0,
+            UI.ui_text(
+                "Batch process completed with degraded tiles; no degraded tile was published.",
+                "バッチ処理はdegradedタイルを含んで完了しました。degradedタイルは公開していません。",
+            ),
+        )
+        return OSM.OSM_DEGRADED
     UI.lvprint(
         0, "Batch process completed in", UI.nicer_timer(time.time() - timer)
     )

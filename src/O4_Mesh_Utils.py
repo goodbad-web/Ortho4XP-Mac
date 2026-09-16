@@ -131,6 +131,7 @@ def is_in_region(lat, lon, latmin, latmax, lonmin, lonmax):
 
 ##############################################################################
 def build_curv_tol_weight_map(tile, weight_array):
+    osm_degraded = False
     if tile.apt_curv_tol != tile.curvature_tol and tile.apt_curv_tol > 0:
         UI.vprint(
             1, "-> Modifying curv_tol weight map according to runway locations."
@@ -199,15 +200,35 @@ def build_curv_tol_weight_map(tile, weight_array):
         else:
             queries = ['way["natural"="coastline"]']
             tags_of_interest = []
-            if not OSM.OSM_queries_to_OSM_layer(
-                queries,
-                sea_layer,
-                tile.lat,
-                tile.lon,
-                tags_of_interest,
-                cached_suffix="coastline",
-            ):
-                return 0
+            if "coastline" in getattr(tile, "osm_degraded_layers", set()):
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "WARNING: Coastline OSM data is already degraded; skipping coastline curvature adjustment.",
+                        "警告: 海岸線OSMデータは既にdegradedのため、海岸線の曲率調整をスキップします。",
+                    ),
+                )
+                osm_degraded = True
+            else:
+                osm_result = OSM.OSM_queries_to_OSM_layer(
+                    queries,
+                    sea_layer,
+                    tile.lat,
+                    tile.lon,
+                    tags_of_interest,
+                    cached_suffix="coastline",
+                )
+                if osm_result == OSM.OSM_FAILED:
+                    return 0
+                if osm_result == OSM.OSM_DEGRADED:
+                    osm_degraded = True
+                    if not hasattr(tile, "osm_degraded_layers"):
+                        tile.osm_degraded_layers = set()
+                    tile.osm_degraded_layers.add("coastline")
+                    return OSM.OSM_DEGRADED
+        if osm_degraded:
+            del sea_layer
+            return OSM.OSM_DEGRADED
         for nodeid in sea_layer.dicosmn:
             (lonp, latp) = [float(x) for x in sea_layer.dicosmn[nodeid]]
             if (
@@ -234,7 +255,7 @@ def build_curv_tol_weight_map(tile, weight_array):
     # editing from PIL import Image
     # Image.fromarray((weight_array!=1).astype(numpy.uint8)*255).save(
     # 'weight.png')
-    return 1
+    return OSM.OSM_DEGRADED if osm_degraded else OSM.OSM_COMPLETE
 
 
 ################################################################################
@@ -705,8 +726,10 @@ def _build_mesh(tile):
     )
 
     weight_array = numpy.ones((1001, 1001), dtype=numpy.float32)
-    if not build_curv_tol_weight_map(tile, weight_array):
+    weight_map_result = build_curv_tol_weight_map(tile, weight_array)
+    if weight_map_result == OSM.OSM_FAILED:
         return 0
+    mesh_degraded = weight_map_result == OSM.OSM_DEGRADED
     weight_array.tofile(weight_file)
     del weight_array
 
@@ -840,7 +863,7 @@ def _build_mesh(tile):
     UI.logprint(
         "Step 2 for tile lat=", tile.lat, ", lon=", tile.lon, ": normal exit."
     )
-    return 1
+    return OSM.OSM_DEGRADED if mesh_degraded else OSM.OSM_COMPLETE
 
 
 ################################################################################

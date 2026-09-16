@@ -49,6 +49,19 @@ redo any prior step; Level 0 keeps every single file.",
 modified on the fly (as all _Application_ variables) in case of problem with \
 a particular server.",
     },
+    "osm_download_failure_policy": {
+        "module": "OSM",
+        "type": str,
+        "default": "abort",
+        "values": ("abort", "continue_degraded", "prompt"),
+        "short_name": "OSM failure policy",
+        "short_name_japanese": "OSM失敗時の動作",
+        "hint": (
+            "What to do when OSM vector data cannot be downloaded after all "
+            "retries. Stop tile is safest; Continue as degraded keeps failed "
+            "layers out of a staging-only build; Ask per tile prompts in the GUI."
+        ),
+    },
     "skip_downloads": {
         "module": "TILE",
         "type": bool,
@@ -583,14 +596,34 @@ def _upscale_backend_label(value):
     return UI.ui_text(english, japanese)
 
 
+def _osm_failure_policy_label(value):
+    labels = {
+        "abort": ("Stop tile", "タイルを停止"),
+        "continue_degraded": (
+            "Continue as degraded",
+            "欠落扱いで継続",
+        ),
+        "prompt": ("Ask per tile", "タイルごとに確認"),
+    }
+    english, japanese = labels.get(value, (str(value), str(value)))
+    return UI.ui_text(english, japanese)
+
+
 def _config_display_value(var, value):
     if var == "upscale_backend":
         aliases = {"lanczos": "ci_lanczos", "fp8_tensorops": "tensorops"}
         return _upscale_backend_label(aliases.get(value, value))
+    if var == "osm_download_failure_policy":
+        return _osm_failure_policy_label(value)
     return str(value)
 
 
 def _config_raw_value(var, value):
+    if var == "osm_download_failure_policy":
+        for candidate in cfg_vars[var]["values"]:
+            if value == candidate or value == _osm_failure_policy_label(candidate):
+                return candidate
+        return value
     if var != "upscale_backend":
         return value
     aliases = {
@@ -624,6 +657,7 @@ list_app_vars = [
     "verbosity",
     "cleaning_level",
     "overpass_server_choice",
+    "osm_download_failure_policy",
     "skip_downloads",
     "skip_converts",
     "max_convert_slots",
@@ -1139,7 +1173,7 @@ class Ortho4XP_Config(tk.Toplevel):
                         self.frame_cfg,
                         values=values,
                         textvariable=self.v_[item],
-                        width=6,
+                        width=(24 if item == "osm_download_failure_policy" else 6),
                         state="readonly",
                         style="O4.TCombobox",
                     )
@@ -1256,7 +1290,7 @@ class Ortho4XP_Config(tk.Toplevel):
                     self.frame_cfg,
                     values=values,
                     textvariable=self.v_[item],
-                    width=6,
+                    width=(24 if item == "osm_download_failure_policy" else 6),
                     state="readonly",
                     style="O4.TCombobox",
                 )
@@ -1716,7 +1750,7 @@ class Ortho4XP_Config(tk.Toplevel):
                     elif module_name == "OVL": setattr(OVL, var, default_val)
                 else:
                     globals()[var] = default_val
-                self.v_[var].set(str(default_val))
+                self.v_[var].set(_config_display_value(var, default_val))
                 errors.append(var)
         if errors:
             error_text = (

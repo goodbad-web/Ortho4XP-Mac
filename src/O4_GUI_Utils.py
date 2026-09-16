@@ -29,6 +29,7 @@ import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Vector_Utils as VECT
 import O4_Vector_Map as VMAP
+import O4_OSM_Utils as OSM
 import O4_Mesh_Utils as MESH
 import O4_Mask_Utils as MASK
 import O4_Tile_Utils as TILE
@@ -622,7 +623,9 @@ class Ortho4XP_GUI(tk.Tk):
                 label, result, was_cancelled = self.stage_result_queue.get_nowait()
                 if was_cancelled:
                     self.status_var.set(_ui_text(f"Cancelled: {label}", f"キャンセル: {label}"))
-                elif result:
+                elif result == OSM.OSM_DEGRADED:
+                    self.status_var.set(_ui_text("Completed as degraded", "degraded状態で完了"))
+                elif result == OSM.OSM_COMPLETE:
                     self.status_var.set(_ui_text(f"Completed: {label}", f"完了: {label}"))
                 else:
                     self.status_var.set(_ui_text(f"Failed: {label}", f"失敗: {label}"))
@@ -691,7 +694,7 @@ class Ortho4XP_GUI(tk.Tk):
         finally:
             # Some legacy auxiliary actions do not reset this flag themselves.
             UI.is_working = 0
-            self.stage_result_queue.put((label, result == 1, bool(UI.red_flag)))
+            self.stage_result_queue.put((label, result, bool(UI.red_flag)))
 
     def _start_background_stage(self, label, target, *args):
         if getattr(self, "working_thread", None) is not None and self.working_thread.is_alive():

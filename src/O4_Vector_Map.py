@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from math import pi, sin, cos, sqrt, atan, exp
 import numpy
 from shapely import geometry, ops
@@ -15,6 +16,87 @@ import O4_Airport_Utils as APT
 from O4_DSF_Budget import stable_id_key
 
 good_imagery_list = ()
+
+
+def _run_osm_queries(tile, layer_name, queries, osm_layer, **kwargs):
+    """Run one layer atomically and apply the configured failure policy."""
+    while True:
+        result = OSM.OSM_queries_to_OSM_layer(
+            queries,
+            osm_layer,
+            tile.lat,
+            tile.lon,
+            **kwargs,
+        )
+        if result == OSM.OSM_COMPLETE:
+            return OSM.OSM_COMPLETE
+
+        failure = dict(getattr(osm_layer, "last_failure", {}) or {})
+        failure["layer"] = layer_name
+        cached_suffix = kwargs.get("cached_suffix", "")
+        cache_info = getattr(osm_layer, "last_cache_info", None)
+        failure["cache"] = {
+            "used": bool(cache_info),
+            "source": (cache_info or {}).get("source", "none"),
+            "data": FNAMES.osm_cached(tile.lat, tile.lon, cached_suffix)
+            if cached_suffix
+            else None,
+            "manifest": FNAMES.osm_cache_manifest(tile.lat, tile.lon, cached_suffix)
+            if cached_suffix
+            else None,
+        }
+        failures = getattr(tile, "osm_failures", None)
+        if failures is None:
+            failures = []
+            tile.osm_failures = failures
+        failures.append(failure)
+
+        action = getattr(tile, "osm_failure_action", None)
+        if action is None:
+            policy = OSM.normalize_osm_failure_policy()
+            action = (
+                OSM.prompt_osm_failure(tile, failure, cache_available=False)
+                if policy == "prompt"
+                else policy
+            )
+            if action != "retry":
+                tile.osm_failure_action = action
+
+        if action == "retry":
+            osm_layer.reset()
+            continue
+        if action == "continue_degraded":
+            osm_layer.reset()
+            if not hasattr(tile, "osm_degraded_layers"):
+                tile.osm_degraded_layers = set()
+            tile.osm_degraded_layers.add(layer_name)
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "WARNING: OSM layer {} is unavailable; continuing as degraded.".format(
+                        layer_name
+                    ),
+                    "警告: OSMレイヤー{}を取得できないため、欠落扱いで継続します。".format(
+                        layer_name
+                    ),
+                ),
+            )
+            return OSM.OSM_DEGRADED
+
+        return OSM.OSM_FAILED
+
+
+def _empty_airport_result(tile):
+    """Provide the minimum airport context needed by degraded vector builds."""
+    tile.dem = DEM.DEM(
+        tile.lat,
+        tile.lon,
+        tile.custom_dem,
+        tile.fill_nodata or "to zero",
+        info_only=False,
+    )
+    return numpy.zeros((1001, 1001), dtype=bool), geometry.GeometryCollection()
+
 
 ################################################################################
 def build_poly_file(tile):
@@ -32,6 +114,9 @@ def _build_poly_file(tile):
         return 0
     UI.is_working = 1
     UI.red_flag = 0
+    tile.osm_degraded_layers = set()
+    tile.osm_failures = []
+    tile.osm_failure_action = None
     # in case that was forgotten by the user
     tile.iterate = 0
     # update the lat/lon scaling factor in VECT
@@ -76,7 +161,8 @@ def _build_poly_file(tile):
         return 0
 
     # Roads
-    if not include_roads(vector_map, tile, apt_array, apt_area):
+    road_result = include_roads(vector_map, tile, apt_array, apt_area)
+    if road_result == OSM.OSM_FAILED:
         UI.exit_message_and_bottom_line("ERROR: Could not load road data.")
         return 0
     if tile.road_level:
@@ -89,7 +175,8 @@ def _build_poly_file(tile):
         return 0
 
     # Sea
-    if not include_sea(vector_map, tile):
+    sea_result = include_sea(vector_map, tile)
+    if sea_result == OSM.OSM_FAILED:
         return 0
     UI.vprint(
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
@@ -100,7 +187,8 @@ def _build_poly_file(tile):
         return 0
 
     # Water
-    if not include_water(vector_map, tile):
+    water_result = include_water(vector_map, tile)
+    if water_result == OSM.OSM_FAILED:
         return 0
     UI.vprint(
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
@@ -184,6 +272,17 @@ def _build_poly_file(tile):
         else:
             vector_map.seeds["SEA"] = [numpy.array([0.5, 0.5])]
     vector_map.snap_to_grid(9) 
+    degraded_output_dir = None
+    if tile.osm_degraded_layers and not getattr(
+        tile, "_allow_degraded_intermediate", False
+    ):
+        degraded_output_dir = os.path.join(
+            tile.build_dir,
+            ".o4xp-degraded-{}".format(int(time.time() * 1000)),
+        )
+        os.makedirs(degraded_output_dir, exist_ok=True)
+        node_file = os.path.join(degraded_output_dir, os.path.basename(node_file))
+        poly_file = os.path.join(degraded_output_dir, os.path.basename(poly_file))
     if not vector_map.write_node_file(node_file) or not vector_map.write_poly_file(poly_file):
         UI.exit_message_and_bottom_line("ERROR: Could not write vector data files.")
         return 0
@@ -195,7 +294,43 @@ def _build_poly_file(tile):
     UI.logprint(
         "Step 1 for tile lat=", tile.lat, ", lon=", tile.lon, ": normal exit."
     )
-    return 1
+    if tile.osm_degraded_layers:
+        if degraded_output_dir is not None:
+            tile.osm_degraded_staging_path = degraded_output_dir
+            with open(
+                os.path.join(degraded_output_dir, "status.json"),
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                json.dump(
+                    {
+                        "status": "DEGRADED",
+                        "tile": FNAMES.short_latlon(tile.lat, tile.lon),
+                        "missing_layers": sorted(tile.osm_degraded_layers),
+                        "failures": getattr(tile, "osm_failures", []),
+                        "cache": [
+                            failure.get("cache", {"used": False})
+                            for failure in getattr(tile, "osm_failures", [])
+                        ],
+                        "vector_files": [node_file, poly_file],
+                        "created_at": time.time(),
+                    },
+                    stream,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                stream.write("\n")
+        UI.logprint(
+            "Step 1 for tile lat=",
+            tile.lat,
+            "lon=",
+            tile.lon,
+            "completed as DEGRADED layers=",
+            sorted(tile.osm_degraded_layers),
+        )
+        return OSM.OSM_DEGRADED
+    return OSM.OSM_COMPLETE
 
 
 ################################################################################
@@ -204,15 +339,18 @@ def include_airports(vector_map, tile):
     airport_layer = OSM.OSM_layer()
     queries = [('node["aeroway"]', 'way["aeroway"]', 'rel["aeroway"]')]
     tags_of_interest = ["all"]
-    if not OSM.OSM_queries_to_OSM_layer(
+    osm_result = _run_osm_queries(
+        tile,
+        "airports",
         queries,
         airport_layer,
-        tile.lat,
-        tile.lon,
-        tags_of_interest,
+        tags_of_interest=tags_of_interest,
         cached_suffix="airports",
-    ):
+    )
+    if osm_result == OSM.OSM_FAILED:
         return None
+    if osm_result == OSM.OSM_DEGRADED:
+        return _empty_airport_result(tile)
     dico_airports = {}
     APT.discover_airport_names(airport_layer, dico_airports)
     APT.attach_surfaces_to_airports(airport_layer, dico_airports)
@@ -286,14 +424,42 @@ def include_roads(vector_map, tile, apt_array, apt_area):
         'way["railway"="rail"]',
         'way["railway"="narrow_gauge"]',
     ]
-    if not OSM.OSM_queries_to_OSM_layer(
+    big_roads_result = _run_osm_queries(
+        tile,
+        "roads",
         queries,
         road_layer,
-        tile.lat,
-        tile.lon,
-        tags_of_interest,
+        tags_of_interest=tags_of_interest,
         cached_suffix="big_roads",
-    ):
+    )
+    if big_roads_result != OSM.OSM_COMPLETE:
+        return big_roads_result
+
+    small_road_layer = None
+    if tile.road_level >= 2:
+        small_road_layer = OSM.OSM_layer()
+        small_queries = ['way["highway"="tertiary"]']
+        if tile.road_level >= 3:
+            small_queries += [
+                'way["highway"="unclassified"]',
+                'way["highway"="residential"]',
+            ]
+        if tile.road_level >= 4:
+            small_queries += ['way["highway"="service"]']
+        if tile.road_level >= 5:
+            small_queries += ['way["highway"="track"]']
+        small_roads_result = _run_osm_queries(
+            tile,
+            "roads",
+            small_queries,
+            small_road_layer,
+            tags_of_interest=tags_of_interest,
+            cached_suffix="small_roads",
+        )
+        if small_roads_result != OSM.OSM_COMPLETE:
+            return small_roads_result
+
+    if UI.red_flag:
         return 0
     UI.vprint(1, "    * Checking which large roads need levelling.")
     (road_network_banked, road_network_flat) = OSM.OSM_to_MultiLineString(
@@ -305,27 +471,8 @@ def include_roads(vector_map, tile, apt_array, apt_area):
     )
     if UI.red_flag:
         return 0
-    if tile.road_level >= 2:
-        road_layer = OSM.OSM_layer()
-        queries = ['way["highway"="tertiary"]']
-        if tile.road_level >= 3:
-            queries += [
-                'way["highway"="unclassified"]',
-                'way["highway"="residential"]',
-            ]
-        if tile.road_level >= 4:
-            queries += ['way["highway"="service"]']
-        if tile.road_level >= 5:
-            queries += ['way["highway"="track"]']
-        if not OSM.OSM_queries_to_OSM_layer(
-            queries,
-            road_layer,
-            tile.lat,
-            tile.lon,
-            tags_of_interest,
-            cached_suffix="small_roads",
-        ):
-            return 0
+    if small_road_layer is not None:
+        road_layer = small_road_layer
         UI.vprint(1, "    * Checking which smaller roads need levelling.")
         timer = time.time()
         (
@@ -422,15 +569,16 @@ def include_sea(vector_map, tile):
     else:
         queries = ['way["natural"="coastline"]']
         tags_of_interest = []
-        if not OSM.OSM_queries_to_OSM_layer(
+        osm_result = _run_osm_queries(
+            tile,
+            "coastline",
             queries,
             sea_layer,
-            tile.lat,
-            tile.lon,
-            tags_of_interest,
+            tags_of_interest=tags_of_interest,
             cached_suffix="coastline",
-        ):
-            return 0
+        )
+        if osm_result != OSM.OSM_COMPLETE:
+            return osm_result
     coastline = OSM.OSM_to_MultiLineString(sea_layer, tile.lat, tile.lon)
     if not coastline.is_empty:
         # 1) encoding the coastline
@@ -576,15 +724,16 @@ def include_water(vector_map, tile):
             'way["waterway"="dock"]',
         ]
         tags_of_interest = ["name"]
-        if not OSM.OSM_queries_to_OSM_layer(
+        osm_result = _run_osm_queries(
+            tile,
+            "water",
             queries,
             water_layer,
-            tile.lat,
-            tile.lon,
-            tags_of_interest,
+            tags_of_interest=tags_of_interest,
             cached_suffix="water",
-        ):
-            return 0
+        )
+        if osm_result != OSM.OSM_COMPLETE:
+            return osm_result
     UI.vprint(1, "    * Building water multipolygon.")
     (water_area, sea_equiv_area) = OSM.OSM_to_MultiPolygon(
         water_layer, tile.lat, tile.lon, filter_large_lakes

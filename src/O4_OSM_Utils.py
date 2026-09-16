@@ -3,6 +3,11 @@ import time
 import io
 import bz2
 import random
+import json
+import hashlib
+import threading
+import tkinter as tk
+from email.utils import parsedate_to_datetime
 import requests
 import numpy
 from shapely import geometry, ops
@@ -20,7 +25,26 @@ overpass_servers = {
     "CH": "https://overpass.osm.ch/api/interpreter"
 }
 overpass_server_choice = "random"
-max_osm_tentatives = 10
+osm_download_failure_policy = "abort"
+OSM_FAILURE_POLICIES = ("abort", "continue_degraded", "prompt")
+OSM_FAILED = 0
+OSM_COMPLETE = 1
+OSM_DEGRADED = 2
+VALID_DATA = "VALID_DATA"
+VALID_EMPTY = "VALID_EMPTY"
+FAILED = "FAILED"
+max_osm_tentatives = 3
+
+# Regional public Overpass instances must not be treated as global fallbacks.
+# A bbox is accepted only when it is fully covered by the endpoint below.
+_overpass_coverage = {
+    "DE": None,
+    "LZ": None,
+    "KU": None,
+    "FR": (41.0, -5.5, 51.5, 10.0),
+    "CH": (45.7, 5.8, 47.9, 10.6),
+}
+_OSM_CACHE_MANIFEST_VERSION = 1
 
 ################################################################################
 class OSM_layer:
@@ -496,12 +520,380 @@ def _quarantine_osm_cache(filename):
     return True
 
 
+def _preserve_unverified_osm_cache(filename, manifest_filename):
+    """Move an unverified cache generation aside before publishing a new one."""
+    moved = []
+    try:
+        candidate = filename + ".unverified"
+        suffix = 1
+        while os.path.exists(candidate) or os.path.exists(candidate + ".manifest.json"):
+            candidate = filename + ".unverified." + str(suffix)
+            suffix += 1
+        if os.path.isfile(filename):
+            os.replace(filename, candidate)
+            moved.append((candidate, filename))
+        if os.path.isfile(manifest_filename):
+            manifest_candidate = candidate + ".manifest.json"
+            os.replace(manifest_filename, manifest_candidate)
+            moved.append((manifest_candidate, manifest_filename))
+        if moved:
+            UI.vprint(1, "    Preserved unverified OSM cache generation as", candidate)
+        return True
+    except OSError as error:
+        UI.vprint(0, "    Could not preserve unverified OSM cache:", error)
+        # Restore any moves made in this operation. Do not leave a half-paired
+        # data/manifest generation behind.
+        for source, destination in reversed(moved):
+            try:
+                os.replace(source, destination)
+            except OSError:
+                pass
+        return False
+
+
 def _update_cached_osm(osm_layer, filename, input_tags, target_tags):
     try:
         return bool(osm_layer.update_dicosm(filename, input_tags, target_tags))
     except Exception as error:
         UI.vprint(0, "    Cached OSM data could not be parsed:", error)
         return False
+
+
+def normalize_osm_failure_policy(value=None):
+    policy = osm_download_failure_policy if value is None else value
+    return policy if policy in OSM_FAILURE_POLICIES else "abort"
+
+
+def _normalized_bbox(bbox):
+    if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
+        return None
+    try:
+        return [round(float(value), 7) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+
+
+def _bbox_is_covered(server_code, bbox):
+    coverage = _overpass_coverage.get(server_code)
+    normalized = _normalized_bbox(bbox)
+    if coverage is None or normalized is None:
+        return coverage is None
+    south, west, north, east = normalized
+    c_south, c_west, c_north, c_east = coverage
+    return (
+        south >= c_south
+        and west >= c_west
+        and north <= c_north
+        and east <= c_east
+    )
+
+
+def _server_order(preferred_server, bbox):
+    server_order = ["DE", "LZ", "CH", "FR", "KU"]
+    if preferred_server == "random":
+        random.shuffle(server_order)
+    elif preferred_server in overpass_servers:
+        server_order.remove(preferred_server)
+        server_order.insert(0, preferred_server)
+    else:
+        UI.vprint(0, "ERROR: Unknown Overpass server:", preferred_server)
+        return []
+
+    eligible = []
+    for server_code in server_order:
+        if _bbox_is_covered(server_code, bbox):
+            eligible.append(server_code)
+            continue
+        UI.logprint(
+            "[OSM] skipped_server=",
+            server_code,
+            "reason=bbox-not-covered",
+            "bbox=",
+            _normalized_bbox(bbox),
+        )
+        UI.vprint(
+            2,
+            "        Skipping Overpass server",
+            server_code,
+            "because it does not cover bbox",
+            _normalized_bbox(bbox),
+        )
+    return eligible
+
+
+def _query_signature(queries, tags_of_interest=None):
+    canonical_queries = []
+    for query in queries:
+        if isinstance(query, (tuple, list)):
+            canonical_queries.append([str(item) for item in query])
+        else:
+            canonical_queries.append(str(query))
+    payload = {
+        "queries": canonical_queries,
+        "tags_of_interest": [
+            list(item) if isinstance(item, tuple) else item
+            for item in (tags_of_interest or [])
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(filename):
+    digest = hashlib.sha256()
+    with open(filename, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _layer_counts(osm_layer):
+    return {
+        "nodes": len(osm_layer.dicosmn),
+        "ways": len(osm_layer.dicosmfirst["w"]),
+        "relations": len(osm_layer.dicosmfirst["r"]),
+        "elements": (
+            len(osm_layer.dicosmn)
+            + len(osm_layer.dicosmfirst["w"])
+            + len(osm_layer.dicosmfirst["r"])
+        ),
+    }
+
+
+def _replace_layer(destination, source):
+    destination.__dict__.clear()
+    destination.__dict__.update(source.__dict__)
+
+
+def _record_layer_failure(osm_layer, failure):
+    osm_layer.reset()
+    osm_layer.last_result = OSM_FAILED
+    osm_layer.last_failure = failure
+    osm_layer.last_cache_info = None
+
+
+def _write_json_atomic(filename, payload):
+    temporary_filename = filename + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+        with open(temporary_filename, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_filename, filename)
+        return True
+    except OSError as error:
+        UI.vprint(1, "    Could not atomically write OSM metadata:", filename, error)
+        try:
+            os.remove(temporary_filename)
+        except OSError:
+            pass
+        return False
+
+
+def _build_cache_manifest(
+    layer_name, bbox, queries, tags_of_interest, responses, osm_layer, filename
+):
+    response_statuses = [response.get("data_status") for response in responses]
+    validity = VALID_EMPTY if response_statuses and all(
+        status == VALID_EMPTY for status in response_statuses
+    ) else VALID_DATA
+    return {
+        "schema_version": _OSM_CACHE_MANIFEST_VERSION,
+        "status": "complete",
+        "validity": validity,
+        "layer": layer_name,
+        "bbox": _normalized_bbox(bbox),
+        "query_signature": _query_signature(queries, tags_of_interest),
+        "queries": [
+            [str(item) for item in query] if isinstance(query, (tuple, list)) else str(query)
+            for query in queries
+        ],
+        "responses": responses,
+        "counts": _layer_counts(osm_layer),
+        "data_sha256": _sha256_file(filename),
+    }
+
+
+def _load_verified_cache(
+    osm_layer, filename, manifest_filename, layer_name, bbox, queries, tags_of_interest,
+    input_tags, target_tags,
+):
+    if not os.path.isfile(filename) or not os.path.isfile(manifest_filename):
+        return False
+    try:
+        with open(manifest_filename, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        if manifest.get("schema_version") != _OSM_CACHE_MANIFEST_VERSION:
+            return False
+        if manifest.get("status") != "complete":
+            return False
+        if manifest.get("layer") != layer_name:
+            return False
+        if manifest.get("bbox") != _normalized_bbox(bbox):
+            return False
+        if manifest.get("query_signature") != _query_signature(queries, tags_of_interest):
+            return False
+        responses = manifest.get("responses")
+        if not isinstance(responses, list) or len(responses) != len(queries):
+            return False
+        response_statuses = []
+        for response in responses:
+            if not isinstance(response, dict):
+                return False
+            data_status = response.get("data_status")
+            if data_status not in (VALID_DATA, VALID_EMPTY):
+                return False
+            if response.get("status") != data_status:
+                return False
+            if response.get("http_status") != 200:
+                return False
+            response_server = response.get("server")
+            if response_server not in overpass_servers or not _bbox_is_covered(
+                response_server, bbox
+            ):
+                return False
+            response_statuses.append(data_status)
+        validity = manifest.get("validity")
+        if validity not in (VALID_DATA, VALID_EMPTY):
+            return False
+        if validity == VALID_EMPTY and any(
+            status != VALID_EMPTY for status in response_statuses
+        ):
+            return False
+        if manifest.get("data_sha256") != _sha256_file(filename):
+            return False
+
+        candidate = OSM_layer()
+        if not _update_cached_osm(candidate, filename, input_tags, target_tags):
+            return False
+        if manifest.get("counts") != _layer_counts(candidate):
+            return False
+        _replace_layer(osm_layer, candidate)
+        osm_layer.last_result = OSM_COMPLETE
+        osm_layer.last_cache_info = {
+            "source": "verified-cache",
+            "manifest": manifest_filename,
+            "validity": manifest.get("validity", VALID_DATA),
+            "counts": manifest.get("counts", {}),
+        }
+        UI.vprint(1, "    * Recycling verified OSM data from", filename)
+        UI.logprint(
+            "[OSM] cache=verified layer=",
+            layer_name,
+            "manifest=",
+            manifest_filename,
+        )
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        UI.vprint(2, "    OSM cache metadata is invalid:", manifest_filename, error)
+        return False
+
+
+def _retry_after_seconds(response):
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(float(value), 300.0))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                return None
+            from datetime import datetime, timezone
+            return max(0.0, min((retry_at - datetime.now(timezone.utc)).total_seconds(), 300.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _retry_delay(round_index, retry_after_values, retry_statuses):
+    if retry_after_values:
+        return max(retry_after_values)
+    if any(status in (406, 429) for status in retry_statuses):
+        return 30.0
+    base = (5.0, 15.0, 30.0)[min(round_index, 2)]
+    return base * random.uniform(0.8, 1.2)
+
+
+def prompt_osm_failure(tile, failure, cache_available=False):
+    """Ask once per tile without touching Tk from the worker thread."""
+    gui = getattr(UI, "gui", None)
+    if gui is None or not hasattr(gui, "after"):
+        return "abort"
+
+    choice = {"value": "abort"}
+    completed = threading.Event()
+
+    def show_dialog():
+        dialog = None
+        try:
+            dialog = tk.Toplevel(gui)
+            dialog.title(UI.ui_text("OSM download failed", "OSMデータの取得に失敗しました"))
+            dialog.transient(gui)
+            dialog.grab_set()
+            detail = "{}: {}".format(
+                failure.get("layer", "OSM"),
+                failure.get("query", "unknown query"),
+            )
+            tk.Label(
+                dialog,
+                text=UI.ui_text(
+                    "No valid OSM response was received after retries.\n" + detail,
+                    "再試行後も有効なOSM応答を受信できませんでした。\n" + detail,
+                ),
+                justify="left",
+                padx=16,
+                pady=12,
+            ).pack(fill="x")
+
+            buttons = [("Retry", "retry")]
+            if cache_available:
+                buttons.append(("Use verified cache", "use_cache"))
+            buttons.extend(
+                [
+                    ("Continue as degraded", "continue_degraded"),
+                    ("Stop tile", "abort"),
+                ]
+            )
+
+            def select(value):
+                choice["value"] = value
+                try:
+                    dialog.grab_release()
+                    dialog.destroy()
+                except tk.TclError:
+                    pass
+                completed.set()
+
+            for english, value in buttons:
+                tk.Button(
+                    dialog,
+                    text=UI.ui_text(
+                        english,
+                        {
+                            "Retry": "再試行",
+                            "Use verified cache": "検証済みキャッシュを使用",
+                            "Continue as degraded": "欠落扱いで継続",
+                            "Stop tile": "タイルを停止",
+                        }[english],
+                    ),
+                    command=lambda value=value: select(value),
+                ).pack(fill="x", padx=16, pady=3)
+            dialog.protocol("WM_DELETE_WINDOW", lambda: select("abort"))
+        except Exception as error:
+            UI.logprint("[OSM] failure dialog unavailable:", repr(error))
+            choice["value"] = "abort"
+            completed.set()
+
+    try:
+        gui.after(0, show_dialog)
+    except Exception:
+        return "abort"
+    completed.wait()
+    return choice["value"]
 
 
 ################################################################################
@@ -514,8 +906,8 @@ def OSM_queries_to_OSM_layer(
     server_code=None,
     cached_suffix="",
 ):
-    # this one is a bit complicated by a few checks of existing cached data 
-    # which had different filenames is versions prior to 1.30
+    # Keep every query in a temporary layer. A cache and its manifest are
+    # published only after the complete query set has succeeded.
     queries = list(queries)
     tags_of_interest = [] if tags_of_interest is None else tags_of_interest
     target_tags = {"n": [], "w": [], "r": []}
@@ -537,63 +929,74 @@ def OSM_queries_to_OSM_layer(
                 else:
                     if tag not in target_tags[osm_type]:
                         target_tags[osm_type].append(tag)
+    bbox = (lat, lon, lat + 1, lon + 1)
     cached_data_filename = FNAMES.osm_cached(lat, lon, cached_suffix)
-    force_network = False
+    manifest_filename = FNAMES.osm_cache_manifest(lat, lon, cached_suffix)
+    osm_layer.last_result = OSM_FAILED
+    osm_layer.last_failure = None
+    osm_layer.last_cache_info = None
+
+    if cached_suffix and _load_verified_cache(
+        osm_layer,
+        cached_data_filename,
+        manifest_filename,
+        cached_suffix,
+        bbox,
+        queries,
+        tags_of_interest,
+        input_tags,
+        target_tags,
+    ):
+        return OSM_COMPLETE
+
     if cached_suffix and os.path.isfile(cached_data_filename):
-        UI.vprint(1, "    * Recycling OSM data from", cached_data_filename)
-        if _update_cached_osm(
-            osm_layer, cached_data_filename, input_tags, target_tags
-        ):
-            return 1
-        if not _quarantine_osm_cache(cached_data_filename):
-            return 0
-        osm_layer.reset()
-        force_network = True
+        UI.vprint(
+            1,
+            "    * Ignoring unverified OSM cache (manifest missing or mismatched):",
+            cached_data_filename,
+        )
+        UI.logprint(
+            "[OSM] cache=unverified layer=",
+            cached_suffix,
+            "data=",
+            cached_data_filename,
+        )
 
-    if not force_network:
-        for query in queries:
-            if not isinstance(query, str):
-                continue
-            old_cached_data_filename = FNAMES.osm_old_cached(lat, lon, query)
-            if not os.path.isfile(old_cached_data_filename):
-                continue
-            UI.vprint(1, "    * Recycling OSM data for", query)
-            if _update_cached_osm(
-                osm_layer, old_cached_data_filename, input_tags, target_tags
-            ):
-                continue
-            if not _quarantine_osm_cache(old_cached_data_filename):
-                return 0
-            # A valid old cache may already have populated the layer.  Once
-            # any old cache is corrupt, discard all of it and fetch every
-            # query again so the result is one consistent network snapshot.
-            osm_layer.reset()
-            force_network = True
-            break
+    unverified_cache_present = bool(
+        cached_suffix
+        and (
+            os.path.isfile(cached_data_filename)
+            or os.path.isfile(manifest_filename)
+        )
+    )
 
-    if force_network:
-        # Do not mix a network response with any data that was read before a
-        # corrupt cache was discovered.  The complete query set is fetched
-        # again from a clean layer.
-        osm_layer.reset()
-        queries_to_download = queries
-    else:
-        queries_to_download = []
-        for query in queries:
-            if isinstance(query, str):
-                old_cached_data_filename = FNAMES.osm_old_cached(lat, lon, query)
-                if os.path.isfile(old_cached_data_filename):
-                    # This cache was already validated and loaded above.
-                    continue
-            queries_to_download.append(query)
+    # Legacy per-query caches have no query/bbox/completeness proof. Keep
+    # them on disk for manual recovery, but never mix them into a new layer.
+    for query in queries:
+        if not isinstance(query, str):
+            continue
+        old_cached_data_filename = FNAMES.osm_old_cached(lat, lon, query)
+        if os.path.isfile(old_cached_data_filename):
+            UI.vprint(
+                2,
+                "    * Ignoring legacy unverified OSM cache:",
+                old_cached_data_filename,
+            )
 
-    for query in queries_to_download:
-        # look first for cached data (old scheme)
+    candidate_layer = OSM_layer()
+    responses = []
+    for query in queries:
         UI.vprint(1, "    * Downloading OSM data for", query)
-        response = get_overpass_data(
-            query, (lat, lon, lat + 1, lon + 1), server_code
+        response, response_info = get_overpass_data(
+            query, bbox, server_code, return_metadata=True
         )
         if UI.red_flag:
+            _record_layer_failure(osm_layer, {
+                "layer": cached_suffix or "OSM",
+                "query": _overpass_query_label(query),
+                "reason": "cancelled",
+                "metadata": response_info,
+            })
             return 0
         if not response:
             UI.logprint(
@@ -601,21 +1004,62 @@ def OSM_queries_to_OSM_layer(
                 query,
                 "after",
                 max_osm_tentatives,
-                ", skipping it.",
+                ".",
             )
             UI.vprint(
                 1,
                 "      No valid answer after",
                 max_osm_tentatives,
-                ", skipping it.",
+                "; layer will not be published.",
             )
+            _record_layer_failure(osm_layer, {
+                "layer": cached_suffix or "OSM",
+                "query": _overpass_query_label(query),
+                "reason": "no-valid-response",
+                "metadata": response_info,
+            })
             return 0
-        if not osm_layer.update_dicosm(response, input_tags, target_tags):
+        if not candidate_layer.update_dicosm(response, input_tags, target_tags):
+            _record_layer_failure(osm_layer, {
+                "layer": cached_suffix or "OSM",
+                "query": _overpass_query_label(query),
+                "reason": "response-parse-failed",
+                "metadata": response_info,
+            })
             return 0
+        responses.append(response_info)
+
+    _replace_layer(osm_layer, candidate_layer)
+    osm_layer.last_result = OSM_COMPLETE
     if cached_suffix:
-        if not osm_layer.write_to_file(cached_data_filename):
+        can_publish_cache = not unverified_cache_present or _preserve_unverified_osm_cache(
+            cached_data_filename, manifest_filename
+        )
+        if not can_publish_cache:
+            UI.vprint(
+                1,
+                "    WARNING: Keeping the new OSM data in memory; cache publication was skipped.",
+            )
+        elif not osm_layer.write_to_file(cached_data_filename):
             UI.vprint(1, "    WARNING: Could not save OSM cache", cached_data_filename)
-    return 1
+        else:
+            manifest = _build_cache_manifest(
+                cached_suffix,
+                bbox,
+                queries,
+                tags_of_interest,
+                responses,
+                osm_layer,
+                cached_data_filename,
+            )
+            if not _write_json_atomic(manifest_filename, manifest):
+                UI.vprint(1, "    WARNING: OSM cache remains unverified:", cached_data_filename)
+    osm_layer.last_cache_info = {
+        "source": "network",
+        "responses": responses,
+        "counts": _layer_counts(osm_layer),
+    }
+    return OSM_COMPLETE
 
 ################################################################################
 def OSM_query_to_OSM_layer(
@@ -683,17 +1127,32 @@ def _overpass_query_label(query):
     return label if len(label) <= 160 else label[:157] + "..."
 
 
-def get_overpass_data(query, bbox, server_code=None):
+def _inspect_osm_response(content):
+    if not content or b"</osm>" not in content.lower():
+        return None, "missing closing </osm> tag", None
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        return None, "malformed XML response", None
+    if root.tag.rsplit("}", 1)[-1].lower() != "osm":
+        return None, "unexpected XML root", None
+    if any(child.tag.rsplit("}", 1)[-1].lower() == "remark" for child in root):
+        return None, "server remark indicates incomplete/error response", None
+    counts = {"node": 0, "way": 0, "relation": 0}
+    for child in root:
+        tag = child.tag.rsplit("}", 1)[-1].lower()
+        if tag in counts:
+            counts[tag] += 1
+    total = sum(counts.values())
+    return (VALID_EMPTY if total == 0 else VALID_DATA), None, counts
+
+
+def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
     preferred_server = server_code or overpass_server_choice
-    server_order = ["DE", "LZ", "CH", "FR", "KU"]
-    if preferred_server == "random":
-        random.shuffle(server_order)
-    elif preferred_server in overpass_servers:
-        server_order.remove(preferred_server)
-        server_order.insert(0, preferred_server)
-    else:
-        UI.vprint(0, "ERROR: Unknown Overpass server:", preferred_server)
-        return 0
+    server_order = _server_order(preferred_server, bbox)
+    if not server_order:
+        metadata = {"status": FAILED, "reason": "no-covered-server"}
+        return (None, metadata) if return_metadata else 0
 
     # rel を relation に置換（互換性のため）
     clean_query = (
@@ -709,13 +1168,12 @@ def get_overpass_data(query, bbox, server_code=None):
     headers = {"User-Agent": "Ortho4XP"}
     session = requests.Session()
     query_label = _overpass_query_label(query)
+    attempts = []
 
-    for tentative in range(max_osm_tentatives):
-        attempted_servers = set()
+    for tentative in range(max(1, int(max_osm_tentatives))):
+        retry_after_values = []
+        retry_statuses = []
         for true_server_code in server_order:
-            if true_server_code in attempted_servers:
-                continue
-            attempted_servers.add(true_server_code)
             base_url = overpass_servers[true_server_code]
             attempt_number = tentative + 1
             UI.logprint(
@@ -735,44 +1193,61 @@ def get_overpass_data(query, bbox, server_code=None):
                     timeout=310,
                     headers=headers,
                 )
-                UI.vprint(3, "OSM response status :", response.status_code)
+                status_code = getattr(response, "status_code", None)
+                UI.vprint(3, "OSM response status :", status_code)
                 content = response.content or b""
-                content_lower = content.lower()
-                if response.status_code == 200 and b"</osm>" in content_lower:
-                    try:
-                        root = ElementTree.fromstring(content)
-                        if root.tag.rsplit("}", 1)[-1].lower() != "osm":
-                            reason = "unexpected XML root"
-                        elif len(content) <= 1000 and b"error" in content_lower:
-                            reason = "server error payload"
-                        else:
-                            UI.logprint(
-                                "[OSM] query=",
-                                query_label,
-                                "success_server=",
-                                true_server_code,
-                                "attempt=",
-                                attempt_number,
-                                "status=200",
-                            )
-                            UI.vprint(
-                                2,
-                                "        OSM query succeeded on server",
-                                true_server_code,
-                                "(attempt",
-                                attempt_number,
-                                "):",
-                                query_label,
-                            )
-                            return content
-                    except ElementTree.ParseError:
-                        reason = "malformed XML response"
+                if status_code == 200:
+                    data_status, reason, counts = _inspect_osm_response(content)
+                    if data_status is not None:
+                        metadata = {
+                            "status": data_status,
+                            "data_status": data_status,
+                            "server": true_server_code,
+                            "attempt": attempt_number,
+                            "http_status": 200,
+                            "counts": counts,
+                            "payload_sha256": hashlib.sha256(content).hexdigest(),
+                            "attempts": attempts,
+                        }
+                        UI.logprint(
+                            "[OSM] query=",
+                            query_label,
+                            "success_server=",
+                            true_server_code,
+                            "attempt=",
+                            attempt_number,
+                            "status=200",
+                            "data_status=",
+                            data_status,
+                        )
+                        UI.vprint(
+                            2,
+                            "        OSM query succeeded on server",
+                            true_server_code,
+                            "(attempt",
+                            attempt_number,
+                            "):",
+                            query_label,
+                            data_status,
+                        )
+                        return (content, metadata) if return_metadata else content
                 else:
-                    reason = (
-                        "HTTP status " + str(response.status_code)
-                        if response.status_code != 200
-                        else "missing closing </osm> tag"
-                    )
+                    reason = "HTTP status " + str(status_code)
+                    counts = None
+                retry_after = _retry_after_seconds(response)
+                if status_code in (406, 429):
+                    retry_statuses.append(status_code)
+                    if retry_after is not None:
+                        retry_after_values.append(retry_after)
+                attempts.append(
+                    {
+                        "server": true_server_code,
+                        "attempt": attempt_number,
+                        "http_status": status_code,
+                        "reason": reason,
+                        "retry_after": retry_after,
+                    }
+                )
                 UI.vprint(
                     1,
                     "        OSM server",
@@ -789,16 +1264,26 @@ def get_overpass_data(query, bbox, server_code=None):
                     "server=",
                     true_server_code,
                     "status=",
-                    getattr(response, "status_code", "unknown"),
+                    status_code,
                     "reason=",
                     reason,
                 )
-                if response.status_code != 200:
+                if status_code != 200:
                     try:
                         UI.vprint(2, "        Server message:", response.text[:200])
                     except Exception:
                         pass
             except requests.RequestException as error:
+                attempts.append(
+                    {
+                        "server": true_server_code,
+                        "attempt": attempt_number,
+                        "http_status": None,
+                        "reason": "request-error",
+                        "error": repr(error),
+                    }
+                )
+                retry_statuses.append(None)
                 UI.logprint(
                     "[OSM] query=",
                     query_label,
@@ -818,6 +1303,16 @@ def get_overpass_data(query, bbox, server_code=None):
                     error,
                 )
             except Exception as error:
+                attempts.append(
+                    {
+                        "server": true_server_code,
+                        "attempt": attempt_number,
+                        "http_status": None,
+                        "reason": "unexpected-error",
+                        "error": repr(error),
+                    }
+                )
+                retry_statuses.append(None)
                 UI.logprint(
                     "[OSM] query=",
                     query_label,
@@ -837,19 +1332,22 @@ def get_overpass_data(query, bbox, server_code=None):
                     error,
                 )
             if UI.red_flag:
-                return 0
+                metadata = {"status": FAILED, "reason": "cancelled", "attempts": attempts}
+                return (None, metadata) if return_metadata else 0
 
-        if tentative + 1 >= max_osm_tentatives:
-            return 0
-        delay = min(2 ** (tentative + 1), 60)
+        if tentative + 1 >= max(1, int(max_osm_tentatives)):
+            break
+        delay = _retry_delay(tentative, retry_after_values, retry_statuses)
         UI.vprint(
             1,
-            "        All Overpass servers failed; new tentative in",
-            delay,
+            "        All covered Overpass servers failed; new attempt in",
+            round(delay, 2),
             "sec...",
         )
         time.sleep(delay)
-    return 0
+
+    metadata = {"status": FAILED, "reason": "all-covered-servers-failed", "attempts": attempts}
+    return (None, metadata) if return_metadata else 0
 
 ################################################################################
 def OSM_to_MultiLineString(

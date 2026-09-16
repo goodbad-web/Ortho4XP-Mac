@@ -361,6 +361,10 @@ def osm_cached(lat, lon, cached_suffix):
     )
 
 
+def osm_cache_manifest(lat, lon, cached_suffix):
+    return osm_cached(lat, lon, cached_suffix) + ".manifest.json"
+
+
 def osm_old_cached(lat, lon, query):
     subtags = query.split('"')
     return os.path.join(

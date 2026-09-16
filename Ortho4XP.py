@@ -141,7 +141,7 @@ if __name__ == '__main__':
                     print("ERROR:", e)
                     print(cmd_line); sys.exit(2)
             try:
-                if not TILE.build_continuous(tile) or UI.red_flag:
+                if TILE.build_continuous(tile) != 1 or UI.red_flag:
                     print("ERROR: continuous tile build failed.")
                     sys.exit(1)
                 print("Bon vol!")
