@@ -62,6 +62,23 @@ def test_masked_xp11_contract_uses_the_actual_mask_alpha():
     assert DSF._masked_dds_requires_alpha(tile, opaque_mask)
 
 
+def test_non_water_texture_contract_uses_shared_mask_alpha(monkeypatch):
+    tile = SimpleNamespace(imprint_masks_to_dds=True, dds_format="AUTO")
+    partial_mask = Image.new("L", (4, 4), color=255)
+    partial_mask.putpixel((0, 0), 0)
+
+    monkeypatch.setattr(
+        DSF.MASK,
+        "needs_mask",
+        lambda _tile, *_attributes: partial_mask,
+    )
+
+    assert DSF._texture_contract_has_alpha(tile, (1, 2, 16, "BI"))
+
+    tile.imprint_masks_to_dds = False
+    assert not DSF._texture_contract_has_alpha(tile, (1, 2, 16, "BI"))
+
+
 def test_upscale_scope_only_targets_explicit_airport_texture_keys():
     tile = SimpleNamespace(
         upscale_backend="tensorops",

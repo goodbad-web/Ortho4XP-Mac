@@ -74,6 +74,19 @@ def _masked_dds_requires_alpha(tile, mask_im):
         return True
 
 
+def _texture_contract_has_alpha(tile, texture_attributes):
+    """Return the alpha contract for any texture classification path.
+
+    Land and inland-water triangles can share a texture with a masked water
+    triangle.  ``convert_texture`` then imprints the same mask into the DDS,
+    so their reuse check must inspect that mask instead of assuming BC1.
+    """
+    if not getattr(tile, "imprint_masks_to_dds", False):
+        return False
+    mask_im = MASK.needs_mask(tile, *texture_attributes)
+    return _masked_dds_requires_alpha(tile, mask_im)
+
+
 ################################################################################
 def float2qquad(x):
     if x >= 1:
@@ -1139,7 +1152,7 @@ def _build_dsf(tile, download_queue):
                 total_cross_pool += 1
                 textured_tris[0]["cross-pool"].extend(tri_p)
 
-    # Second land and inland water tris with no mask
+    # Second land and inland water tris
     for tri in range(nbr_tris):
         tri_type = tri_types[tri]
         if (tri_type == 2):
@@ -1180,7 +1193,11 @@ def _build_dsf(tile, download_queue):
                 if (not os.path.isfile(target_tex)):
                     rebuild = True
                 elif not _texture_contract_matches(
-                    tile, texture_attributes, has_alpha=False
+                    tile,
+                    texture_attributes,
+                    has_alpha=_texture_contract_has_alpha(
+                        tile, texture_attributes
+                    ),
                 ):
                     rebuild = True
                 if (rebuild):
