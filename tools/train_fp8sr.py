@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import struct
 import shutil
 import subprocess
 import sys
@@ -237,7 +238,46 @@ def build_model() -> Any:
             self.conv0 = nn.Conv2d(3, 32, 3, padding=0)
             self.conv1 = nn.Conv2d(32, 32, 3, padding=0)
             self.conv2 = nn.Conv2d(32, 12, 3, padding=0)
-            self.shuffle = nn.PixelShuffle(2)
+            self._initialize_nearest_neighbor()
+
+        def _initialize_nearest_neighbor(self) -> None:
+            """Start from a valid 2x RGB upsampler instead of random subpixels.
+
+            The runtime graph has ReLU before PixelShuffle and stores the 12
+            output channels as ``[subpixel][RGB]``.  A default random
+            initialization can leave different subpixel channels with very
+            different signs, producing a checkerboard before optimization has
+            a chance to balance them.  The center-only identity path below is
+            exactly nearest-neighbor 2x for RGB input while keeping the fixed
+            3 -> 32 -> 32 -> 12 graph unchanged.
+            """
+            with torch.no_grad():
+                self.conv0.weight.zero_()
+                self.conv0.bias.zero_()
+                for channel in range(3):
+                    self.conv0.weight[channel, channel, 1, 1] = 1.0
+
+                self.conv1.weight.zero_()
+                self.conv1.bias.zero_()
+                for channel in range(32):
+                    self.conv1.weight[channel, channel, 1, 1] = 1.0
+
+                self.conv2.weight.zero_()
+                self.conv2.bias.zero_()
+                for channel in range(12):
+                    self.conv2.weight[channel, channel % 3, 1, 1] = 1.0
+
+        @staticmethod
+        def _runtime_pixel_shuffle(value: Any) -> Any:
+            """Apply ASHelper's subpixel-major ``[subpixel][RGB]`` layout."""
+            batch, channels, height, width = value.shape
+            if channels != 12:
+                raise TrainingError(f"PixelShuffle input must have 12 channels, got {channels}")
+            return (
+                value.reshape(batch, 2, 2, 3, height, width)
+                .permute(0, 3, 4, 1, 5, 2)
+                .reshape(batch, 3, height * 2, width * 2)
+            )
 
         @staticmethod
         def _edge_conv(layer: Any, value: Any) -> Any:
@@ -248,7 +288,7 @@ def build_model() -> Any:
             value = torch.relu(self._edge_conv(self.conv0, value))
             value = torch.relu(self._edge_conv(self.conv1, value))
             value = torch.relu(self._edge_conv(self.conv2, value))
-            return self.shuffle(value)
+            return self._runtime_pixel_shuffle(value)
 
     return FP8SRModel()
 
@@ -275,6 +315,106 @@ def _image_metrics(output: Path, reference: Path) -> dict[str, float]:
         rmse = math.sqrt(sum(value * value for value in rmse_rgb) / 3.0)
         psnr = float("inf") if rmse == 0 else 20.0 * math.log10(255.0 / rmse)
     return {"mae": mae, "rmse": rmse, "psnr_db": psnr}
+
+
+def _make_mps_reference(pack: Path) -> tuple[Any, str] | None:
+    """Build a fast MPS reference using the runtime's NHWC channel order.
+
+    The exact Python reference remains the deterministic fallback used by
+    tests and environments without MPS.  Full aerial-photo validation needs a
+    vectorized path because the exact scalar loop is prohibitively slow for
+    128x128 inputs.  This path intentionally supports the production FP16 and
+    FP8 pack formats only; other dtypes continue through the exact fallback.
+    """
+    try:
+        torch, _, functional = _require_torch()
+        import numpy as np
+    except (TrainingError, ImportError):
+        return None
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is None or not mps_backend.is_available():
+        return None
+
+    normalized = validate_pack(pack)
+    if normalized["weight_dtype"] not in {"Float16", "MetalFloat8E4M3"}:
+        return None
+    device = torch.device("mps")
+    layers: list[tuple[Any, Any]] = []
+    for layer in normalized["layers"]:
+        kernel = int(layer["kernel"])
+        in_channels = int(layer["in_channels"])
+        out_channels = int(layer["out_channels"])
+        weight_data = layer["weights"].read_bytes()
+        bias_data = layer["bias"].read_bytes()
+        values: list[float] = []
+        for output_channel in range(out_channels):
+            for input_channel in range(in_channels):
+                for ky in range(kernel):
+                    for kx in range(kernel):
+                        feature = (ky * kernel + kx) * in_channels + input_channel
+                        row = feature * 128
+                        if normalized["weight_dtype"] == "Float16":
+                            value = struct.unpack_from(
+                                "<e", weight_data, row + output_channel * 2
+                            )[0]
+                        else:
+                            value = decode_fp8_e4m3(weight_data[row + output_channel])
+                            value *= float(layer["scale"])
+                        values.append(float(value))
+        weight = torch.tensor(
+            values,
+            dtype=torch.float16,
+            device=device,
+        ).reshape(out_channels, in_channels, kernel, kernel)
+        bias = torch.tensor(
+            [struct.unpack_from("<e", bias_data, channel * 2)[0] for channel in range(out_channels)],
+            dtype=torch.float16,
+            device=device,
+        )
+        layers.append((weight, bias))
+
+    def run(
+        _pack_path: Path,
+        input_path: Path,
+        output_path: Path,
+        *,
+        reject_nonfinite: bool = False,
+    ) -> Path:
+        with Image.open(input_path).convert("RGB") as source:
+            data = np.asarray(source, dtype=np.float32) / 255.0
+        value = torch.from_numpy(data).permute(2, 0, 1).unsqueeze(0).to(
+            device=device,
+            dtype=torch.float16,
+        )
+        with torch.no_grad():
+            for weight, bias in layers:
+                value = functional.pad(value, (1, 1, 1, 1), mode="replicate")
+                value = functional.conv2d(value, weight, bias)
+                value = torch.relu(value)
+            if reject_nonfinite and not bool(torch.isfinite(value).all().item()):
+                raise FP8SRPackError("MPS reference produced a non-finite value")
+            batch, channels, height, width = value.shape
+            value = (
+                value.reshape(batch, 2, 2, 3, height, width)
+                .permute(0, 3, 4, 1, 5, 2)
+                .reshape(batch, 3, height * 2, width * 2)
+                .float()
+                .clamp(0.0, 1.0)
+            )
+            output = (
+                value[0]
+                .permute(1, 2, 0)
+                .mul(255.0)
+                .round()
+                .to(device="cpu", dtype=torch.uint8)
+                .numpy()
+            )
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(output, mode="RGB").save(destination, format="PNG")
+        return destination
+
+    return run, "torch_mps_runtime_layout_reference"
 
 
 def _aggregate_metrics(values: list[dict[str, float]]) -> dict[str, float]:
@@ -673,6 +813,18 @@ def verify(args: argparse.Namespace) -> int:
     validate_pack(fp16_pack)
     if fp8_pack is not None:
         validate_pack(fp8_pack)
+    fp16_reference = fp8sr_fp16_reference
+    fp16_reference_implementation = "fp8sr_fp16_reference"
+    fp8_reference = fp8sr_fp16_reference
+    fp8_reference_implementation = "fp8sr_fp16_reference"
+    if len(val_pairs) > 16:
+        fast_fp16 = _make_mps_reference(fp16_pack)
+        if fast_fp16 is not None:
+            fp16_reference, fp16_reference_implementation = fast_fp16
+        if fp8_pack is not None:
+            fast_fp8 = _make_mps_reference(fp8_pack)
+            if fast_fp8 is not None:
+                fp8_reference, fp8_reference_implementation = fast_fp8
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     representative_dir = output_dir / "representatives"
@@ -709,7 +861,7 @@ def verify(args: argparse.Namespace) -> int:
 
         started = time.perf_counter()
         try:
-            fp8sr_fp16_reference(
+            fp16_reference(
                 fp16_pack,
                 pair.lr,
                 fp16_path,
@@ -770,10 +922,10 @@ def verify(args: argparse.Namespace) -> int:
             fp16_gate,
             fp16_pack,
             requested_backend="tensorops",
-            effective_backend="python_fp8sr_reference",
-            implementation="fp8sr_fp16_reference",
+            effective_backend=fp16_reference_implementation,
+            implementation=fp16_reference_implementation,
             fallback_reason=reference_failure["reason"] if reference_failure else None,
-            timing_ms=_timing_summary(fp16_samples, "Python FP16-rounded FP8SR reference"),
+            timing_ms=_timing_summary(fp16_samples, fp16_reference_implementation),
         )
     )
     report: dict[str, Any] = {
@@ -817,7 +969,7 @@ def verify(args: argparse.Namespace) -> int:
         for pair, _, _, fp8_path in pair_artifacts:
             started = time.perf_counter()
             try:
-                fp8sr_fp16_reference(
+                fp8_reference(
                     fp8_pack,
                     pair.lr,
                     fp8_path,
@@ -858,10 +1010,10 @@ def verify(args: argparse.Namespace) -> int:
                     fp8_gate,
                     fp8_pack,
                     requested_backend="tensorops",
-                    effective_backend="python_fp8sr_reference",
-                    implementation="fp8sr_fp16_reference",
+                    effective_backend=fp8_reference_implementation,
+                    implementation=fp8_reference_implementation,
                     fallback_reason=reference_failure["reason"],
-                    timing_ms=_timing_summary(fp8_samples, "Python FP8-rounded FP8SR reference"),
+                    timing_ms=_timing_summary(fp8_samples, fp8_reference_implementation),
                 )
             )
         else:
@@ -882,9 +1034,9 @@ def verify(args: argparse.Namespace) -> int:
                     fp8_gate,
                     fp8_pack,
                     requested_backend="tensorops",
-                    effective_backend="python_fp8sr_reference",
-                    implementation="fp8sr_fp16_reference",
-                    timing_ms=_timing_summary(fp8_samples, "Python FP8-rounded FP8SR reference"),
+                    effective_backend=fp8_reference_implementation,
+                    implementation=fp8_reference_implementation,
+                    timing_ms=_timing_summary(fp8_samples, fp8_reference_implementation),
                 )
             )
             if fp8_gate["status"] != "PASS":
@@ -974,9 +1126,9 @@ def verify(args: argparse.Namespace) -> int:
                         gpu_output if gpu_output.is_file() else None,
                         gpu_result.get("quality"),
                         fp8_gate,
-                        fp8_pack,
-                        gpu_tools,
-                        execution_result=gpu_result,
+                    fp8_pack,
+                    gpu_tools,
+                    execution_result=gpu_result,
                         requested_backend="tensorops",
                         effective_backend="tensorops" if record_gpu_status == "PASS" else "unavailable",
                         implementation="ASHelper",

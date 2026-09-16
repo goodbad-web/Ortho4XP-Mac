@@ -95,6 +95,19 @@ def test_cli_exposes_all_pipeline_stages():
     assert train_args.adam_eps == pytest.approx(1e-4)
 
 
+def test_model_initialization_matches_nearest_neighbor():
+    torch = pytest.importorskip("torch")
+    model = train_fp8sr.build_model().to(dtype=torch.float32)
+    source = torch.tensor(
+        [[[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]], [[0.9, 1.0], [0.2, 0.3]]]],
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        output = model(source)
+    expected = torch.nn.functional.interpolate(source, scale_factor=2, mode="nearest")
+    assert torch.allclose(output, expected)
+
+
 def test_fp16_reference_reports_nonfinite_instead_of_overflowing(tmp_path):
     layers = []
     for name, kernel, in_channels, out_channels in EXPECTED_LAYERS:
