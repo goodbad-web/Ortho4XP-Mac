@@ -21,6 +21,7 @@ import random
 import importlib.util
 import tempfile
 import uuid
+import threading
 from math import ceil, log, tan, pi, floor
 import numpy
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
@@ -83,6 +84,32 @@ as_helper_cmd = None
 upscale_scope = "all"
 imagery_cache_format = CACHE.DEFAULT_CACHE_FORMAT
 imagery_cache_quality = ""
+
+
+class _TextureFetchState:
+    """Thread-safe state for quality-affecting provider responses."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._degradation_reasons = []
+
+    def mark(self, reason):
+        with self._lock:
+            if reason not in self._degradation_reasons:
+                self._degradation_reasons.append(reason)
+
+    def mark_lower_zoom(self):
+        self.mark("unexpected_lower_zoom")
+
+    @property
+    def degraded(self):
+        with self._lock:
+            return bool(self._degradation_reasons)
+
+    @property
+    def reasons(self):
+        with self._lock:
+            return tuple(self._degradation_reasons)
 
 
 def validate_imagery_cache_settings(cache_format=None, quality=None):
@@ -1327,7 +1354,9 @@ def has_data(
 ################################################################################
 
 ################################################################################
-def http_request_to_image(width, height, url, request_headers, http_session):
+def http_request_to_image(
+    width, height, url, request_headers, http_session, quality_state=None
+):
     UI.vprint(
         3, "HTTP request issued :", url, "\nRequest headers :", request_headers
     )
@@ -1352,11 +1381,15 @@ def http_request_to_image(width, height, url, request_headers, http_session):
                     "virtualearth" in url
                 ):
                     UI.vprint(3, url, r.headers)
+                    if quality_state is not None:
+                        quality_state.mark("404")
                     return (0, "[404]")
                 if (r.headers["Content-Length"] == "2521") and (
                     "arcgisonline" in url
                 ):
                     UI.vprint(3, url, r.headers)
+                    if quality_state is not None:
+                        quality_state.mark("404")
                     return (0, "[404]")
             if ("[200]" in status_code) and (
                 "image" in r.headers["Content-Type"]
@@ -1365,6 +1398,8 @@ def http_request_to_image(width, height, url, request_headers, http_session):
                     small_image = Image.open(io.BytesIO(r.content))
                     return (1, small_image)
                 except:
+                    if quality_state is not None:
+                        quality_state.mark("corrupt_image")
                     UI.vprint(
                         2,
                         "Server said 'OK', but the received ",
@@ -1376,6 +1411,8 @@ def http_request_to_image(width, height, url, request_headers, http_session):
                 UI.vprint(3, url, r.headers)
                 break
             elif "[200]" in status_code:
+                if quality_state is not None:
+                    quality_state.mark("unexpected_content")
                 UI.vprint(
                     2, "Server said 'OK' but sent us the wrong Content-Type."
                 )
@@ -1474,7 +1511,9 @@ def get_wms_image(bbox, width, height, provider, http_session):
 ################################################################################
 
 ################################################################################
-def get_wmts_image(tilematrix, til_x, til_y, provider, http_session):
+def get_wmts_image(
+    tilematrix, til_x, til_y, provider, http_session, quality_state=None
+):
     til_x_orig, til_y_orig = til_x, til_y
     down_sample = 0
     while True:
@@ -1574,12 +1613,19 @@ def get_wmts_image(tilematrix, til_x, til_y, provider, http_session):
             else:
                 request_headers = request_headers_generic
         width = height = provider["tile_size"]
-        (success, data) = http_request_to_image(
-            width, height, url, request_headers, http_session
-        )
+        if quality_state is None:
+            (success, data) = http_request_to_image(
+                width, height, url, request_headers, http_session
+            )
+        else:
+            (success, data) = http_request_to_image(
+                width, height, url, request_headers, http_session, quality_state
+            )
         if success and not down_sample:
             return (success, data)
         elif success and down_sample:
+            if quality_state is not None:
+                quality_state.mark_lower_zoom()
             x0 = (
                 (til_x_orig - 2 ** down_sample * til_x)
                 * width
@@ -1599,6 +1645,8 @@ def get_wmts_image(tilematrix, til_x, til_y, provider, http_session):
                 ),
             )
         elif "[404]" in data:
+            if quality_state is not None:
+                quality_state.mark("404")
             if ("grid_type" not in provider) or (
                 provider["grid_type"] != "webmercator"
             ):
@@ -1610,6 +1658,11 @@ def get_wmts_image(tilematrix, til_x, til_y, provider, http_session):
             if down_sample >= 6:
                 return (0, Image.new("RGB", (width, height), "white"))
         else:
+            if quality_state is not None:
+                if "[200]" in str(data):
+                    quality_state.mark("corrupt_or_unexpected_content")
+                else:
+                    quality_state.mark("request_failure")
             return (0, Image.new("RGB", (width, height), "white"))
 
 
@@ -1639,10 +1692,16 @@ def get_and_paste_wmts_part(
     y0,
     http_session,
     subt_size=None,
+    quality_state=None,
 ):
-    (success, small_image) = get_wmts_image(
-        tilematrix, til_x, til_y, provider, http_session
-    )
+    if quality_state is None:
+        (success, small_image) = get_wmts_image(
+            tilematrix, til_x, til_y, provider, http_session
+        )
+    else:
+        (success, small_image) = get_wmts_image(
+            tilematrix, til_x, til_y, provider, http_session, quality_state
+        )
     if not subt_size:
         big_image.paste(small_image, (x0, y0))
     else:
@@ -1653,7 +1712,9 @@ def get_and_paste_wmts_part(
 ################################################################################
 
 ################################################################################
-def build_texture_from_tilbox(tilbox, zoomlevel, provider, progress=None):
+def build_texture_from_tilbox(
+    tilbox, zoomlevel, provider, progress=None, quality_state=None
+):
     # less general than the next build_texture_from_bbox_and_size but
     # probably slightly quicker
     (til_x_min, til_y_min, til_x_max, til_y_max) = tilbox
@@ -1678,6 +1739,8 @@ def build_texture_from_tilbox(tilbox, zoomlevel, provider, progress=None):
                 y0,
                 http_session,
             )
+            if quality_state is not None:
+                fargs += (None, quality_state)
             download_queue.put(fargs)
     # then the number of workers
     if "max_threads" in provider:
@@ -1882,32 +1945,35 @@ def _save_image_atomically(image, file_path, **save_kwargs):
                 pass
 
 
-def download_jpeg_ortho(
-    file_dir,
-    file_name,
+def _fetch_orthophoto_image(
     til_x_left,
     til_y_top,
     zoomlevel,
     provider_code,
     super_resol_factor=1,
+    quality_state=None,
 ):
+    """Fetch one image without writing it to the imagery cache."""
     provider = providers_dict[provider_code]
     if ("super_resol_factor" in provider) and (super_resol_factor == 1):
         super_resol_factor = int(provider["super_resol_factor"])
+    provider_limited = False
     if "max_zl" in provider:
         max_zl = int(provider["max_zl"])
         if zoomlevel > max_zl:
+            provider_limited = True
             super_resol_factor = 2 ** (max_zl - zoomlevel)
     width = height = int(4096 * super_resol_factor)
-    # we treat first the case of webmercator grid type servers
     if "grid_type" in provider and provider["grid_type"] == "webmercator":
         tilbox = [til_x_left, til_y_top, til_x_left + 16, til_y_top + 16]
         tilbox_mod = [int(round(p * super_resol_factor)) for p in tilbox]
         zoom_shift = round(log(super_resol_factor) / log(2))
         (success, big_image) = build_texture_from_tilbox(
-            tilbox_mod, zoomlevel + zoom_shift, provider
+            tilbox_mod,
+            zoomlevel + zoom_shift,
+            provider,
+            quality_state=quality_state,
         )
-    # if not we are in the world of epsg:3857 bboxes
     else:
         [latmax, lonmin] = GEO.gtile_to_wgs84(til_x_left, til_y_top, zoomlevel)
         [latmin, lonmax] = GEO.gtile_to_wgs84(
@@ -1918,126 +1984,330 @@ def download_jpeg_ortho(
         (success, big_image) = build_texture_from_bbox_and_size(
             [xmin, ymax, xmax, ymin], "3857", (width, height), provider
         )
-    # if stop flag we do not wish to imprint a white texture
+    if UI.red_flag or not success:
+        return (0, None, provider_limited)
+    if getattr(big_image, "size", None) != (width, height):
+        if quality_state is not None:
+            quality_state.mark("unexpected_image_dimensions")
+        return (0, None, provider_limited)
+    if super_resol_factor != 1:
+        big_image = big_image.resize((4096, 4096), Image.BICUBIC)
+    return (1, big_image, provider_limited)
+
+
+def _parent_crop_box(til_x_left, til_y_top, zoomlevel, parent_zl, source_size=4096):
+    """Return a bounded crop from a 4096px parent texture."""
+    diff = int(zoomlevel) - int(parent_zl)
+    if diff <= 0:
+        return None
+    factor = 2 ** diff
+    parent_x = int(til_x_left) // factor
+    parent_y = int(til_y_top) // factor
+    parent_x_left = (parent_x // 16) * 16
+    parent_y_top = (parent_y // 16) * 16
+    crop_size = int(source_size) // factor
+    offset_x = (parent_x - parent_x_left) * 256
+    offset_y = (parent_y - parent_y_top) * 256
+    if crop_size <= 0 or offset_x < 0 or offset_y < 0:
+        return None
+    if offset_x + crop_size > source_size or offset_y + crop_size > source_size:
+        return None
+    return (
+        parent_x_left,
+        parent_y_top,
+        offset_x,
+        offset_y,
+        crop_size,
+    )
+
+
+def _parent_file_dir(file_dir, provider_code, parent_zl):
+    return os.path.join(
+        os.path.dirname(os.path.normpath(file_dir)),
+        provider_code + "_" + str(parent_zl),
+    )
+
+
+def _valid_parent_cache_path(
+    parent_file_dir, til_x_left, til_y_top, parent_zl, provider_code
+):
+    for cache_path in CACHE.cache_paths(
+        parent_file_dir,
+        til_x_left,
+        til_y_top,
+        parent_zl,
+        provider_code,
+    ):
+        if not CACHE.image_file_is_valid(cache_path):
+            continue
+        try:
+            with Image.open(cache_path) as parent_image:
+                if parent_image.format in ("JPEG", "WEBP") and parent_image.size == (4096, 4096):
+                    return cache_path
+        except Exception:
+            continue
+    return None
+
+
+def _load_or_download_parent_image(
+    file_dir,
+    til_x_left,
+    til_y_top,
+    parent_zl,
+    provider_code,
+    parent_download_cache=None,
+):
+    provider = providers_dict[provider_code]
+    cache_key = (
+        file_dir,
+        int(til_x_left),
+        int(til_y_top),
+        int(parent_zl),
+        provider_code,
+    )
+    if parent_download_cache is not None and cache_key in parent_download_cache:
+        return parent_download_cache[cache_key]
+    parent_file_dir = _parent_file_dir(file_dir, provider_code, parent_zl)
+    parent_cache_path = _valid_parent_cache_path(
+        parent_file_dir,
+        til_x_left,
+        til_y_top,
+        parent_zl,
+        provider_code,
+    )
+    if parent_cache_path:
+        if parent_download_cache is not None:
+            parent_download_cache[cache_key] = parent_cache_path
+        return parent_cache_path
+
+    parent_cache_path = CACHE.preferred_cache_path(
+        parent_file_dir,
+        til_x_left,
+        til_y_top,
+        parent_zl,
+        provider_code,
+        validate_imagery_cache_settings()[0],
+    )
+    UI.vprint(
+        1,
+        UI.ui_text(
+            f"   Downloading parent ZL{parent_zl} orthophoto: {os.path.basename(parent_cache_path)}",
+            f"   親画像ZL{parent_zl}を取得中: {os.path.basename(parent_cache_path)}",
+        ),
+    )
+    quality_state = _TextureFetchState()
+    try:
+        (success, parent_image, _provider_limited) = _fetch_orthophoto_image(
+            til_x_left,
+            til_y_top,
+            parent_zl,
+            provider_code,
+            quality_state=quality_state,
+        )
+    except Exception as error:
+        UI.vprint(
+            1,
+            UI.ui_text(
+                f"   Parent image fetch failed: {error}",
+                f"   親画像の取得に失敗: {error}",
+            ),
+        )
+        if parent_download_cache is not None:
+            parent_download_cache[cache_key] = None
+        return None
+    if (
+        not success
+        or quality_state.degraded
+        or getattr(parent_image, "size", None) != (4096, 4096)
+    ):
+        if parent_download_cache is not None:
+            parent_download_cache[cache_key] = None
+        return None
+    try:
+        os.makedirs(parent_file_dir, exist_ok=True)
+        save_imagery_cache_image(parent_image, parent_cache_path)
+    except Exception as error:
+        UI.vprint(
+            1,
+            UI.ui_text(
+                f"   Parent image save failed: {error}",
+                f"   親画像の保存に失敗: {error}",
+            ),
+        )
+        if parent_download_cache is not None:
+            parent_download_cache[cache_key] = None
+        return None
+    parent_cache_path = _valid_parent_cache_path(
+        parent_file_dir,
+        til_x_left,
+        til_y_top,
+        parent_zl,
+        provider_code,
+    )
+    if parent_download_cache is not None:
+        parent_download_cache[cache_key] = parent_cache_path
+    return parent_cache_path
+
+
+def _rebuild_from_parent(
+    file_dir,
+    til_x_left,
+    til_y_top,
+    zoomlevel,
+    provider_code,
+    parent_download_cache=None,
+):
+    """Find the nearest usable parent and crop it to a 4096px child."""
+    for parent_zl in range(int(zoomlevel) - 1, 15, -1):
+        crop_box = _parent_crop_box(
+            til_x_left, til_y_top, zoomlevel, parent_zl
+        )
+        if crop_box is None:
+            continue
+        (
+            parent_x_left,
+            parent_y_top,
+            offset_x,
+            offset_y,
+            crop_size,
+        ) = crop_box
+        parent_cache_path = _load_or_download_parent_image(
+            file_dir,
+            parent_x_left,
+            parent_y_top,
+            parent_zl,
+            provider_code,
+            parent_download_cache=parent_download_cache,
+        )
+        if not parent_cache_path:
+            continue
+        try:
+            with Image.open(parent_cache_path) as parent_image:
+                if parent_image.size != (4096, 4096):
+                    continue
+                cropped = parent_image.crop(
+                    (
+                        offset_x,
+                        offset_y,
+                        offset_x + crop_size,
+                        offset_y + crop_size,
+                    )
+                )
+                return (
+                    1,
+                    cropped.resize((4096, 4096), Image.BICUBIC),
+                    parent_zl,
+                    parent_cache_path,
+                )
+        except Exception:
+            continue
+    return (0, None, None, None)
+
+
+def download_jpeg_ortho(
+    file_dir,
+    file_name,
+    til_x_left,
+    til_y_top,
+    zoomlevel,
+    provider_code,
+    super_resol_factor=1,
+):
+    quality_state = _TextureFetchState()
+    try:
+        (success, big_image, _provider_limited) = _fetch_orthophoto_image(
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            provider_code,
+            super_resol_factor=super_resol_factor,
+            quality_state=quality_state,
+        )
+    except Exception as error:
+        quality_state.mark("direct_fetch_error")
+        UI.vprint(
+            1,
+            UI.ui_text(
+                f"   Direct orthophoto fetch failed: {error}",
+                f"   直接オルソ画像取得に失敗: {error}",
+            ),
+        )
+        success, big_image = 0, None
     if UI.red_flag:
         return 0
-    if not success:
-        UI.lvprint(
-            0,
-            "ERROR: Part of image",
-            file_name,
-            "could not be obtained (even at lower ZL).",
-        )
-        return 0
-    os.makedirs(file_dir, exist_ok=True)
-    try:
-        if super_resol_factor == 1:
-            save_imagery_cache_image(big_image, os.path.join(file_dir, file_name))
-        else:
-            resized_image = big_image.resize(
-                (
-                    int(width / super_resol_factor),
-                    int(height / super_resol_factor),
-                ),
-                Image.BICUBIC,
-            )
-            save_imagery_cache_image(
-                resized_image, os.path.join(file_dir, file_name)
-            )
-    except Exception as e:
-        UI.lvprint(
-            0,
-            "OS Error : could not save orthophoto on disk, ",
-            "received message :",
-            e,
-        )
-        return 0
+
     file_path = os.path.join(file_dir, file_name)
-    if zoomlevel > 16 and os.path.exists(file_path):
-        try:
-            if os.path.getsize(file_path) < 512000:
-                UI.vprint(
-                    1,
-                    f"   [Quality Check] {file_name} is small, trying ZL16 crop fallback.",
-                )
-                parent_zl = 16
-                diff = zoomlevel - parent_zl
-                factor = 2 ** diff
-                til_x_16 = til_x_left // factor
-                til_y_16 = til_y_top // factor
-                til_x_left_16 = (til_x_16 // 16) * 16
-                til_y_top_16 = (til_y_16 // 16) * 16
-                parent_file_name = FNAMES.jpeg_file_name_from_attributes(
-                    til_x_left_16,
-                    til_y_top_16,
-                    parent_zl,
-                    provider_code,
-                )
-                latmax, lonmin = GEO.gtile_to_wgs84(
-                    til_x_left, til_y_top, zoomlevel
-                )
-                parent_lat = int(floor(latmax))
-                parent_lon = int(floor(lonmin))
-                parent_file_dir = FNAMES.jpeg_file_dir_from_attributes(
-                    parent_lat,
-                    parent_lon,
-                    parent_zl,
-                    provider,
-                )
-                parent_cache_path = CACHE.find_cache_path(
-                    parent_file_dir,
-                    til_x_left_16,
-                    til_y_top_16,
-                    parent_zl,
-                    provider_code,
-                )
-                if not parent_cache_path:
-                    parent_file_path = CACHE.preferred_cache_path(
-                        parent_file_dir,
-                        til_x_left_16,
-                        til_y_top_16,
-                        parent_zl,
-                        provider_code,
-                        validate_imagery_cache_settings()[0],
-                    )
+    if not success or quality_state.degraded:
+        reasons = ", ".join(quality_state.reasons) or "direct_fetch_failed"
+        if zoomlevel > 16:
+            UI.vprint(
+                1,
+                UI.ui_text(
+                    f"   [Quality Check] {file_name} direct fetch degraded ({reasons}); searching parent ZL{zoomlevel - 1}..ZL16.",
+                    f"   [品質確認] {file_name} の直接取得が劣化状態（{reasons}）のため、親画像ZL{zoomlevel - 1}..ZL16を探索します。",
+                ),
+            )
+            (
+                rebuilt,
+                parent_image,
+                parent_zl,
+                parent_cache_path,
+            ) = _rebuild_from_parent(
+                file_dir,
+                til_x_left,
+                til_y_top,
+                zoomlevel,
+                provider_code,
+            )
+            if rebuilt:
+                try:
+                    os.makedirs(file_dir, exist_ok=True)
+                    save_imagery_cache_image(parent_image, file_path, jpeg_quality=90)
                     UI.vprint(
                         1,
-                        f"   Downloading parent ZL16 orthophoto: {os.path.basename(parent_file_path)}",
+                        UI.ui_text(
+                            f"   [Quality Check] Rebuilt {file_name} from {os.path.basename(parent_cache_path)}.",
+                            f"   [品質確認] {file_name} を {os.path.basename(parent_cache_path)} から再構成しました。",
+                        ),
                     )
-                    download_jpeg_ortho(
-                        parent_file_dir,
-                        os.path.basename(parent_file_path),
-                        til_x_left_16,
-                        til_y_top_16,
-                        parent_zl,
-                        provider_code,
+                    return 1
+                except Exception as error:
+                    UI.vprint(
+                        1,
+                        UI.ui_text(
+                            f"   [Quality Check] Parent fallback save failed: {error}",
+                            f"   [品質確認] 親フォールバック画像の保存に失敗: {error}",
+                        ),
                     )
-                    parent_cache_path = parent_file_path
-                if parent_cache_path and _jpeg_file_is_ready(parent_cache_path):
-                    with Image.open(parent_cache_path) as parent_img:
-                        offset_x = (til_x_16 - til_x_left_16) * 256
-                        offset_y = (til_y_16 - til_y_top_16) * 256
-                        crop_size = factor * 256
-                        cropped = parent_img.crop(
-                            (
-                                offset_x,
-                                offset_y,
-                                offset_x + crop_size,
-                                offset_y + crop_size,
-                            )
-                        )
-                        high_quality_img = cropped.resize(
-                            (4096, 4096), Image.BICUBIC
-                        )
-                        save_imagery_cache_image(
-                            high_quality_img, file_path, jpeg_quality=90
-                        )
-                        UI.vprint(
-                            1,
-                            f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",
-                        )
-        except Exception as e:
-            UI.vprint(1, f"   [Quality Check] Failed to fallback: {e}")
+            UI.lvprint(
+                0,
+                UI.ui_text(
+                    f"ERROR: Part of image {file_name} could not be obtained; all parent fallbacks failed.",
+                    f"エラー: 画像 {file_name} を取得できず、すべての親フォールバックにも失敗しました。",
+                ),
+            )
+        else:
+            UI.lvprint(
+                0,
+                UI.ui_text(
+                    f"ERROR: Part of image {file_name} could not be obtained.",
+                    f"エラー: 画像 {file_name} を取得できませんでした。",
+                ),
+            )
+        return 0
+
+    try:
+        os.makedirs(file_dir, exist_ok=True)
+        save_imagery_cache_image(big_image, file_path)
+    except Exception as error:
+        UI.lvprint(
+            0,
+            UI.ui_text(
+                f"OS Error: could not save orthophoto on disk: {error}",
+                f"OSエラー: オルソ画像をディスクへ保存できません: {error}",
+            ),
+        )
+        return 0
     return 1
 
 
