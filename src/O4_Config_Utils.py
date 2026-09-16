@@ -939,8 +939,44 @@ class Ortho4XP_Config(tk.Toplevel):
         self.main_frame = tk.Frame(
             self, border=4, relief=RIDGE, bg=UI.BG_COLOR
         )
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(0, weight=1)
+        self.config_view = tk.Frame(
+            self.main_frame, border=0, bg=UI.BG_COLOR
+        )
+        self.config_view.columnconfigure(0, weight=1)
+        self.config_view.rowconfigure(0, weight=1)
+        self.config_canvas = tk.Canvas(
+            self.config_view,
+            borderwidth=0,
+            highlightthickness=0,
+            bg=UI.BG_COLOR,
+            xscrollincrement=20,
+            yscrollincrement=20,
+        )
+        self.config_scrollbar_y = ttk.Scrollbar(
+            self.config_view,
+            orient=tk.VERTICAL,
+            command=self.config_canvas.yview,
+        )
+        self.config_scrollbar_x = ttk.Scrollbar(
+            self.config_view,
+            orient=tk.HORIZONTAL,
+            command=self.config_canvas.xview,
+        )
+        self.config_canvas.configure(
+            xscrollcommand=self.config_scrollbar_x.set,
+            yscrollcommand=self.config_scrollbar_y.set,
+        )
+        self.config_canvas.grid(row=0, column=0, sticky=N + S + E + W)
+        self.config_scrollbar_y.grid(row=0, column=1, sticky=N + S)
+        self.config_scrollbar_x.grid(row=1, column=0, sticky=E + W)
         self.frame_cfg = tk.Frame(
-            self.main_frame, border=0, padx=5, pady=self.pady, bg=UI.BG_COLOR
+            self.config_canvas,
+            border=0,
+            padx=5,
+            pady=self.pady,
+            bg=UI.BG_COLOR,
         )
         self.frame_dem = tk.Frame(
             self.frame_cfg, border=0, padx=0, pady=self.pady, bg=UI.BG_COLOR
@@ -958,8 +994,19 @@ class Ortho4XP_Config(tk.Toplevel):
 
         # Frames placement
         self.main_frame.grid(row=0, column=0, sticky=N + S + W + E)
-        self.frame_cfg.grid(row=0, column=0, pady=10, sticky=N + S + E + W)
+        self.config_view.grid(
+            row=0, column=0, padx=5, pady=10, sticky=N + S + E + W
+        )
         self.frame_lastbtn.grid(row=1, column=0, pady=10, sticky=N + S + E + W)
+        self.config_window_id = self.config_canvas.create_window(
+            (0, 0), window=self.frame_cfg, anchor="nw"
+        )
+        self.frame_cfg.bind(
+            "<Configure>", self._update_config_scrollregion
+        )
+        self.config_canvas.bind(
+            "<Configure>", self._resize_config_frame
+        )
 
         # Variables and widgets and their placement
         self.v_ = {}
@@ -1233,10 +1280,93 @@ class Ortho4XP_Config(tk.Toplevel):
             row=0, column=6, padx=5, pady=self.pady, sticky=N + S + E + W
         )
 
+        self._bind_config_mousewheel()
+        self.update_idletasks()
+        self._set_initial_geometry()
+
         # Initialize fields and variables
         self.v_["default_website"] = parent.default_website
         self.v_["default_zl"] = parent.default_zl
         self.load_interface_from_variables()
+
+    def _update_config_scrollregion(self, _event=None):
+        self.config_canvas.configure(
+            scrollregion=self.config_canvas.bbox("all")
+        )
+
+    def _resize_config_frame(self, event):
+        frame_width = max(event.width, self.frame_cfg.winfo_reqwidth())
+        self.config_canvas.itemconfigure(
+            self.config_window_id, width=frame_width
+        )
+        self._update_config_scrollregion()
+
+    def _bind_config_mousewheel(self):
+        widgets = [self.config_canvas, self.frame_cfg]
+        pending = list(self.frame_cfg.winfo_children())
+        while pending:
+            widget = pending.pop()
+            widgets.append(widget)
+            pending.extend(widget.winfo_children())
+        for widget in widgets:
+            widget.bind("<MouseWheel>", self._on_config_mousewheel, add="+")
+            widget.bind(
+                "<Shift-MouseWheel>",
+                self._on_config_shift_mousewheel,
+                add="+",
+            )
+            widget.bind("<Button-4>", self._on_config_mousewheel, add="+")
+            widget.bind("<Button-5>", self._on_config_mousewheel, add="+")
+
+    @staticmethod
+    def _mousewheel_units(event):
+        event_num = getattr(event, "num", None)
+        if event_num == 4:
+            return -1
+        if event_num == 5:
+            return 1
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return 0
+        if abs(delta) >= 120:
+            return -int(delta / 120)
+        return -1 if delta > 0 else 1
+
+    def _on_config_mousewheel(self, event):
+        units = self._mousewheel_units(event)
+        if units:
+            self.config_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_config_shift_mousewheel(self, event):
+        units = self._mousewheel_units(event)
+        if units:
+            self.config_canvas.xview_scroll(units, "units")
+        return "break"
+
+    def _set_initial_geometry(self):
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        available_width = max(320, screen_width - 40)
+        available_height = max(320, screen_height - 80)
+        desired_width = max(
+            self.frame_cfg.winfo_reqwidth() + 30,
+            self.frame_lastbtn.winfo_reqwidth() + 20,
+            900,
+        )
+        desired_height = max(
+            520,
+            self.frame_lastbtn.winfo_reqheight()
+            + min(self.frame_cfg.winfo_reqheight(), 900)
+            + 40,
+        )
+        width = min(desired_width, available_width)
+        height = min(desired_height, available_height)
+        self.minsize(min(900, width), min(420, height))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.geometry("{}x{}+{}+{}".format(width, height, x, y))
+        self.after_idle(self._update_config_scrollregion)
 
     def load_interface_from_variables(self):
         for var in cfg_vars:
