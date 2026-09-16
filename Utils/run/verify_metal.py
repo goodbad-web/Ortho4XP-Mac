@@ -645,16 +645,48 @@ def compare_metalfx_batch(
         )
         if value
     ).strip()
+    measured_diagnostics = last_result.stdout if last_result is not None else ""
+    item_effective_backends = []
+    for line in measured_diagnostics.splitlines():
+        if not line.startswith("metalfx_batch_item="):
+            continue
+        fields = dict(
+            field.split("=", 1)
+            for field in line.split()
+            if "=" in field
+        )
+        effective_backend = fields.get("effective_backend")
+        if effective_backend:
+            item_effective_backends.append(effective_backend)
+
+    if len(item_effective_backends) != len(pairs):
+        batch_fallback = None
+        effective_backend = "unknown"
+        status = "SKIP(batch_backend_telemetry_missing)"
+    else:
+        batch_fallback = sum(
+            backend == "ci_lanczos" for backend in item_effective_backends
+        )
+        observed_backends = set(item_effective_backends)
+        if observed_backends == {"metalfx_spatial"}:
+            effective_backend = "metalfx_spatial"
+            status = "PASS"
+        elif observed_backends == {"ci_lanczos"}:
+            effective_backend = "ci_lanczos"
+            status = "SKIP(metalfx_fallback)"
+        else:
+            effective_backend = "mixed"
+            status = "SKIP(metalfx_fallback)"
     return {
-        "status": "PASS",
+        "status": status,
         "backend": "metalfx_spatial",
-        "effective_backend": "metalfx_spatial",
+        "effective_backend": effective_backend,
         "requested_backend": "metalfx_spatial",
         "dispatch": "batch",
         "alpha_mode": "opaque",
         "batch_tasks": len(pairs),
         "batch_success": len(pairs),
-        "batch_fallback": diagnostics.count("effective_backend=ci_lanczos"),
+        "batch_fallback": batch_fallback,
         "runs": runs,
         "timing_ms": {
             "samples": samples_ms,

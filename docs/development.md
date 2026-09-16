@@ -77,9 +77,11 @@ MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
 
 ログの`backend`、`effective_backend`、`alpha_mode`、`dispatch`、`duration_ms`と、batchの`batch_tasks`、`batch_success`、`batch_fallback`を記録する。`verify_metal.py --compare-upscale`はopaque、RGBA、batchを測定する。MetalFXを利用できない環境でRGBA単画像を実行した場合も、ASHelper内のLanczos fallbackが成功すれば出力を残し、実際にMetalFX dispatchが発生したかはログの`effective_backend`で区別する。
 
-直接プロバイダのopaque JPEGを実タイルで処理するときは、PNG中間ファイルを作らないdirect DDS経路を使用する。Python側は`--metalfx-spatial-dds-batch <request.json>`へ入力、マスク、色補正、BC1/BC3形式、`.gpu.tmp.dds`出力先を渡し、ASHelperがMetalFXのreadbackから既存DDS圧縮までを同一プロセス内で実行する。検証済みの一時DDSだけを`os.replace`で公開するため、途中失敗時に部分出力を公開しない。RGBA、ローカル合成、WebP、非対応provider、TensorOpsは従来の経路を維持する。
+直接プロバイダのopaque JPEGを実タイルで処理するときは、PNG中間ファイルを作らないdirect DDS経路を使用する。MetalFXは`--metalfx-spatial-dds-batch <request.json>`、TensorOpsは`--tensorops-dds-batch <request.json>`（`--fp8-tensorops-dds-batch`はalias）へ入力、マスク、色補正、BC1/BC3形式、`.gpu.tmp.dds`出力先を渡す。ASHelperがreadbackから既存DDS圧縮までを同一プロセス内で実行し、検証済みの一時DDSだけを`os.replace`で公開するため、途中失敗時に部分出力を公開しない。RGBA、ローカル合成、WebP、非対応providerは従来の経路を維持する。
 
 direct DDS batchは既定2 worker、最大4 worker、1プロセス8画像chunkで実行する。verbosity 1では`MetalFX Spatial DDS batch: completed/total`、続けて`png_intermediate=false`、`metalfx_ms`、`readback_ms`、`dds_ms`、`temporary_bytes`、fallback理由を表示する。単独経路と性能を比較する場合は、同じ入力を次のように実行する。
+
+TensorOps direct DDSはGPU同時実行を避け、既定1 worker・1 child processあたり8画像のchunkで実行する。chunk終了時にASHelperを終了するため、Metal/PNG/CGImageの一時リソースをプロセス境界で回収できる。ログには`batch_workers=1`、`batch_chunks`、`chunk_size=8`、`peak_rss_mb`、`rss_after_item_mb`、`signal=9`（SIGKILL時）、`fallback_reasons=process_signal_9`を記録する。TensorOps batchが失敗した場合は失敗chunkの画像だけを`ci_lanczos`へ送り、成功済みDDSは再処理しない。`--tensorops-upscale`とそのbatchはPNG互換CLIとして残るが、実タイルのdirect DDSでは`png_intermediate=false`となり、`_tensorops_upscaled.png`や`tile_input.png`を生成しない。
 
 ```sh
 cat >/private/tmp/metalfx-direct-dds.json <<'JSON'

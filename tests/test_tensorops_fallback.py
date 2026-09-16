@@ -46,3 +46,25 @@ def test_non_tensorops_prepared_input_remains_reusable(tmp_path, monkeypatch):
     result = TILE._cpu_fallback_convert_args([item], [str(prepared)])
 
     assert result == [(*item, "dds", str(prepared))]
+
+
+def test_cpu_fallback_forces_lanczos_backend(monkeypatch):
+    captured = {}
+
+    def fake_pool(*args, **kwargs):
+        captured.update(kwargs["init_args"])
+        return True
+
+    monkeypatch.setattr(TILE, "multiprocessing_pool", fake_pool)
+
+    assert TILE._run_cpu_fallback(
+        [],
+        {
+            "upscale_backend": "tensorops",
+            "use_gpu_acceleration": True,
+        },
+        1,
+        {},
+    )
+    assert captured["upscale_backend"] == "ci_lanczos"
+    assert captured["use_gpu_acceleration"] is False

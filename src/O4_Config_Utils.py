@@ -75,6 +75,54 @@ a particular server.",
         "values": (1, 2, 4, 8, 16, 32, 64, 128),
         "hint": "Number of parallel threads for texture downloading. Should be dictated by your bandwidth and the server tolerance.",
     },
+    "enable_streaming_conversion": {
+        "module": "TILE",
+        "type": bool,
+        "default": False,
+        "short_name": "Streaming conversion",
+        "short_name_japanese": "ストリーミング変換",
+        "hint": "Start DDS conversion as each imagery download completes instead of waiting for all downloads. The legacy barrier remains available while this feature is validated.\n\n日本語: すべての画像ダウンロードを待たず、完了した画像からDDS変換を開始します。検証中は旧経路へ戻せます。",
+    },
+    "conversion_queue_size": {
+        "module": "TILE",
+        "type": int,
+        "default": 0,
+        "short_name": "Conversion queue",
+        "short_name_japanese": "変換キュー上限",
+        "hint": "Bounded conversion queue size. Zero selects an automatic value based on max_convert_slots.",
+    },
+    "gpu_batch_size": {
+        "module": "TILE",
+        "type": int,
+        "default": 0,
+        "short_name": "GPU batch size",
+        "short_name_japanese": "GPUバッチサイズ",
+        "hint": "GPU batch item limit. Zero keeps the backend-specific safe default.",
+    },
+    "gpu_batch_wait_ms": {
+        "module": "TILE",
+        "type": int,
+        "default": 50,
+        "short_name": "GPU batch wait ms",
+        "short_name_japanese": "GPUバッチ待ち時間(ms)",
+        "hint": "Maximum wait before flushing a partially filled GPU batch.",
+    },
+    "enable_parallel_overlay": {
+        "module": "TILE",
+        "type": bool,
+        "default": False,
+        "short_name": "Parallel overlay",
+        "short_name_japanese": "overlay並列",
+        "hint": "Experimental: run overlay extraction in an isolated worker. Disabled by default.",
+    },
+    "max_parallel_tiles": {
+        "module": "TILE",
+        "type": int,
+        "default": 1,
+        "short_name": "Parallel tiles",
+        "short_name_japanese": "タイル並列数",
+        "hint": "Experimental tile concurrency. One is the safe default; two is the initial opt-in limit.",
+    },
     "check_tms_response": {
         "module": "IMG",
         "type": bool,
@@ -651,12 +699,21 @@ list_dsf_vars = [
     "build_overlays_in_all_in_one",
 ]
 list_other_vars = ["custom_dem", "fill_nodata"]
+list_performance_vars = [
+    "enable_streaming_conversion",
+    "conversion_queue_size",
+    "gpu_batch_size",
+    "gpu_batch_wait_ms",
+    "enable_parallel_overlay",
+    "max_parallel_tiles",
+]
 list_tile_vars = (
     list_vector_vars
     + list_mesh_vars
     + list_mask_vars
     + list_dsf_vars
     + list_other_vars
+    + list_performance_vars
     + ["default_website", "default_zl", "zone_list"]
 )
 
@@ -667,6 +724,7 @@ list_global_cfg = (
     + list_mask_vars
     + list_dsf_vars
     + list_other_vars
+    + list_performance_vars
 )
 
 ################################################################################

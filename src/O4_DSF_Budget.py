@@ -8,6 +8,15 @@ MAX_AUTO_REDUCE_ATTEMPTS = 1
 MIN_LEVELLED_SEGMENTS = 25_000
 
 
+_RETRY_STAGE_BY_SETTING = {
+    "max_levelled_segs": "vector data",
+    "water_simplification": "vector data",
+    "cover_zl": "vector data",
+    "curvature_tol": "mesh",
+    "limit_tris": "mesh",
+}
+
+
 def stable_id_key(value):
     """Return a deterministic ordering key for OSM and R-tree identifiers."""
     text = str(value)
@@ -55,6 +64,21 @@ def retry_settings(base_settings, attempt, mesh_zl):
         settings["curvature_tol"] = float(base_settings["curvature_tol"]) * 1.25
         settings["limit_tris"] = float(base_settings["limit_tris"]) * 0.8
     return settings
+
+
+def retry_stage_for_settings(changed_settings):
+    """Return the earliest stage affected by an auto-reduce change.
+
+    The dependency table is intentionally conservative.  A vector-affecting
+    setting invalidates vector data and every downstream artifact; mesh-only
+    settings retain the previous vector input and restart at mesh.  Unknown
+    settings invalidate the full pipeline rather than risking mixed outputs.
+    """
+    names = set(changed_settings or ())
+    if not names:
+        return "vector data"
+    stages = {_RETRY_STAGE_BY_SETTING.get(name, "vector data") for name in names}
+    return "vector data" if "vector data" in stages else "mesh"
 
 
 def summarize_dsf_pools(

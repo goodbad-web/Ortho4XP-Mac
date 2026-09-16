@@ -9,6 +9,8 @@ import threading
 import tempfile
 import re
 import traceback
+from contextlib import nullcontext
+from itertools import count
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 import O4_Imagery_Utils as IMG
@@ -18,13 +20,27 @@ import O4_Mask_Utils as MASK
 import O4_DSF_Utils as DSF
 import O4_Overlay_Utils as OVL
 import O4_DSF_Budget as DSF_BUDGET
-from O4_Parallel_Utils import parallel_launch, parallel_join, multiprocessing_pool
+import O4_Performance_Utils as PERF
+from O4_Parallel_Utils import (
+    parallel_launch,
+    parallel_join,
+    multiprocessing_pool,
+    ReusableMultiprocessingPool,
+)
+from O4_Tile_Scheduler import ConversionResult, ConversionTask, TileConversionScheduler
+from O4_ASHelper_Server import ASHelperJSONLServer
 from PIL import Image
 
 max_convert_slots = 8
 max_download_slots = 8
 skip_downloads = False
 skip_converts = False
+enable_streaming_conversion = False
+conversion_queue_size = 0
+gpu_batch_size = 0
+gpu_batch_wait_ms = 50
+enable_parallel_overlay = False
+max_parallel_tiles = 1
 
 
 _BUILD_TRANSACTION_MARKER = ".Ortho4XP_build_recovery.json"
@@ -39,6 +55,7 @@ _AUTO_REDUCE_SETTING_NAMES = (
     "curvature_tol",
     "limit_tris",
 )
+_ASHELPER_CAPABILITY_CACHE = {}
 
 
 def _is_generated_dds_name(name):
@@ -258,6 +275,36 @@ class _BuildTransaction:
         self._move_current_to(snapshot_name)
         return snapshot_name
 
+    def clone_snapshot(self, source_snapshot, target_snapshot):
+        """Clone a candidate without consuming it.
+
+        DDS payloads are hardlinked while small text/raster outputs are copied,
+        matching the transaction's existing snapshot policy.  This gives a
+        partial retry a private rollback point even though restoring a
+        candidate moves its files back to canonical paths.
+        """
+        source_root = os.path.join(self.root, source_snapshot)
+        target_root = os.path.join(self.root, target_snapshot)
+        if not os.path.isdir(source_root):
+            raise FileNotFoundError(source_root)
+        for kind in ("tile", "shared", "mask"):
+            source_kind_root = os.path.join(source_root, kind)
+            if not os.path.isdir(source_kind_root):
+                continue
+            for dir_path, _, names in os.walk(source_kind_root):
+                for name in names:
+                    source_path = os.path.join(dir_path, name)
+                    relative_path = os.path.relpath(source_path, source_kind_root)
+                    destination_path = os.path.join(
+                        target_root, kind, relative_path
+                    )
+                    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                    if source_path.lower().endswith(".dds"):
+                        os.link(source_path, destination_path)
+                    else:
+                        shutil.copy2(source_path, destination_path)
+        return target_snapshot
+
     def discard_current(self, label):
         self._move_current_to("discarded-{}".format(label))
 
@@ -469,8 +516,16 @@ def _recover_build_transaction(tile):
         return False
 
 
-def _ashelper_metal_available(as_helper):
-    """Probe ASHelper once before deferring work to the Metal batch path."""
+def _ashelper_capabilities(as_helper):
+    """Probe all ASHelper capabilities once per executable revision."""
+    try:
+        stat = os.stat(as_helper)
+        cache_key = (os.path.abspath(as_helper), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = (os.path.abspath(as_helper), None, None)
+    cached = _ASHELPER_CAPABILITY_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
     try:
         result = subprocess.run(
             [as_helper, "--capabilities"],
@@ -481,70 +536,53 @@ def _ashelper_metal_available(as_helper):
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        UI.vprint(1, f"WARNING: Could not probe ASHelper Metal capability: {error}")
-        return False
+        capabilities = {
+            "metal_available": False,
+            "metalfx_spatial_available": False,
+            "tensorops_available": False,
+            "fp8_tensorops_available": False,
+            "probe_error": type(error).__name__,
+        }
+    else:
+        values = {}
+        for line in (result.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            name, value = line.strip().split("=", 1)
+            values[name] = value.lower() == "true"
+        capabilities = {
+            "metal_available": bool(result.returncode == 0 and values.get("metal_available")),
+            "metalfx_spatial_available": bool(
+                result.returncode == 0 and values.get("metalfx_spatial_available")
+            ),
+            "tensorops_available": bool(
+                result.returncode == 0 and values.get("tensorops_available")
+            ),
+            "fp8_tensorops_available": bool(
+                result.returncode == 0 and values.get("fp8_tensorops_available")
+            ),
+        }
+        if result.returncode != 0:
+            capabilities["probe_error"] = f"exit_{result.returncode}"
+    _ASHELPER_CAPABILITY_CACHE[cache_key] = dict(capabilities)
+    if not capabilities["metal_available"]:
+        UI.vprint(1, "WARNING: ASHelper Metal is unavailable; using CPU conversion.")
+    return dict(capabilities)
 
-    available = (
-        result.returncode == 0
-        and "metal_available=true" in (result.stdout or "").splitlines()
-    )
-    if not available:
-        detail = (result.stdout or "").strip()
-        if detail:
-            UI.vprint(1, "WARNING: ASHelper Metal is unavailable; using CPU conversion.", detail)
-        else:
-            UI.vprint(1, "WARNING: ASHelper Metal is unavailable; using CPU conversion.")
-    return available
+
+def _ashelper_metal_available(as_helper):
+    """Compatibility wrapper for callers that only need Metal."""
+    return bool(_ashelper_capabilities(as_helper).get("metal_available"))
 
 
 def _ashelper_metalfx_available(as_helper):
     """Probe MetalFX separately from the generic Metal DDS capability."""
-    try:
-        result = subprocess.run(
-            [as_helper, "--capabilities"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        UI.vprint(1, f"WARNING: Could not probe ASHelper MetalFX capability: {error}")
-        return False
-    available = (
-        result.returncode == 0
-        and "metalfx_spatial_available=true" in (result.stdout or "").splitlines()
-    )
-    if not available and (result.stdout or "").strip():
-        UI.vprint(1, "WARNING: ASHelper MetalFX Spatial is unavailable; using per-image fallback.")
-    return available
+    return bool(_ashelper_capabilities(as_helper).get("metalfx_spatial_available"))
 
 
 def _ashelper_tensorops_available(as_helper):
     """Probe the macOS 27 TensorOps capability before batch deferral."""
-    try:
-        result = subprocess.run(
-            [as_helper, "--capabilities"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        UI.vprint(1, f"WARNING: Could not probe ASHelper TensorOps capability: {error}")
-        return False
-
-    available = (
-        result.returncode == 0
-        and "tensorops_available=true" in (result.stdout or "").splitlines()
-    )
-    if not available:
-        UI.vprint(
-            1,
-            "WARNING: ASHelper TensorOps is unavailable; using the requested fallback path.",
-        )
-    return available
+    return bool(_ashelper_capabilities(as_helper).get("tensorops_available"))
 
 
 def _cpu_fallback_convert_args(convert_list, prepared_input_paths):
@@ -600,6 +638,7 @@ def _run_cpu_fallback(
     cpu_config_data.update(
         {
             "use_gpu_acceleration": False,
+            "upscale_backend": "ci_lanczos",
             "defer_gpu_batch": False,
             "defer_fp8_batch": False,
             "preserve_batch_inputs": True,
@@ -613,6 +652,413 @@ def _run_cpu_fallback(
         init_func=IMG.init_worker,
         init_args=cpu_config_data,
     )
+
+
+def _streaming_queue_size(tile):
+    requested = int(
+        getattr(tile, "conversion_queue_size", conversion_queue_size) or 0
+    )
+    if requested <= 0:
+        requested = max(
+            32,
+            2 * max(1, int(getattr(tile, "max_convert_slots", max_convert_slots))),
+        )
+    return min(128, max(1, requested))
+
+
+def _streaming_gpu_batch_size(tile):
+    requested = int(getattr(tile, "gpu_batch_size", gpu_batch_size) or 0)
+    # Keep the existing safe batch size as the initial automatic value.  The
+    # setting is deliberately shared by the scheduler and future ASHelper
+    # server implementation, while each backend may lower it before dispatch.
+    return max(1, requested if requested > 0 else 32)
+
+
+def _streaming_batch_wait_ms(tile):
+    return max(
+        0,
+        int(getattr(tile, "gpu_batch_wait_ms", gpu_batch_wait_ms) or 0),
+    )
+
+
+def _conversion_worker_config(tile, effective_gpu):
+    """Build the spawn-worker globals used by a streaming CPU dispatcher."""
+    return {
+        "use_magick": IMG.use_magick,
+        "use_texture_converter": getattr(IMG, "use_texture_converter", False),
+        "dds_convert_cmd": IMG.dds_convert_cmd,
+        "gdal_transl_cmd": IMG.gdal_transl_cmd,
+        "gdalwarp_cmd": IMG.gdalwarp_cmd,
+        "as_helper_cmd": getattr(IMG, "as_helper_cmd", None),
+        "providers_dict": IMG.providers_dict,
+        "local_combined_providers_dict": IMG.local_combined_providers_dict,
+        "color_filters_dict": IMG.color_filters_dict,
+        "extents_dict": IMG.extents_dict,
+        "Ortho4XP_dir": UI.Ortho4XP_dir,
+        "verbosity": UI.verbosity,
+        "cleaning_level": UI.cleaning_level,
+        "upscale_backend": IMG.normalize_upscale_backend(
+            getattr(tile, "upscale_backend", "none")
+        ),
+        "upscale_scope": IMG.normalize_upscale_scope(
+            getattr(tile, "upscale_scope", "all")
+        ),
+        "fp8_model_path": getattr(
+            tile, "fp8_model_path", getattr(IMG, "fp8_model_path", "")
+        ),
+        "imagery_cache_format": getattr(IMG, "imagery_cache_format", "jpg"),
+        "imagery_cache_quality": getattr(IMG, "imagery_cache_quality", ""),
+        "dds_converter": getattr(
+            tile, "dds_converter", getattr(UI, "dds_converter", "nvcompress")
+        ),
+        "dds_format": getattr(
+            tile, "dds_format", getattr(UI, "dds_format", "BC3")
+        ),
+        "use_gpu_acceleration": bool(effective_gpu),
+        "use_gpu_for_color_filters": getattr(
+            tile, "use_gpu_for_color_filters", False
+        ),
+        "defer_gpu_batch": False,
+        "defer_fp8_batch": False,
+        "preserve_batch_inputs": False,
+        "is_worker": True,
+    }
+
+
+def _build_streaming_gpu_spec(task_id, item, dds_format):
+    """Prepare one direct-cache conversion for the resident ASHelper route.
+
+    The first streaming GPU lane intentionally handles only opaque provider
+    cache inputs without an upscale.  Combined providers, WebP inputs, and
+    upscale backends stay on the existing CPU/legacy paths until their
+    intermediate-image contracts are moved into the JSONL protocol.
+    """
+    tile, til_x_left, til_y_top, zoomlevel, provider_code = item
+    if provider_code not in IMG.providers_dict:
+        return None
+    if provider_code in IMG.local_combined_providers_dict:
+        return None
+    if IMG.should_upscale_texture(
+        tile, til_x_left, til_y_top, zoomlevel, provider_code
+    ):
+        return None
+    if not IMG.can_defer_gpu_batch_for_texture(
+        tile, til_x_left, til_y_top, zoomlevel, provider_code
+    ):
+        return None
+
+    out_file_name = FNAMES.dds_file_name_from_attributes(
+        til_x_left, til_y_top, zoomlevel, provider_code
+    )
+    file_dir = FNAMES.jpeg_file_dir_from_attributes(
+        tile.lat, tile.lon, zoomlevel, IMG.providers_dict[provider_code]
+    )
+    input_path = IMG.find_imagery_cache_path(
+        til_x_left, til_y_top, zoomlevel, provider_code, file_dir
+    )
+    if not input_path or not IMG._jpeg_file_is_ready(input_path):
+        return None
+    if input_path.lower().endswith(".webp"):
+        return None
+
+    with Image.open(input_path) as source_image:
+        input_size = source_image.size
+
+    png_file_name = out_file_name.replace("dds", "png")
+    mask_path = "none"
+    generated_mask_path = None
+    if tile.imprint_masks_to_dds:
+        mask_path, generated_mask_path = _resolve_gpu_batch_mask(
+            tile,
+            til_x_left,
+            til_y_top,
+            zoomlevel,
+            provider_code,
+            png_file_name,
+        )
+
+    color_code = IMG.providers_dict[provider_code].get("color_filters", "none")
+    r, g, b = 1.0, 1.0, 1.0
+    contrast, brightness, saturation = 1.0, 0.0, 1.0
+    for color_filter in IMG.color_filters_dict.get(color_code, []):
+        filter_name = color_filter[0]
+        if filter_name == "brightness-contrast":
+            brightness_value, contrast_value = color_filter[1:3]
+            brightness = brightness_value / 255.0
+            contrast = 1.0 + (contrast_value / 128.0)
+        elif filter_name == "saturation":
+            saturation = 1.0 + (color_filter[1] / 100.0)
+
+    has_alpha = False
+    if mask_path != "none":
+        with Image.open(mask_path) as mask_image:
+            has_alpha = mask_image.convert("L").getextrema()[0] < 255
+    target_format = IMG.resolve_dds_format(dds_format, has_alpha)
+    if target_format not in ("BC1", "BC3"):
+        return None
+
+    final_path = os.path.join(tile.build_dir, "textures", out_file_name)
+    temporary_path = final_path + ".gpu.tmp.dds"
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    try:
+        os.remove(temporary_path)
+    except OSError:
+        pass
+    return {
+        "task_id": task_id,
+        "item": item,
+        "request": {
+            "id": task_id,
+            "input": input_path,
+            "mask": mask_path,
+            "output": temporary_path,
+            "format": target_format,
+            "r": r,
+            "g": g,
+            "b": b,
+            "contrast": contrast,
+            "brightness": brightness,
+            "saturation": saturation,
+        },
+        "input_size": input_size,
+        "temporary_path": temporary_path,
+        "final_path": final_path,
+        "target_format": target_format,
+        "cleanup_paths": [generated_mask_path] if generated_mask_path else [],
+    }
+
+
+class _StreamingConversionRunner:
+    """Bridge downloads to bounded CPU and resident GPU conversion routes."""
+
+    def __init__(self, tile):
+        self.tile = tile
+        self.metrics = getattr(tile, "_performance_metrics", None)
+        self.started = time.perf_counter()
+        self._ids = count(1)
+        self._submitted_keys = set()
+        dds_converter = getattr(
+            tile, "dds_converter", getattr(UI, "dds_converter", "nvcompress")
+        )
+        self.dds_converter = dds_converter
+        self.dds_format = getattr(
+            tile, "dds_format", getattr(UI, "dds_format", "BC3")
+        )
+        use_gpu = bool(
+            getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
+        )
+        self.as_helper = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
+        gpu_requested = bool(
+            use_gpu
+            and dds_converter == "TextureConverter"
+            and "dar" in sys.platform
+        )
+        self.capabilities = (
+            _ashelper_capabilities(self.as_helper)
+            if gpu_requested and os.path.isfile(self.as_helper)
+            else {}
+        )
+        self.effective_gpu = bool(
+            use_gpu
+            and (not gpu_requested or self.capabilities.get("metal_available", False))
+        )
+        self.gpu_server = None
+        if (
+            gpu_requested
+            and self.effective_gpu
+            and os.path.isfile(self.as_helper)
+            and os.access(self.as_helper, os.X_OK)
+        ):
+            try:
+                self.gpu_server = ASHelperJSONLServer(
+                    self.as_helper,
+                    logger=lambda message: UI.vprint(1, message),
+                )
+                self.gpu_server.start()
+            except Exception as error:
+                UI.vprint(
+                    1,
+                    "WARNING: ASHelper JSONL server is unavailable; "
+                    "streaming GPU conversion will use CPU fallback: {}".format(error),
+                )
+                self.gpu_server = None
+        if self.metrics is not None:
+            self.metrics.set_capabilities(
+                dict(
+                    self.capabilities,
+                    ashelper_jsonl_server=self.gpu_server is not None,
+                )
+            )
+        # The resident server owns the GPU lane. CPU fallback workers must not
+        # independently initialize Metal for the same tile.
+        worker_gpu = self.effective_gpu and self.gpu_server is None
+        self.config_data = _conversion_worker_config(tile, worker_gpu)
+        self.pool = ReusableMultiprocessingPool(
+            max(1, int(getattr(tile, "max_convert_slots", max_convert_slots))),
+            init_func=IMG.init_worker,
+            init_args=self.config_data,
+        )
+        self.progress = {"done": 0, "bar": 3, "message": "Converting DDS textures"}
+        self.scheduler = TileConversionScheduler(
+            dispatch_cpu=self._dispatch_cpu,
+            dispatch_gpu=self._dispatch_gpu if self.gpu_server is not None else None,
+            gpu_eligible=self._gpu_eligible,
+            queue_size=_streaming_queue_size(tile),
+            cpu_batch_size=max(
+                1,
+                int(getattr(tile, "max_convert_slots", max_convert_slots)),
+            ),
+            gpu_batch_size=_streaming_gpu_batch_size(tile),
+            batch_wait_ms=_streaming_batch_wait_ms(tile),
+            metrics=self.metrics,
+            logger=lambda message: UI.vprint(1, message),
+        )
+        self.scheduler.start()
+
+    def submit(self, payload):
+        payload = tuple(payload)
+        if len(payload) >= 5:
+            duplicate_key = tuple(payload[1:5])
+            if duplicate_key in self._submitted_keys:
+                if self.metrics is not None:
+                    self.metrics.increment("conversion_duplicates_suppressed")
+                UI.vprint(2, "Skipping duplicate texture conversion:", duplicate_key)
+                return True
+            self._submitted_keys.add(duplicate_key)
+        task_id = "texture-{:08d}".format(next(self._ids))
+        accepted = self.scheduler.submit(
+            ConversionTask(task_id, payload),
+            timeout=None,
+        )
+        if not accepted and len(payload) >= 5:
+            self._submitted_keys.discard(tuple(payload[1:5]))
+        return accepted
+
+    def _dispatch_cpu(self, tasks):
+        payloads = [task.payload for task in tasks]
+        if self.metrics is not None:
+            self.metrics.increment("conversion_batches_cpu")
+        return bool(
+            self.pool.run(
+                IMG.convert_texture,
+                payloads,
+                progress=None,
+            )
+        )
+
+    def _gpu_eligible(self, task):
+        if self.gpu_server is None or self.gpu_server.gpu_disabled:
+            return False
+        item = task.payload
+        try:
+            spec = _build_streaming_gpu_spec(task.task_id, item, self.dds_format)
+        except Exception:
+            return False
+        # Eligibility must be side-effect free from the scheduler's point of
+        # view. The actual request is rebuilt in _dispatch_gpu; masks produced
+        # by a speculative check are removed immediately.
+        if spec is None:
+            return False
+        for cleanup_path in spec.get("cleanup_paths", ()):
+            try:
+                os.remove(cleanup_path)
+            except OSError:
+                pass
+        return True
+
+    def _dispatch_gpu(self, tasks):
+        if self.gpu_server is None or self.gpu_server.gpu_disabled:
+            raise RuntimeError("ASHelper GPU server is disabled")
+        specs = []
+        for task in tasks:
+            try:
+                spec = _build_streaming_gpu_spec(
+                    task.task_id, task.payload, self.dds_format
+                )
+            except Exception as error:
+                spec = None
+                UI.vprint(1, "WARNING: Could not prepare streaming GPU task:", error)
+            if spec is None:
+                return {
+                    task.task_id: False
+                    for task in tasks
+                }
+            specs.append(spec)
+
+        if self.metrics is not None:
+            self.metrics.increment("conversion_batches_gpu")
+        response = self.gpu_server.convert_batch(
+            [spec["request"] for spec in specs],
+            gpu=True,
+        )
+        response_by_id = {
+            result.get("id"): result
+            for result in response.get("results", [])
+            if isinstance(result, dict)
+        }
+        normalized = {}
+        for spec in specs:
+            task_id = spec["task_id"]
+            result = response_by_id.get(task_id, {})
+            ok = bool(result.get("ok"))
+            error = result.get("error")
+            if ok:
+                valid, validation_error = IMG.validate_dds_file(
+                    spec["temporary_path"],
+                    expected_format=spec["target_format"],
+                    expected_dimensions=spec["input_size"],
+                    require_mipmaps=True,
+                )
+                if valid:
+                    try:
+                        os.replace(spec["temporary_path"], spec["final_path"])
+                    except OSError as publish_error:
+                        ok = False
+                        error = "atomic_publish:{}".format(type(publish_error).__name__)
+                else:
+                    ok = False
+                    error = validation_error or "invalid_dds"
+            if not ok:
+                try:
+                    os.remove(spec["temporary_path"])
+                except OSError:
+                    pass
+            for cleanup_path in spec.get("cleanup_paths", ()):
+                try:
+                    os.remove(cleanup_path)
+                except OSError:
+                    pass
+            normalized[task_id] = ConversionResult(
+                task_id,
+                ok,
+                "gpu",
+                error,
+            )
+        return normalized
+
+    def finish(self):
+        if UI.red_flag:
+            self.scheduler.cancel()
+        else:
+            self.scheduler.close()
+        try:
+            results = self.scheduler.wait()
+            success = bool(results) and all(result.ok for result in results)
+            if not results:
+                success = True
+            return success, results
+        finally:
+            if self.gpu_server is not None:
+                self.gpu_server.close()
+            if UI.red_flag or self.scheduler.error is not None:
+                self.pool.terminate()
+            else:
+                self.pool.close()
+            if self.metrics is not None:
+                self.metrics.record_stage(
+                    "texture conversion",
+                    (time.perf_counter() - self.started) * 1000.0,
+                )
 
 
 def _activate_dsf(dsf_tmp_path, dsf_path):
@@ -773,7 +1219,7 @@ def _build_metalfx_direct_dds_spec(item, dds_format):
             has_alpha = mask_image.convert("L").getextrema()[0] < 255
     target_format = IMG.resolve_dds_format(dds_format, has_alpha)
     if target_format not in ("BC1", "BC3"):
-        raise ValueError(f"unsupported direct MetalFX DDS format: {target_format}")
+        raise ValueError(f"unsupported direct DDS format: {target_format}")
 
     final_path = os.path.join(tile.build_dir, "textures", out_file_name)
     temporary_path = final_path + ".gpu.tmp.dds"
@@ -834,6 +1280,7 @@ def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8
             "dds_ms": 0.0,
             "temporary_bytes": 0,
             "duration_ms": 0.0,
+            "signal": None,
             "fallback_reasons": {},
         }
 
@@ -859,6 +1306,7 @@ def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8
         "dds_ms": 0.0,
         "temporary_bytes": 0,
         "duration_ms": 0.0,
+        "signal": None,
         "fallback_reasons": {},
     }
 
@@ -988,10 +1436,19 @@ def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8
 
     stats["duration_ms"] = (time.perf_counter() - batch_started) * 1000.0
     fallback_reasons = stats["fallback_reasons"]
+    effective_backend = (
+        "metalfx_spatial"
+        if stats["batch_fallback"] == 0
+        else (
+            "ci_lanczos"
+            if stats["batch_fallback"] == stats["batch_success"]
+            else "mixed"
+        )
+    )
     UI.vprint(
         1,
         "   MetalFX direct DDS summary: "
-        "backend=metalfx_spatial effective_backend=metalfx_spatial "
+        f"backend=metalfx_spatial effective_backend={effective_backend} "
         f"dispatch=direct_dds png_intermediate=false batch_tasks={stats['batch_tasks']} "
         f"batch_success={stats['batch_success']} batch_fallback={stats['batch_fallback']} "
         f"batch_failed={stats['batch_failed']} batch_workers={stats['batch_workers']} "
@@ -1009,14 +1466,232 @@ def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8
     )
     return stats
 
+
+def _build_tensorops_direct_dds_spec(item, dds_format):
+    """Build one opaque-provider request for TensorOps direct DDS work."""
+    spec = _build_metalfx_direct_dds_spec(item, dds_format)
+    spec["tensorops"] = True
+    return spec
+
+
+def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
+    """Run TensorOps in one child per bounded chunk and publish valid DDS atomically."""
+    if not specs:
+        return {
+            "failed_items": [],
+            "batch_tasks": 0,
+            "batch_success": 0,
+            "batch_fallback": 0,
+            "batch_failed": 0,
+            "batch_workers": 1,
+            "batch_chunks": 0,
+            "chunk_size": max(1, int(chunk_size)),
+            "peak_rss_mb": 0,
+            "rss_after_item_mb": 0,
+            "temporary_bytes": 0,
+            "duration_ms": 0.0,
+            "fallback_reasons": {},
+        }
+
+    chunk_size = max(1, int(chunk_size))
+    chunks = [
+        specs[index : index + chunk_size]
+        for index in range(0, len(specs), chunk_size)
+    ]
+    started = time.perf_counter()
+    stats = {
+        "failed_items": [],
+        "batch_tasks": len(specs),
+        "batch_success": 0,
+        "batch_fallback": 0,
+        "batch_failed": 0,
+        "batch_workers": 1,
+        "batch_chunks": len(chunks),
+        "chunk_size": chunk_size,
+        "peak_rss_mb": 0,
+        "rss_after_item_mb": 0,
+        "temporary_bytes": 0,
+        "duration_ms": 0.0,
+        "signal": None,
+        "fallback_reasons": {},
+    }
+
+    def record_reason(reason):
+        stats["fallback_reasons"][reason] = (
+            stats["fallback_reasons"].get(reason, 0) + 1
+        )
+
+    def mark_failed(spec, reason):
+        stats["batch_failed"] += 1
+        stats["failed_items"].append(spec["item"])
+        record_reason(reason)
+        try:
+            os.remove(spec["temporary_path"])
+        except OSError:
+            pass
+
+    os.makedirs(os.path.join(UI.Ortho4XP_dir, "tmp"), exist_ok=True)
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        request_fd, request_path = tempfile.mkstemp(
+            prefix=".tensorops-dds-",
+            suffix=".json",
+            dir=os.path.join(UI.Ortho4XP_dir, "tmp"),
+        )
+        request = {
+            "version": 1,
+            "pack": pack_path,
+            "items": [spec["request"] for spec in chunk],
+        }
+        try:
+            with os.fdopen(request_fd, "w", encoding="utf-8") as stream:
+                json.dump(request, stream, separators=(",", ":"))
+            try:
+                result = subprocess.run(
+                    [as_helper, "--tensorops-dds-batch", request_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                output = result.stdout or ""
+            except Exception as error:
+                result = None
+                output = ""
+                reason = f"ashelper_exception:{type(error).__name__}"
+                for spec in chunk:
+                    mark_failed(spec, reason)
+                UI.vprint(1, f"   TensorOps direct DDS: chunk {chunk_index}/{len(chunks)} failed ({reason})")
+                continue
+
+            output_lines = output.splitlines()
+            item_lines = [
+                line for line in output_lines
+                if line.startswith("tensorops_dds_item=")
+            ]
+            output_level = 0 if result.returncode != 0 else 2
+            for line in output_lines:
+                UI.vprint(output_level, "      " + line)
+
+            signal_reason = (
+                f"process_signal_{abs(result.returncode)}"
+                if result.returncode < 0
+                else None
+            )
+            if signal_reason:
+                stats["signal"] = abs(result.returncode)
+                record_reason(signal_reason)
+
+            for index, spec in enumerate(chunk):
+                fields = {}
+                if index < len(item_lines):
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in item_lines[index].split()
+                        if "=" in field
+                    )
+                try:
+                    item_rss_mb = int(float(fields.get("rss_mb", 0) or 0))
+                except (TypeError, ValueError):
+                    item_rss_mb = 0
+                stats["peak_rss_mb"] = max(stats["peak_rss_mb"], item_rss_mb)
+                stats["rss_after_item_mb"] = item_rss_mb
+
+                temp_path = spec["temporary_path"]
+                valid, dds_error = IMG.validate_dds_file(
+                    temp_path,
+                    expected_format=spec["target_format"],
+                    expected_dimensions=(
+                        spec["input_size"][0] * 2,
+                        spec["input_size"][1] * 2,
+                    ),
+                    require_mipmaps=True,
+                )
+                if not valid:
+                    reason = (
+                        fields.get("fallback_reason")
+                        or ("process_signal_9" if result.returncode == -9 else None)
+                        or (f"ashelper_exit_{result.returncode}" if result.returncode else None)
+                        or dds_error
+                        or "direct_dds_invalid"
+                    )
+                    mark_failed(spec, reason)
+                    continue
+
+                try:
+                    output_bytes = os.path.getsize(temp_path)
+                    os.replace(temp_path, spec["final_path"])
+                except (OSError, ValueError) as error:
+                    mark_failed(spec, f"atomic_publish:{type(error).__name__}")
+                    continue
+
+                stats["batch_success"] += 1
+                stats["temporary_bytes"] += output_bytes
+                if fields.get("effective_backend") == "ci_lanczos":
+                    stats["batch_fallback"] += 1
+                    if fields.get("fallback_reason"):
+                        record_reason(fields["fallback_reason"])
+
+            if result.returncode < 0:
+                for spec in chunk[len(item_lines):]:
+                    if spec["item"] not in stats["failed_items"]:
+                        mark_failed(spec, signal_reason or f"process_signal_{abs(result.returncode)}")
+        finally:
+            try:
+                os.close(request_fd)
+            except OSError:
+                pass
+            try:
+                os.remove(request_path)
+            except OSError:
+                pass
+        completed = min(chunk_index * chunk_size, len(specs))
+        UI.vprint(1, f"   TensorOps direct DDS: {completed}/{len(specs)}")
+
+    stats["duration_ms"] = (time.perf_counter() - started) * 1000.0
+    UI.vprint(
+        1,
+        "   TensorOps direct DDS summary: "
+        f"backend=tensorops effective_backend=tensorops dispatch=direct_dds "
+        f"png_intermediate=false batch_tasks={stats['batch_tasks']} "
+        f"batch_success={stats['batch_success']} batch_fallback={stats['batch_fallback']} "
+        f"batch_failed={stats['batch_failed']} batch_workers=1 "
+        f"batch_chunks={stats['batch_chunks']} chunk_size={stats['chunk_size']} "
+        f"peak_rss_mb={stats['peak_rss_mb']} rss_after_item_mb={stats['rss_after_item_mb']} "
+        f"temporary_bytes={stats['temporary_bytes']} signal={stats['signal'] or 0} "
+        f"duration_ms={stats['duration_ms']:.2f}"
+        + (
+            " fallback_reasons="
+            + ",".join(
+                f"{reason}:{count}"
+                for reason, count in sorted(stats["fallback_reasons"].items())
+            )
+            if stats["fallback_reasons"]
+            else ""
+        ),
+    )
+    return stats
+
 ################################################################################
-def download_textures(tile, download_queue, convert_queue):
+def download_textures(
+    tile,
+    download_queue,
+    convert_queue=None,
+    conversion_submit=None,
+):
     UI.vprint(1, "-> Opening download queue with", max_download_slots, "workers.")
 
     def download_task(*texture_attributes):
         if IMG.build_jpeg_ortho(tile, *texture_attributes):
-            convert_queue.put((tile, *texture_attributes))
-            return 1
+            payload = (tile, *texture_attributes)
+            metrics = getattr(tile, "_performance_metrics", None)
+            if metrics is not None:
+                metrics.increment("textures_downloaded")
+            if conversion_submit is not None:
+                return int(bool(conversion_submit(payload)))
+            if convert_queue is not None:
+                convert_queue.put(payload)
+                return 1
+            return 0
         return 0
 
     dico_dl_progress = {"done": 0, "bar": 2, "message": "Downloading textures"}
@@ -1232,7 +1907,12 @@ def _build_tile(tile, persist_config=True):
 
     download_queue = queue.Queue()
     convert_queue = queue.Queue()
-    
+    streaming_enabled = bool(
+        getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
+        and not skip_downloads
+        and not skip_converts
+    )
+    streaming_runner = None
     download_launched = False
     convert_launched = False
     conversion_success = True
@@ -1249,7 +1929,10 @@ def _build_tile(tile, persist_config=True):
     def run_downloads():
         try:
             download_state["result"] = download_textures(
-                tile, download_queue, convert_queue
+                tile,
+                download_queue,
+                convert_queue if not streaming_enabled else None,
+                streaming_runner.submit if streaming_runner is not None else None,
             )
         except Exception as error:
             download_state["error"] = error
@@ -1263,6 +1946,20 @@ def _build_tile(tile, persist_config=True):
     )
     build_dsf_thread.start()
     if not skip_downloads:
+        if streaming_enabled:
+            try:
+                streaming_runner = _StreamingConversionRunner(tile)
+            except Exception as error:
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "ERROR: Could not start streaming conversion: {}".format(error),
+                        "エラー: ストリーミング変換を開始できません: {}".format(error),
+                    ),
+                )
+                UI.red_flag = True
+                build_dsf_thread.join()
+                return 0
         download_thread.start()
         download_launched = True
         if not skip_converts:
@@ -1273,6 +1970,21 @@ def _build_tile(tile, persist_config=True):
         for _ in range(max_download_slots):
             download_queue.put("quit")
         download_thread.join()
+    if streaming_runner is not None:
+        try:
+            conversion_success, streaming_results = streaming_runner.finish()
+            if streaming_results:
+                UI.vprint(
+                    1,
+                    " *Streaming DDS conversion completed:"
+                    + " success={}/{}".format(
+                        sum(result.ok for result in streaming_results),
+                        len(streaming_results),
+                    ),
+                )
+        except Exception as error:
+            conversion_success = False
+            UI.vprint(0, "ERROR: Streaming DDS conversion failed:", error)
     if dsf_state["error"] is not None or not dsf_state["result"]:
         UI.exit_message_and_bottom_line("ERROR: DSF construction failed.")
         return 0
@@ -1281,7 +1993,7 @@ def _build_tile(tile, persist_config=True):
     ):
         UI.exit_message_and_bottom_line("ERROR: Texture download failed.")
         return 0
-    if convert_launched:
+    if convert_launched and not streaming_enabled:
             dds_converter = getattr(tile, 'dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
             dds_format = getattr(tile, 'dds_format', getattr(UI, 'dds_format', 'BC3'))
             use_gpu = getattr(tile, 'use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
@@ -1302,23 +2014,33 @@ def _build_tile(tile, persist_config=True):
             requested_upscale_scope = IMG.normalize_upscale_scope(
                 getattr(tile, 'upscale_scope', 'all')
             )
-            metal_available = (
-                _ashelper_metal_available(as_helper)
-                if gpu_converter_requested
-                else False
+            capabilities = (
+                _ashelper_capabilities(as_helper)
+                if (
+                    gpu_converter_requested
+                    or (
+                        requested_upscale_backend == "tensorops"
+                        and os.path.isfile(as_helper)
+                        and os.access(as_helper, os.X_OK)
+                    )
+                )
+                else {
+                    "metal_available": False,
+                    "metalfx_spatial_available": False,
+                    "tensorops_available": False,
+                    "fp8_tensorops_available": False,
+                }
             )
-            metalfx_available = (
-                _ashelper_metalfx_available(as_helper)
-                if gpu_converter_requested
-                and requested_upscale_backend == "metalfx_spatial"
-                else False
+            metal_available = bool(capabilities.get("metal_available"))
+            metalfx_available = bool(
+                capabilities.get("metalfx_spatial_available")
             )
-            tensorops_available = (
-                _ashelper_tensorops_available(as_helper)
-                if gpu_converter_requested
-                and requested_upscale_backend == "tensorops"
-                else False
-            )
+            tensorops_available = bool(capabilities.get("tensorops_available"))
+            metrics = getattr(tile, "_performance_metrics", None)
+            if metrics is not None:
+                metrics.set_capabilities(
+                    dict(capabilities, opencl_available=None)
+                )
             gpu_batch_enabled = gpu_batch_requested and metal_available
             effective_gpu = use_gpu and (
                 not gpu_converter_requested or metal_available
@@ -1410,14 +2132,6 @@ def _build_tile(tile, persist_config=True):
             metalfx_batch_items = [
                 item for item in convert_list if can_defer_to_metalfx_batch(item)
             ]
-            regular_convert_list = [
-                item for item in convert_list if item not in metalfx_batch_items
-            ]
-
-            batch_items_eligible = bool(
-                regular_convert_list
-                and all(can_defer_to_gpu_batch(item) for item in regular_convert_list)
-            )
             tensorops_model_path = getattr(
                 tile, 'fp8_model_path', getattr(IMG, 'fp8_model_path', '')
             )
@@ -1426,25 +2140,38 @@ def _build_tile(tile, persist_config=True):
                 and os.path.isdir(tensorops_model_path)
                 and os.path.isfile(os.path.join(tensorops_model_path, "manifest.json"))
             )
+            tensorops_batch_items = [
+                item for item in convert_list if can_defer_to_tensorops_batch(item)
+            ]
             defer_tensorops_batch = bool(
-                gpu_batch_enabled
-                and tensorops_available
+                tensorops_available
                 and requested_upscale_backend == "tensorops"
                 and tensorops_pack_configured
-                and convert_list
-                and all(can_defer_to_tensorops_batch(item) for item in convert_list)
+                and tensorops_batch_items
+            )
+            if not defer_tensorops_batch:
+                tensorops_batch_items = []
+            direct_batch_items = metalfx_batch_items + tensorops_batch_items
+            regular_convert_list = [
+                item for item in convert_list if item not in direct_batch_items
+            ]
+
+            batch_items_eligible = bool(
+                regular_convert_list
+                and all(can_defer_to_gpu_batch(item) for item in regular_convert_list)
             )
             defer_gpu_batch = bool(
                 gpu_batch_enabled
                 and batch_items_eligible
                 and requested_upscale_backend != "metalfx_spatial"
-                and (
-                    requested_upscale_backend != "tensorops"
-                    or defer_tensorops_batch
-                )
+                and requested_upscale_backend != "tensorops"
             )
             config_data['defer_gpu_batch'] = defer_gpu_batch
-            config_data['defer_fp8_batch'] = defer_tensorops_batch
+            # TensorOps direct items are removed from the worker list before
+            # this pool starts. Never ask the remaining workers to defer
+            # again, otherwise an ineligible direct-provider item could be
+            # counted as successful without producing a DDS.
+            config_data['defer_fp8_batch'] = False
 
             dds_error = IMG.dds_format_support_error(dds_converter, dds_format)
             if dds_error:
@@ -1539,116 +2266,81 @@ def _build_tile(tile, persist_config=True):
                         pass
                 metalfx_batch_items = []
 
-            # MetalFX direct DDS work is already complete.  The existing DDS
-            # batch below handles only deferred non-MetalFX items.
+            # Direct DDS work is already complete.  The existing DDS batch
+            # below handles only the remaining non-direct items.
             batch_convert_list = (
-                regular_convert_list if direct_metalfx_requested else convert_list
+                regular_convert_list
+                if direct_metalfx_requested or defer_tensorops_batch
+                else convert_list
             )
 
-            # TensorOps image work is intentionally batched in one ASHelper
-            # process.  FP8SRRuntime caches the validated pack in that
-            # process, so a large tile set does not reload the model for each
-            # worker or each image. This narrow path accepts direct JPEG
-            # inputs; supported color filters and masks are applied by the
-            # existing DDS batch after FP8 inference.
+            # TensorOps direct DDS work is split into one child process per
+            # bounded chunk. The child exit is a hard memory-reclaim boundary;
+            # successful chunks remain published when a later chunk fails.
             if conversion_success and defer_tensorops_batch:
-                UI.vprint(1, "-> Executing TensorOps upscale batch via ASHelper...")
-                tensorops_batch_args = [tensorops_model_path]
-                tensorops_batch_outputs = []
-                tensorops_batch_error = None
-                for item in convert_list:
-                    item_tile, item_x, item_y, item_z, item_provider = item
-                    out_file_name = FNAMES.dds_file_name_from_attributes(
-                        item_x, item_y, item_z, item_provider
-                    )
-                    if item_provider not in IMG.providers_dict:
-                        tensorops_batch_error = f"provider source unavailable for {out_file_name}"
-                        break
-                    file_dir = FNAMES.jpeg_file_dir_from_attributes(
-                        item_tile.lat,
-                        item_tile.lon,
-                        item_z,
-                        IMG.providers_dict[item_provider],
-                    )
-                    jpeg_path = IMG.find_imagery_cache_path(
-                        item_x, item_y, item_z, item_provider, file_dir
-                    )
-                    if not jpeg_path:
-                        tensorops_batch_error = f"input source not found for {out_file_name}"
-                        break
-                    output_path = os.path.join(
-                        UI.Ortho4XP_dir,
-                        "tmp",
-                        out_file_name.replace(
-                            ".dds", "_tensorops_upscaled.png"
-                        ),
-                    )
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
-                    tensorops_batch_args.extend([jpeg_path, output_path])
-                    tensorops_batch_outputs.append((jpeg_path, output_path))
-
-                if tensorops_batch_error is None and tensorops_batch_outputs:
-                    try:
-                        fp8_result = subprocess.run(
-                            [as_helper, "--tensorops-upscale-batch"]
-                            + tensorops_batch_args,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            check=False,
-                        )
-                        if fp8_result.stdout:
-                            output_level = 0 if fp8_result.returncode != 0 else 2
-                            for line in fp8_result.stdout.splitlines():
-                                UI.vprint(output_level, "      " + line)
-                        if fp8_result.returncode != 0:
-                                tensorops_batch_error = (
-                                    f"ASHelper returned {fp8_result.returncode}"
-                                )
-                    except Exception as error:
-                        tensorops_batch_error = f"ASHelper execution failed: {error}"
-
-                if tensorops_batch_error is None:
-                    invalid_tensorops_outputs = [
-                        output_path
-                        for input_path, output_path in tensorops_batch_outputs
-                        if not IMG._valid_upscale_output(input_path, output_path)
-                    ]
-                    if invalid_tensorops_outputs:
-                        tensorops_batch_error = (
-                            "invalid output: " + ", ".join(invalid_tensorops_outputs)
-                        )
-
-                if tensorops_batch_error is not None:
-                    for _, output_path in tensorops_batch_outputs:
+                UI.vprint(
+                    1,
+                    "-> Executing TensorOps direct DDS batch "
+                    f"({len(tensorops_batch_items)} images)...",
+                )
+                tensorops_direct_specs = []
+                tensorops_direct_failed = []
+                tensorops_direct_cleanup = []
+                try:
+                    for item in tensorops_batch_items:
+                        spec = _build_tensorops_direct_dds_spec(item, dds_format)
+                        tensorops_direct_specs.append(spec)
+                        tensorops_direct_cleanup.extend(spec["cleanup_paths"])
+                except Exception as error:
+                    UI.vprint(1, f"WARNING: TensorOps direct DDS preparation failed: {error}")
+                    for prepared_spec in tensorops_direct_specs:
+                        for cleanup_path in prepared_spec.get("cleanup_paths", ()):
+                            try:
+                                os.remove(cleanup_path)
+                            except OSError:
+                                pass
                         try:
-                            os.remove(output_path)
+                            os.remove(prepared_spec["temporary_path"])
                         except OSError:
                             pass
-                    UI.vprint(
-                        1,
-                        f"WARNING: TensorOps batch failed ({tensorops_batch_error}); "
-                        "falling back to per-texture processing.",
-                    )
-                    fallback_progress = {
-                        "done": 0,
-                        "bar": 3,
-                        "message": "FP8 fallback DDS conversion",
-                    }
+                    tensorops_direct_specs = []
+                    tensorops_direct_failed = list(tensorops_batch_items)
+
+                batch_result = _run_tensorops_direct_dds_batch(
+                    as_helper,
+                    tensorops_model_path,
+                    tensorops_direct_specs,
+                    chunk_size=8,
+                )
+                tensorops_direct_failed.extend(batch_result["failed_items"])
+                fallback_success = True
+                if tensorops_direct_failed:
+                    fallback_config = dict(config_data)
+                    fallback_config["upscale_backend"] = "ci_lanczos"
+                    fallback_config["defer_fp8_batch"] = False
+                    fallback_config["defer_gpu_batch"] = False
                     fallback_success = _run_cpu_fallback(
-                        convert_list,
-                        config_data,
-                        max_convert_slots,
-                        fallback_progress,
+                        tensorops_direct_failed,
+                        fallback_config,
+                        2,
+                        {
+                            "done": 0,
+                            "bar": 3,
+                            "message": "TensorOps direct DDS fallback",
+                        },
                     )
-                    success_count = len(convert_list) if fallback_success else 0
-                    conversion_success = bool(fallback_success)
-                    defer_gpu_batch = False
-                    defer_tensorops_batch = False
+                success_count += batch_result["batch_success"]
+                success_count += len(tensorops_direct_failed) if fallback_success else 0
+                conversion_success = bool(
+                    fallback_success and success_count == len(convert_list)
+                )
+                defer_gpu_batch = False
+                defer_tensorops_batch = False
+                for cleanup_path in sorted(set(tensorops_direct_cleanup)):
+                    try:
+                        os.remove(cleanup_path)
+                    except OSError:
+                        pass
 
             # GPU Batch DDS Conversion integration for macOS
             if conversion_success and defer_gpu_batch:
@@ -2130,6 +2822,24 @@ def _start_full_pipeline(tile, include_overlays):
             )
         )
         return 0
+    metrics = PERF.PerformanceMetrics(tile, "all_in_one")
+    tile._performance_metrics = metrics
+    metrics.set_config(
+        {
+            "enable_streaming_conversion": bool(
+                getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
+            ),
+            "conversion_queue_size": int(
+                getattr(tile, "conversion_queue_size", conversion_queue_size)
+            ),
+            "gpu_batch_size": int(getattr(tile, "gpu_batch_size", gpu_batch_size)),
+            "gpu_batch_wait_ms": int(
+                getattr(tile, "gpu_batch_wait_ms", gpu_batch_wait_ms)
+            ),
+            "max_convert_slots": int(getattr(tile, "max_convert_slots", max_convert_slots)),
+            "max_download_slots": int(getattr(tile, "max_download_slots", max_download_slots)),
+        }
+    )
     UI.is_building_all = True
     UI.initialize_build_log(tile.build_dir, tile)
     try:
@@ -2138,6 +2848,13 @@ def _start_full_pipeline(tile, include_overlays):
         UI.is_building_all = False
         UI.is_working = 0
         UI.flush_build_log(tile.build_dir)
+        try:
+            metrics.write(
+                os.path.join(tile.build_dir, "Ortho4XP_performance.json"),
+                finished=True,
+            )
+        except Exception as error:
+            UI.vprint(1, "WARNING: Could not write performance metrics:", error)
 
 
 def build_all(tile):
@@ -2149,7 +2866,7 @@ def build_continuous(tile):
     return _start_full_pipeline(tile, include_overlays=False)
 
 
-def _run_pipeline_once(tile):
+def _run_pipeline_once(tile, start_stage="vector data"):
     stages = (
         ("vector data", VMAP.build_poly_file),
         ("mesh", MESH.build_mesh),
@@ -2159,12 +2876,19 @@ def _run_pipeline_once(tile):
             lambda current_tile: build_tile(current_tile, persist_config=False),
         ),
     )
+    stage_names = [stage_name for stage_name, _ in stages]
+    if start_stage not in stage_names:
+        raise ValueError("unknown pipeline start stage: {}".format(start_stage))
+    stages = stages[stage_names.index(start_stage):]
     tile.last_pipeline_failure = None
     for stage_name, stage in stages:
         stage_error = None
         stage_traceback = None
+        metrics = getattr(tile, "_performance_metrics", None)
+        stage_context = metrics.stage(stage_name) if metrics is not None else nullcontext()
         try:
-            stage_succeeded = bool(stage(tile))
+            with stage_context:
+                stage_succeeded = bool(stage(tile))
         except Exception as error:
             stage_succeeded = False
             stage_error = error
@@ -2221,6 +2945,7 @@ def _build_all(tile, include_overlays=True):
     )
     transaction = None
     best_candidate = None
+    performance_metrics = getattr(tile, "_performance_metrics", None)
 
     def restore_snapshot(snapshot_name):
         if transaction is None:
@@ -2280,30 +3005,68 @@ def _build_all(tile, include_overlays=True):
 
     try:
         transaction = _BuildTransaction(tile)
+        previous_candidate = None
         for attempt in range(DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS + 1):
-            transaction.discard_current("before-attempt-{}".format(attempt))
-            transaction.prepare_attempt()
             if attempt:
                 updates = _apply_auto_reduce_attempt(tile, base_settings, attempt)
+                retry_stage = DSF_BUDGET.retry_stage_for_settings(updates)
                 UI.vprint(
                     0,
-                    "[Auto-Reduce] Full pipeline attempt {}/{}; "
+                    "[Auto-Reduce] Partial pipeline attempt {}/{} from {} onward; "
                     "updated settings: {}".format(
                         attempt,
                         DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS,
+                        retry_stage,
                         ", ".join(
                             "{}={}".format(name, value)
                             for name, value in updates.items()
                         ),
                     ),
                 )
+                if previous_candidate is None:
+                    raise RuntimeError("partial retry has no previous candidate")
+                previous_snapshot = previous_candidate["snapshot"]
+                transaction._write_marker(
+                    "restoring",
+                    best_candidate["snapshot"] if best_candidate is not None else None,
+                    best_candidate["settings"] if best_candidate is not None else None,
+                    previous_snapshot,
+                )
+                transaction.discard_current("before-partial-attempt-{}".format(attempt))
+                transaction.restore_snapshot_files(previous_snapshot)
+                retry_base_snapshot = "retry-base-{}".format(attempt)
+                transaction._link_current_to(retry_base_snapshot)
+                previous_candidate["snapshot"] = retry_base_snapshot
+                transaction._write_marker(
+                    "active",
+                    best_candidate["snapshot"] if best_candidate is not None else None,
+                    best_candidate["settings"] if best_candidate is not None else None,
+                )
             else:
                 _restore_auto_reduce_settings(tile, base_settings)
+                retry_stage = "vector data"
+                transaction.discard_current("before-attempt-{}".format(attempt))
+                transaction.prepare_attempt()
                 UI.vprint(0, "[Auto-Reduce] Full pipeline baseline attempt.")
 
-            if not _run_pipeline_once(tile):
+            if performance_metrics is not None:
+                performance_metrics.begin_attempt(
+                    attempt,
+                    _snapshot_auto_reduce_settings(tile),
+                )
+
+            pipeline_result = (
+                _run_pipeline_once(tile)
+                if retry_stage == "vector data"
+                else _run_pipeline_once(tile, start_stage=retry_stage)
+            )
+            if not pipeline_result:
                 failure = getattr(tile, "last_pipeline_failure", {})
                 if best_candidate is None or failure.get("cancelled"):
+                    if performance_metrics is not None:
+                        performance_metrics.end_attempt(
+                            "cancelled" if failure.get("cancelled") else "failed"
+                        )
                     _restore_auto_reduce_settings(tile, base_settings)
                     restore_and_cleanup(
                         best_candidate["snapshot"]
@@ -2319,6 +3082,8 @@ def _build_all(tile, include_overlays=True):
                     ),
                 )
                 _restore_auto_reduce_settings(tile, best_candidate["settings"])
+                if performance_metrics is not None:
+                    performance_metrics.end_attempt("failed_reduced")
                 break
 
             metrics = getattr(tile, "last_dsf_metrics", None)
@@ -2336,6 +3101,8 @@ def _build_all(tile, include_overlays=True):
             if not metrics_valid:
                 _report_metrics_failure(tile)
                 if best_candidate is None:
+                    if performance_metrics is not None:
+                        performance_metrics.end_attempt("invalid_metrics")
                     _restore_auto_reduce_settings(tile, base_settings)
                     restore_and_cleanup("initial")
                     return 0
@@ -2347,6 +3114,8 @@ def _build_all(tile, include_overlays=True):
                     ),
                 )
                 _restore_auto_reduce_settings(tile, best_candidate["settings"])
+                if performance_metrics is not None:
+                    performance_metrics.end_attempt("invalid_metrics_reduced")
                 break
 
             metrics = dict(metrics)
@@ -2358,6 +3127,7 @@ def _build_all(tile, include_overlays=True):
                 "config": _snapshot_tile_config_settings(tile),
                 "snapshot": transaction.capture_candidate(attempt),
             }
+            previous_candidate = candidate
             if (
                 best_candidate is None
                 or metrics["point_count"] < best_candidate["metrics"]["point_count"]
@@ -2388,9 +3158,15 @@ def _build_all(tile, include_overlays=True):
                 metrics.get("budget_exceeded", metrics["point_count"] > budget)
             )
             if not budget_exceeded:
+                if performance_metrics is not None:
+                    performance_metrics.end_attempt("success")
                 break
             if attempt >= DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS:
+                if performance_metrics is not None:
+                    performance_metrics.end_attempt("budget_exceeded")
                 break
+            if performance_metrics is not None:
+                performance_metrics.end_attempt("budget_exceeded")
             UI.vprint(0, "[Auto-Reduce] Rebuilding all stages to reduce DSF density.")
 
         if best_candidate is None:
@@ -2445,6 +3221,8 @@ def _build_all(tile, include_overlays=True):
             UI.vprint(1, "WARNING: Tile transaction staging remains for recovery:", error)
 
     except Exception as error:
+        if performance_metrics is not None:
+            performance_metrics.end_attempt("exception")
         UI.logprint(
             "ERROR: Full tile pipeline failed unexpectedly:",
             repr(error),
@@ -2510,7 +3288,14 @@ def _build_all(tile, include_overlays=True):
     UI.is_working = 0
     if include_overlays and getattr(tile, "build_overlays_in_all_in_one", False):
         UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
-        if not OVL.build_overlay(tile.lat, tile.lon) or UI.red_flag:
+        overlay_context = (
+            performance_metrics.stage("overlay")
+            if performance_metrics is not None
+            else nullcontext()
+        )
+        with overlay_context:
+            overlay_result = OVL.build_overlay(tile.lat, tile.lon)
+        if not overlay_result or UI.red_flag:
             _report_pipeline_failure(tile, "overlay extraction")
             return 0
     return 1

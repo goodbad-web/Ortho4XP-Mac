@@ -80,26 +80,34 @@ def parallel_execute(task, execute_queue, nbr_workers, progress=None):
 ################################################################################
 # Multiprocessing support
 ################################################################################
-def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=None, init_args=None):
-    # This is a synchronous call but it uses a Pool to run in parallel.
-    # It updates the progress bar.
-    # An empty queue means there is nothing to do (for example when every
-    # texture already exists), which is a successful no-op rather than a
-    # failed conversion stage.
-    if not arg_list:
-        return 1
-    
-    # Use spawn context explicitly for macOS stability
-    ctx = multiprocessing.get_context("spawn")
-    
-    initargs = (init_args,) if init_args is not None else ()
-    with ctx.Pool(processes=nbr_workers, initializer=init_func, initargs=initargs) as pool:
+class ReusableMultiprocessingPool:
+    """Keep one macOS spawn pool alive across bounded conversion batches."""
+
+    def __init__(self, nbr_workers, init_func=None, init_args=None):
+        if nbr_workers < 1:
+            raise ValueError("nbr_workers must be positive")
+        ctx = multiprocessing.get_context("spawn")
+        initargs = (init_args,) if init_args is not None else ()
+        self._pool = ctx.Pool(
+            processes=nbr_workers,
+            initializer=init_func,
+            initargs=initargs,
+        )
+        self._closed = False
+
+    def run(self, task, arg_list, progress=None):
+        if not arg_list:
+            return 1
+        if self._closed:
+            raise RuntimeError("reusable multiprocessing pool is closed")
         done = 0
         success = 0
         total = len(arg_list)
         log_step = max(1, total // 10)
         try:
-            for res in pool.imap_unordered(task_wrapper, [(task, args) for args in arg_list]):
+            for res in self._pool.imap_unordered(
+                task_wrapper, [(task, args) for args in arg_list]
+            ):
                 done += 1
                 if res:
                     success += 1
@@ -113,12 +121,47 @@ def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=N
                 if done % log_step == 0 or done == total:
                     UI.vprint(1, f"   ... {done}/{total} ({int(100 * done / total)}%)")
                 if UI.red_flag:
-                    pool.terminate()
+                    self.terminate()
                     break
         except Exception as e:
             UI.vprint(1, f"Pool execution error: {e}")
-            pool.terminate()
+            self.terminate()
         return int(done == total and success == total and not UI.red_flag)
+
+    def close(self):
+        if not self._closed:
+            self._pool.close()
+            self._pool.join()
+            self._closed = True
+
+    def terminate(self):
+        if not self._closed:
+            self._pool.terminate()
+            self._pool.join()
+            self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            self.terminate()
+        return False
+
+
+def multiprocessing_pool(task, arg_list, nbr_workers, progress=None, init_func=None, init_args=None):
+    # Preserve the historical one-shot API for callers outside the streaming
+    # scheduler while sharing the same implementation and spawn semantics.
+    if not arg_list:
+        return 1
+    with ReusableMultiprocessingPool(
+        nbr_workers,
+        init_func=init_func,
+        init_args=init_args,
+    ) as pool:
+        return pool.run(task, arg_list, progress=progress)
 
 def task_wrapper(args):
     task, task_args = args

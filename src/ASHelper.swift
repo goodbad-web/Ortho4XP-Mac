@@ -7,6 +7,7 @@ import CoreImage
 import Metal
 import MetalKit
 import MetalFX
+import Darwin
 
 struct DDSHeader {
     var magic: UInt32 = 0x20534444; var size: UInt32 = 124; var flags: UInt32 = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000 
@@ -100,6 +101,31 @@ struct MetalFXDirectDDSItem: Codable {
 struct MetalFXDirectDDSRequest: Codable {
     let version: Int
     let items: [MetalFXDirectDDSItem]
+}
+
+struct TensorOpsDirectDDSRequest: Codable {
+    let version: Int
+    let pack: String
+    let items: [MetalFXDirectDDSItem]
+}
+
+func residentMemoryMB() -> UInt64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size
+    )
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+            task_info(
+                mach_task_self_,
+                task_flavor_t(MACH_TASK_BASIC_INFO),
+                rebound,
+                &count
+            )
+        }
+    }
+    guard result == KERN_SUCCESS else { return 0 }
+    return UInt64(info.resident_size) / (1024 * 1024)
 }
 
 let metalSource = """
@@ -2087,8 +2113,11 @@ func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
     let reasonSummary = fallbackReasons.keys.sorted().map {
         "\($0):\(fallbackReasons[$0] ?? 0)"
     }.joined(separator: ",")
+    let effectiveBackend = fallbackCount == 0
+        ? "metalfx_spatial"
+        : (fallbackCount == successCount ? "ci_lanczos" : "mixed")
     print(
-        "backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=batch "
+        "backend=metalfx_spatial effective_backend=\(effectiveBackend) dispatch=batch "
             + "batch_tasks=\(pairs.count) batch_success=\(successCount) "
             + "batch_fallback=\(fallbackCount) duration_ms=\(String(format: "%.2f", duration))"
             + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
@@ -2259,8 +2288,11 @@ func metalFXSpatialDDSBatch(requestPath: String) -> Bool {
         let reasonSummary = fallbackReasons.keys.sorted().map {
             "\($0):\(fallbackReasons[$0] ?? 0)"
         }.joined(separator: ",")
+        let effectiveBackend = fallbackCount == 0
+            ? "metalfx_spatial"
+            : (fallbackCount == successCount ? "ci_lanczos" : "mixed")
         print(
-            "backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=direct_dds "
+            "backend=metalfx_spatial effective_backend=\(effectiveBackend) dispatch=direct_dds "
                 + "png_intermediate=false batch_tasks=\(request.items.count) "
                 + "batch_success=\(successCount) batch_fallback=\(fallbackCount) "
                 + "batch_failed=\(failedCount) duration_ms="
@@ -2270,6 +2302,205 @@ func metalFXSpatialDDSBatch(requestPath: String) -> Bool {
         return failedCount == 0
     } catch {
         reportError("ASHelper: MetalFX direct DDS batch failed: \(error)")
+        return false
+    }
+}
+
+@available(macOS 27.0, *)
+private struct TensorOpsDirectDDSItemResult {
+    let success: Bool
+    let effectiveBackend: String
+    let tensorOpsDispatchObserved: Bool
+    let alphaMode: String
+    let fallbackReason: String?
+    let tensorOpsMs: Double
+    let readbackMs: Double
+    let ddsMs: Double
+    let totalMs: Double
+    let rssMB: UInt64
+}
+
+@available(macOS 27.0, *)
+private func processTensorOpsDirectDDSItem(
+    item: MetalFXDirectDDSItem,
+    runtime: FP8SRRuntime?
+) -> TensorOpsDirectDDSItemResult {
+    let started = CFAbsoluteTimeGetCurrent()
+    var tensorOpsMs = 0.0
+    var readbackMs = 0.0
+    var ddsMs = 0.0
+    var fallbackReason: String?
+    try? FileManager.default.removeItem(atPath: item.output)
+
+    do {
+        guard let runtime else {
+            throw FP8SRError.unavailable("tensorops_runtime")
+        }
+        let tensorOpsStarted = CFAbsoluteTimeGetCurrent()
+        let rawResult = try runtime.upscaleRaw(inputPath: item.input)
+        tensorOpsMs = max(
+            rawResult.tensorOpsMs,
+            (CFAbsoluteTimeGetCurrent() - tensorOpsStarted) * 1000.0
+        )
+        readbackMs = rawResult.readbackMs
+        guard let outputImage = cgImageFromRGBAUnassociated(
+            rawResult.raw,
+            width: rawResult.width,
+            height: rawResult.height
+        ) else {
+            throw FP8SRError.execution("output_image")
+        }
+        let ddsStarted = CFAbsoluteTimeGetCurrent()
+        guard convertCGImageWithPreprocess(
+            sourceImage: outputImage,
+            sourceLabel: item.input,
+            maskPath: item.mask,
+            r: item.color.r,
+            g: item.color.g,
+            b: item.color.b,
+            contrast: item.color.contrast,
+            brightness: item.color.brightness,
+            saturation: item.color.saturation,
+            outputPath: item.output,
+            format: item.format,
+            useGPU: true
+        ) else {
+            throw FP8SRError.execution("dds_compress")
+        }
+        ddsMs = (CFAbsoluteTimeGetCurrent() - ddsStarted) * 1000.0
+        return TensorOpsDirectDDSItemResult(
+            success: true,
+            effectiveBackend: "tensorops",
+            tensorOpsDispatchObserved: true,
+            alphaMode: "opaque",
+            fallbackReason: nil,
+            tensorOpsMs: tensorOpsMs,
+            readbackMs: readbackMs,
+            ddsMs: ddsMs,
+            totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+            rssMB: residentMemoryMB()
+        )
+    } catch {
+        fallbackReason = String(describing: error)
+    }
+
+    let fallbackStarted = CFAbsoluteTimeGetCurrent()
+    guard let fallbackImage = lanczosImage(inputPath: item.input),
+          convertCGImageWithPreprocess(
+              sourceImage: fallbackImage,
+              sourceLabel: item.input,
+              maskPath: item.mask,
+              r: item.color.r,
+              g: item.color.g,
+              b: item.color.b,
+              contrast: item.color.contrast,
+              brightness: item.color.brightness,
+              saturation: item.color.saturation,
+              outputPath: item.output,
+              format: item.format,
+              useGPU: true
+          ) else {
+        return TensorOpsDirectDDSItemResult(
+            success: false,
+            effectiveBackend: "failed",
+            tensorOpsDispatchObserved: false,
+            alphaMode: "unknown",
+            fallbackReason: fallbackReason ?? "ci_lanczos_failed",
+            tensorOpsMs: tensorOpsMs,
+            readbackMs: readbackMs,
+            ddsMs: 0.0,
+            totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+            rssMB: residentMemoryMB()
+        )
+    }
+    ddsMs = (CFAbsoluteTimeGetCurrent() - fallbackStarted) * 1000.0
+    return TensorOpsDirectDDSItemResult(
+        success: true,
+        effectiveBackend: "ci_lanczos",
+        tensorOpsDispatchObserved: false,
+        alphaMode: "lanczos",
+        fallbackReason: fallbackReason,
+        tensorOpsMs: tensorOpsMs,
+        readbackMs: readbackMs,
+        ddsMs: ddsMs,
+        totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+        rssMB: residentMemoryMB()
+    )
+}
+
+@available(macOS 27.0, *)
+func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: requestPath))
+        let request = try JSONDecoder().decode(TensorOpsDirectDDSRequest.self, from: data)
+        guard request.version == 1, !request.pack.isEmpty, !request.items.isEmpty else {
+            throw FP8SRError.invalid("request")
+        }
+        guard request.items.allSatisfy({ $0.format == "BC1" || $0.format == "BC3" }) else {
+            throw FP8SRError.invalid("unsupported_format")
+        }
+        let runtime = try? FP8SRRuntime.cached(packPath: request.pack)
+        var successCount = 0
+        var fallbackCount = 0
+        var failedCount = 0
+        var tensorOpsDispatchObserved = false
+        var fallbackReasons: [String: Int] = [:]
+        var peakRSSMB: UInt64 = 0
+        let started = CFAbsoluteTimeGetCurrent()
+
+        for (index, item) in request.items.enumerated() {
+            let result = autoreleasepool {
+                processTensorOpsDirectDDSItem(item: item, runtime: runtime)
+            }
+            peakRSSMB = max(peakRSSMB, result.rssMB)
+            if result.success {
+                successCount += 1
+                tensorOpsDispatchObserved = tensorOpsDispatchObserved || result.tensorOpsDispatchObserved
+                if result.effectiveBackend == "ci_lanczos" {
+                    fallbackCount += 1
+                }
+            } else {
+                failedCount += 1
+            }
+            if let reason = result.fallbackReason {
+                fallbackReasons[reason, default: 0] += 1
+            }
+            let dtypeName = runtime?.weightDTypeName ?? "unknown"
+            let tensorOpsMS = String(format: "%.2f", result.tensorOpsMs)
+            let readbackMS = String(format: "%.2f", result.readbackMs)
+            let ddsMS = String(format: "%.2f", result.ddsMs)
+            let totalMS = String(format: "%.2f", result.totalMs)
+            print(
+                "tensorops_dds_item=\(index + 1)/\(request.items.count) "
+                    + "backend=tensorops effective_backend=\(result.effectiveBackend) "
+                    + "dispatch=direct_dds dtype=\(dtypeName) "
+                    + "alpha_mode=\(result.alphaMode) "
+                    + "activation_dtype=Float16 accumulation_dtype=Float16 "
+                    + "png_intermediate=false tensorops_dispatch_observed=\(result.tensorOpsDispatchObserved) "
+                    + "neural_accelerator_confirmed=false "
+                    + "tensorops_ms=\(tensorOpsMS) readback_ms=\(readbackMS) "
+                    + "dds_ms=\(ddsMS) total_ms=\(totalMS) "
+                    + "rss_mb=\(result.rssMB)"
+                    + (result.fallbackReason.map { " fallback_reason=\($0)" } ?? "")
+            )
+        }
+
+        let reasonSummary = fallbackReasons.keys.sorted().map {
+            "\($0):\(fallbackReasons[$0] ?? 0)"
+        }.joined(separator: ",")
+        print(
+            "backend=tensorops effective_backend=tensorops dispatch=direct_dds "
+                + "png_intermediate=false batch_tasks=\(request.items.count) "
+                + "batch_success=\(successCount) batch_fallback=\(fallbackCount) "
+                + "batch_failed=\(failedCount) batch_workers=1 batch_chunks=1 chunk_size=\(request.items.count) "
+                + "tensorops_dispatch_observed=\(tensorOpsDispatchObserved) neural_accelerator_confirmed=false "
+                + "peak_rss_mb=\(peakRSSMB) duration_ms="
+                + String(format: "%.2f", (CFAbsoluteTimeGetCurrent() - started) * 1000.0)
+                + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
+        )
+        return failedCount == 0
+    } catch {
+        reportError("ASHelper: TensorOps direct DDS batch failed: \(error)")
         return false
     }
 }
@@ -2420,6 +2651,16 @@ private enum FP8SRError: Error, CustomStringConvertible {
 }
 
 @available(macOS 27.0, *)
+private struct TensorOpsRawResult {
+    let raw: [UInt8]
+    let width: Int
+    let height: Int
+    let dispatch: String
+    let tensorOpsMs: Double
+    let readbackMs: Double
+}
+
+@available(macOS 27.0, *)
 private struct FP8SRIm2ColParams {
     var width: UInt32
     var height: UInt32
@@ -2479,6 +2720,10 @@ private final class FP8SRRuntime {
     private let layers: [Layer]
     private var transientBuffers: [MTLBuffer] = []
     private var nextCompletionValue: UInt64 = 1
+
+    var weightDTypeName: String {
+        layers.first?.weightDType ?? "unknown"
+    }
 
     static func cached(packPath: String) throws -> FP8SRRuntime {
         let key = URL(fileURLWithPath: packPath).standardizedFileURL.path
@@ -3010,13 +3255,6 @@ private final class FP8SRRuntime {
         let outputHeight = try checkedMultiply(height, 2, label: "tiled_output_height")
         let outputCount = try checkedMultiply(outputWidth, outputHeight, 4, label: "tiled_output")
         var result = [UInt8](repeating: 0, count: outputCount)
-        let temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ortho4xp-tensorops-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: temporaryDirectory,
-            withIntermediateDirectories: true
-        )
-        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
 
         let tileColumns = (width + Self.coreTileDimension - 1) / Self.coreTileDimension
         let tileRows = (height + Self.coreTileDimension - 1) / Self.coreTileDimension
@@ -3041,17 +3279,16 @@ private final class FP8SRRuntime {
                     width: tileWidth,
                     height: tileHeight
                 )
-                let tileInput = temporaryDirectory.appendingPathComponent("tile_\(tileIndex)_input.png")
-                let tileOutput = temporaryDirectory.appendingPathComponent("tile_\(tileIndex)_output.png")
-                guard writePNG(tileRaw, width: tileWidth, height: tileHeight, outputPath: tileInput.path) else {
-                    throw FP8SRError.execution("tile_input_write")
-                }
+                let tileOutputRaw: [UInt8]
                 do {
-                    try upscaleSingle(
-                        inputPath: tileInput.path,
-                        outputPath: tileOutput.path,
-                        emitCompletionLog: false
-                    )
+                    tileOutputRaw = try autoreleasepool {
+                        try upscaleSingleRaw(
+                            raw: tileRaw,
+                            width: tileWidth,
+                            height: tileHeight,
+                            emitCompletionLog: false
+                        )
+                    }
                 } catch let error as FP8SRError {
                     switch error {
                     case .execution("nonfinite"):
@@ -3062,19 +3299,18 @@ private final class FP8SRRuntime {
                         throw error
                     }
                 }
-                guard let outputSource = CGImageSourceCreateWithURL(tileOutput as CFURL, nil),
-                      let outputImage = CGImageSourceCreateImageAtIndex(outputSource, 0, nil) else {
-                    throw FP8SRError.execution("tile_output_decode")
-                }
-                let tileOutputRaw = getRawRGBA(cgImage: outputImage)
-                guard outputImage.width == tileWidth * 2,
-                      outputImage.height == tileHeight * 2 else {
+                let tileOutputWidth = try checkedMultiply(tileWidth, 2, label: "tile_output_width")
+                let tileOutputHeight = try checkedMultiply(tileHeight, 2, label: "tile_output_height")
+                let expectedTileOutputBytes = try checkedMultiply(
+                    tileOutputWidth, tileOutputHeight, 4, label: "tile_output_rgba"
+                )
+                guard tileOutputRaw.count == expectedTileOutputBytes else {
                     throw FP8SRError.execution("tile_output_invalid")
                 }
                 let copyX = (coreX - tileX) * 2
                 let copyY = (coreY - tileY) * 2
                 let destinationRowBytes = outputWidth * 4
-                let sourceRowBytes = outputImage.width * 4
+                let sourceRowBytes = tileOutputWidth * 4
                 let copyRowBytes = coreWidth * 2 * 4
                 for row in 0..<(coreHeight * 2) {
                     let sourceOffset = (copyY + row) * sourceRowBytes + copyX * 4
@@ -3090,6 +3326,25 @@ private final class FP8SRRuntime {
     }
 
     func upscale(inputPath: String, outputPath: String) throws {
+        let result = try upscaleRaw(inputPath: inputPath)
+        guard writePNG(
+            result.raw,
+            width: result.width,
+            height: result.height,
+            outputPath: outputPath
+        ) else {
+            throw FP8SRError.execution("output_write")
+        }
+        let dtype = layers.first?.weightDType ?? "unknown"
+        print(
+            "tensorops_dispatch=completed dtype=\(dtype) activation=Float16 "
+                + "accumulation=Float16 dispatch=\(result.dispatch) "
+                + "png_intermediate=true "
+                + "output=\(result.width)x\(result.height)"
+        )
+    }
+
+    func upscaleRaw(inputPath: String) throws -> TensorOpsRawResult {
         let sourceURL = URL(fileURLWithPath: inputPath)
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
@@ -3107,18 +3362,233 @@ private final class FP8SRRuntime {
         if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
             throw FP8SRError.execution("alpha")
         }
+        let started = CFAbsoluteTimeGetCurrent()
         if max(image.width, image.height) > Self.coreTileDimension {
             let tiledOutput = try upscaleTiled(raw: raw, width: image.width, height: image.height)
-            let outputWidth = image.width * 2
-            let outputHeight = image.height * 2
-            guard writePNG(tiledOutput, width: outputWidth, height: outputHeight, outputPath: outputPath) else {
-                throw FP8SRError.execution("output_write")
-            }
-            let dtype = layers.first?.weightDType ?? "unknown"
-            print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 dispatch=tiled output=\(outputWidth)x\(outputHeight)")
-            return
+            return TensorOpsRawResult(
+                raw: tiledOutput,
+                width: image.width * 2,
+                height: image.height * 2,
+                dispatch: "tiled",
+                tensorOpsMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+                readbackMs: 0.0
+            )
         }
-        try upscaleSingle(inputPath: inputPath, outputPath: outputPath)
+        let readbackStarted = CFAbsoluteTimeGetCurrent()
+        let outputRaw = try upscaleSingleRaw(
+            raw: raw,
+            width: image.width,
+            height: image.height,
+            emitCompletionLog: false
+        )
+        let readbackMs = (CFAbsoluteTimeGetCurrent() - readbackStarted) * 1000.0
+        return TensorOpsRawResult(
+            raw: outputRaw,
+            width: image.width * 2,
+            height: image.height * 2,
+            dispatch: "single",
+            tensorOpsMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+            readbackMs: readbackMs
+        )
+    }
+
+    private func upscaleSingleRaw(
+        raw: [UInt8],
+        width: Int,
+        height: Int,
+        emitCompletionLog: Bool = true
+    ) throws -> [UInt8] {
+        let pixelCount = try validateSingleTileGeometry(width: width, height: height)
+        let inputByteCount = try checkedMultiply(width, height, 4, label: "input_rgba")
+        guard raw.count == inputByteCount else {
+            throw FP8SRError.execution("input_normalize")
+        }
+        if stride(from: 3, to: raw.count, by: 4).contains(where: { raw[$0] < 255 }) {
+            throw FP8SRError.execution("alpha")
+        }
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        textureDescriptor.storageMode = .shared
+        textureDescriptor.usage = .shaderRead
+        guard let inputTexture = device.makeTexture(descriptor: textureDescriptor) else {
+            throw FP8SRError.execution("input_texture")
+        }
+        raw.withUnsafeBytes { bytes in
+            inputTexture.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: width * 4
+            )
+        }
+
+        guard let commandBuffer = device.makeCommandBuffer(),
+              let errorBuffer = device.makeBuffer(length: 128, options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: max(128, try checkedMultiply(width, height, 16, label: "output_buffer")),
+                  options: .storageModeShared
+              ) else {
+            throw FP8SRError.execution("command_buffer")
+        }
+        errorBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: errorBuffer.length)
+        outputBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: outputBuffer.length)
+        transientBuffers.removeAll(keepingCapacity: true)
+        var temporaryResources: [MTLAllocation] = [inputTexture, errorBuffer, outputBuffer]
+        defer {
+            for resource in temporaryResources {
+                residencySet.removeAllocation(resource)
+            }
+            for buffer in transientBuffers {
+                residencySet.removeAllocation(buffer)
+            }
+            transientBuffers.removeAll(keepingCapacity: true)
+            residencySet.commit()
+        }
+        residencySet.addAllocation(inputTexture)
+        residencySet.addAllocation(errorBuffer)
+        residencySet.addAllocation(outputBuffer)
+        commandAllocator.reset()
+        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            commandBuffer.endCommandBuffer()
+            throw FP8SRError.execution("compute_encoder")
+        }
+
+        var previousOutput: MTLBuffer?
+        for (index, layer) in layers.enumerated() {
+            let kPadded = FP8SRRuntime.paddedKernelElements(layer.manifest)
+            let activationBuffer = try FP8SRRuntime.makeSharedBuffer(
+                device: device,
+                data: Data(count: max(128, try checkedMultiply(kPadded, pixelCount, 2, label: "activation_buffer")))
+            )
+            residencySet.addAllocation(activationBuffer)
+            temporaryResources.append(activationBuffer)
+            _ = try makeTensor(
+                buffer: activationBuffer,
+                dimensions: [kPadded, pixelCount],
+                strides: [1, kPadded],
+                dataType: .float16
+            )
+            if index == 0 {
+                var params = FP8SRIm2ColParams(
+                    width: UInt32(width), height: UInt32(height),
+                    sourceChannels: 3, sourceStride: 3,
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel), baseIndex: 0
+                )
+                try encodeImageIm2Col(
+                    encoder: encoder,
+                    image: inputTexture,
+                    destination: activationBuffer,
+                    params: &params,
+                    elementCount: try checkedMultiply(pixelCount, kPadded, label: "image_im2col")
+                )
+            } else if let previousOutput {
+                var params = FP8SRIm2ColParams(
+                    width: UInt32(width), height: UInt32(height),
+                    sourceChannels: UInt32(layer.manifest.inChannels), sourceStride: 32,
+                    targetK: UInt32(kPadded), kernelSize: UInt32(layer.manifest.kernel), baseIndex: 0
+                )
+                try encodeFeatureIm2Col(
+                    encoder: encoder,
+                    source: previousOutput,
+                    destination: activationBuffer,
+                    params: &params,
+                    elementCount: try checkedMultiply(pixelCount, kPadded, label: "feature_im2col")
+                )
+            }
+
+            let outputLength = max(128, try checkedMultiply(32, pixelCount, 2, label: "layer_output") + 128)
+            guard let layerOutput = device.makeBuffer(length: outputLength, options: .storageModeShared) else {
+                throw FP8SRError.execution("layer_output")
+            }
+            layerOutput.contents().initializeMemory(as: UInt8.self, repeating: 0, count: layerOutput.length)
+            residencySet.addAllocation(layerOutput)
+            temporaryResources.append(layerOutput)
+            _ = try makeTensor(
+                buffer: layerOutput,
+                dimensions: [32, pixelCount],
+                strides: [1, 32],
+                dataType: .float16
+            )
+            var matmulParams = FP8SRMatmulParams(
+                m: UInt32(pixelCount), n: 32, k: UInt32(kPadded)
+            )
+            try encodeMatmul(
+                encoder: encoder,
+                activation: activationBuffer,
+                weights: layer.weightBuffer,
+                output: layerOutput,
+                params: &matmulParams,
+                weightDType: layer.weightDType,
+                pixelCount: pixelCount
+            )
+            var postParams = FP8SRPostParams(
+                pixelCount: UInt32(pixelCount), channels: 32, scale: layer.manifest.scale
+            )
+            try encodePostprocess(
+                encoder: encoder,
+                values: layerOutput,
+                bias: layer.bias,
+                params: &postParams,
+                error: errorBuffer
+            )
+            previousOutput = layerOutput
+        }
+        guard let finalOutput = previousOutput else {
+            commandBuffer.endCommandBuffer()
+            throw FP8SRError.execution("no_layers")
+        }
+        var pixelParams = FP8SRPixelParams(
+            width: UInt32(width), height: UInt32(height),
+            pixelCount: UInt32(pixelCount), channels: 32
+        )
+        try encodePixelShuffle(
+            encoder: encoder,
+            values: finalOutput,
+            destination: outputBuffer,
+            params: &pixelParams
+        )
+        encoder.endEncoding()
+        residencySet.commit()
+        commandBuffer.useResidencySet(residencySet)
+        commandBuffer.endCommandBuffer()
+        let completionValue = nextCompletionValue
+        nextCompletionValue += 1
+        commandQueue.commit([commandBuffer])
+        commandQueue.signalEvent(completionEvent, value: completionValue)
+        completionEvent.wait(untilSignaledValue: completionValue, timeoutMS: 120_000)
+        guard completionEvent.signaledValue >= completionValue else {
+            throw FP8SRError.execution("gpu_timeout")
+        }
+        let errorValue = errorBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee
+        guard errorValue == 0 else {
+            throw FP8SRError.execution("nonfinite")
+        }
+        let outputWidth = try checkedMultiply(width, 2, label: "output_width")
+        let outputHeight = try checkedMultiply(height, 2, label: "output_height")
+        let outputBytes = try checkedMultiply(outputWidth, outputHeight, 4, label: "output_rgba")
+        let outputRaw = Array(
+            UnsafeBufferPointer(
+                start: outputBuffer.contents().assumingMemoryBound(to: UInt8.self),
+                count: outputBytes
+            )
+        )
+        guard outputRaw.count == outputBytes,
+              outputRaw.count >= 4,
+              stride(from: 3, to: outputRaw.count, by: 4).allSatisfy({
+                  outputRaw[$0] == 255
+              }) else {
+            throw FP8SRError.execution("output_invalid")
+        }
+        if emitCompletionLog {
+            let dtype = layers.first?.weightDType ?? "unknown"
+            print("tensorops_dispatch=completed dtype=\(dtype) activation=Float16 accumulation=Float16 output=\(outputWidth)x\(outputHeight)")
+        }
+        return outputRaw
     }
 
     private func upscaleSingle(
@@ -3401,9 +3871,320 @@ func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool
     return writeDDS(output, to: outputPath)
 }
 
+// MARK: - Resident JSON Lines server
+
+// The server protocol deliberately carries only paths and scalar options.  It
+// keeps the large image payloads on the staging filesystem and lets the
+// Python-side tile scheduler apply backpressure without starting one helper
+// process per batch.
+private func serverString(_ request: [String: Any], _ key: String) -> String? {
+    guard let value = request[key] as? String, !value.isEmpty else { return nil }
+    return value
+}
+
+private func serverTaskID(_ task: [String: Any], index: Int) -> String {
+    return (task["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        ?? "task-\(index + 1)"
+}
+
+private func serverDouble(
+    _ task: [String: Any],
+    _ key: String,
+    defaultValue: Double
+) -> Double {
+    if let number = task[key] as? NSNumber { return number.doubleValue }
+    if let string = task[key] as? String, let value = Double(string) { return value }
+    return defaultValue
+}
+
+private func serverTaskResult(
+    _ taskID: String,
+    success: Bool,
+    backend: String,
+    error: String? = nil,
+    extra: [String: Any] = [:]
+) -> [String: Any] {
+    var result: [String: Any] = [
+        "id": taskID,
+        "ok": success,
+        "backend": backend,
+    ]
+    if let error { result["error"] = error }
+    for (key, value) in extra { result[key] = value }
+    return result
+}
+
+private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
+    let useGPU = (request["gpu"] as? Bool) ?? false
+    guard let tasks = request["tasks"] as? [[String: Any]], !tasks.isEmpty else {
+        return [serverTaskResult("batch", success: false, backend: "server", error: "tasks_required")]
+    }
+
+    var results = Array(repeating: [String: Any](), count: tasks.count)
+    let resultLock = NSLock()
+    DispatchQueue.concurrentPerform(iterations: tasks.count) { index in
+        let task = tasks[index]
+        let taskID = serverTaskID(task, index: index)
+        guard let input = serverString(task, "input"),
+              let output = serverString(task, "output"),
+              let format = serverString(task, "format"),
+              format == "BC1" || format == "BC3" else {
+            resultLock.lock()
+            results[index] = serverTaskResult(
+                taskID,
+                success: false,
+                backend: "server",
+                error: "invalid_task"
+            )
+            resultLock.unlock()
+            return
+        }
+
+        let ok = convertWithPreprocess(
+            jpegPath: input,
+            maskPath: serverString(task, "mask") ?? "none",
+            r: serverDouble(task, "r", defaultValue: 1.0),
+            g: serverDouble(task, "g", defaultValue: 1.0),
+            b: serverDouble(task, "b", defaultValue: 1.0),
+            contrast: serverDouble(task, "contrast", defaultValue: 1.0),
+            brightness: serverDouble(task, "brightness", defaultValue: 0.0),
+            saturation: serverDouble(task, "saturation", defaultValue: 1.0),
+            outputPath: output,
+            format: format,
+            useGPU: useGPU
+        )
+        resultLock.lock()
+        results[index] = serverTaskResult(
+            taskID,
+            success: ok,
+            backend: useGPU ? "metal" : "cpu",
+            error: ok ? nil : "conversion_failed"
+        )
+        resultLock.unlock()
+    }
+    return results
+}
+
+@available(macOS 13.0, *)
+private func serverMetalFXUpscaleBatch(_ request: [String: Any]) -> [[String: Any]] {
+    guard let tasks = request["tasks"] as? [[String: Any]], !tasks.isEmpty else {
+        return [serverTaskResult("batch", success: false, backend: "metalfx", error: "tasks_required")]
+    }
+    let runtime = try? MetalFXSpatialRuntime()
+    return tasks.enumerated().map { index, task in
+        let taskID = serverTaskID(task, index: index)
+        guard let input = serverString(task, "input"),
+              let output = serverString(task, "output") else {
+            return serverTaskResult(taskID, success: false, backend: "metalfx", error: "invalid_task")
+        }
+        let result = metalFXSpatialProcess(
+            runtime: runtime,
+            inputPath: input,
+            outputPath: output,
+            fallbackAlphaProcessing: true
+        )
+        return serverTaskResult(
+            taskID,
+            success: result.success,
+            backend: result.effectiveBackend,
+            error: result.success ? nil : (result.reason ?? "metalfx_failed"),
+            extra: [
+                "alpha_mode": result.alphaMode,
+                "fallback": result.effectiveBackend == "ci_lanczos",
+            ]
+        )
+    }
+}
+
+@available(macOS 27.0, *)
+private func serverTensorOpsUpscaleBatch(_ request: [String: Any]) -> [[String: Any]] {
+    guard let pack = serverString(request, "pack"),
+          let tasks = request["tasks"] as? [[String: Any]],
+          !tasks.isEmpty else {
+        return [serverTaskResult("batch", success: false, backend: "tensorops", error: "pack_and_tasks_required")]
+    }
+    let runtime = try? FP8SRRuntime.cached(packPath: pack)
+    return tasks.enumerated().map { index, task in
+        let taskID = serverTaskID(task, index: index)
+        guard let input = serverString(task, "input"),
+              let output = serverString(task, "output"),
+              let runtime else {
+            return serverTaskResult(taskID, success: false, backend: "tensorops", error: "tensorops_runtime_unavailable")
+        }
+        do {
+            try autoreleasepool {
+                try runtime.upscale(inputPath: input, outputPath: output)
+            }
+            return serverTaskResult(taskID, success: true, backend: "tensorops")
+        } catch {
+            return serverTaskResult(
+                taskID,
+                success: false,
+                backend: "tensorops",
+                error: String(describing: error)
+            )
+        }
+    }
+}
+
+private func serverUnsupportedBatch(
+    _ request: [String: Any],
+    backend: String,
+    operation: String
+) -> [[String: Any]] {
+    let tasks = request["tasks"] as? [[String: Any]] ?? []
+    if tasks.isEmpty {
+        return [serverTaskResult("batch", success: false, backend: backend, error: "tasks_required")]
+    }
+    return tasks.enumerated().map { index, task in
+        serverTaskResult(
+            serverTaskID(task, index: index),
+            success: false,
+            backend: backend,
+            error: "unsupported_\(operation)"
+        )
+    }
+}
+
+private func serverResponse(
+    id: String,
+    operation: String,
+    results: [[String: Any]],
+    error: String? = nil,
+    shutdown: Bool = false
+) -> [String: Any] {
+    var response: [String: Any] = [
+        "id": id,
+        "op": operation,
+        "ok": error == nil && results.allSatisfy { ($0["ok"] as? Bool) == true },
+        "results": results,
+    ]
+    if let error { response["error"] = error }
+    if shutdown { response["shutdown"] = true }
+    return response
+}
+
+private func runJSONLRequest(_ request: [String: Any]) -> ([String: Any], Bool) {
+    let requestID = (request["id"] as? String) ?? UUID().uuidString
+    let operation = (request["op"] as? String) ?? ""
+    switch operation {
+    case "convert_batch":
+        return (serverResponse(
+            id: requestID,
+            operation: operation,
+            results: serverConvertBatch(request)
+        ), false)
+    case "metalfx_upscale_batch":
+        guard #available(macOS 13.0, *) else {
+            return (serverResponse(
+                id: requestID,
+                operation: operation,
+                results: serverUnsupportedBatch(request, backend: "metalfx", operation: operation)
+            ), false)
+        }
+        return (serverResponse(
+            id: requestID,
+            operation: operation,
+            results: serverMetalFXUpscaleBatch(request)
+        ), false)
+    case "tensorops_upscale_batch":
+        guard #available(macOS 27.0, *) else {
+            return (serverResponse(
+                id: requestID,
+                operation: operation,
+                results: serverUnsupportedBatch(request, backend: "tensorops", operation: operation)
+            ), false)
+        }
+        return (serverResponse(
+            id: requestID,
+            operation: operation,
+            results: serverTensorOpsUpscaleBatch(request)
+        ), false)
+    case "mask_blur_batch", "dem_smooth_batch":
+        let results = serverUnsupportedBatch(request, backend: "cpu", operation: operation)
+        return (serverResponse(id: requestID, operation: operation, results: results), false)
+    case "shutdown":
+        return (serverResponse(id: requestID, operation: operation, results: [], shutdown: true), true)
+    default:
+        return (serverResponse(
+            id: requestID,
+            operation: operation,
+            results: [],
+            error: "unsupported_operation"
+        ), false)
+    }
+}
+
+private func runJSONLinesServer() -> Int32 {
+    let responseFileDescriptor = dup(STDOUT_FILENO)
+    guard responseFileDescriptor >= 0 else {
+        reportError("ASHelper: --serve could not duplicate stdout.")
+        return 1
+    }
+    // Existing image/Metal routines use print for diagnostics.  Keep those
+    // diagnostics on stderr so stdout stays a strict one-request/one-response
+    // JSON Lines stream.
+    guard dup2(STDERR_FILENO, STDOUT_FILENO) >= 0 else {
+        close(responseFileDescriptor)
+        reportError("ASHelper: --serve could not redirect diagnostics.")
+        return 1
+    }
+    let responseHandle = FileHandle(
+        fileDescriptor: responseFileDescriptor,
+        closeOnDealloc: true
+    )
+    defer { responseHandle.closeFile() }
+
+    func writeResponse(_ response: [String: Any]) {
+        do {
+            let data = try JSONSerialization.data(withJSONObject: response, options: [])
+            responseHandle.write(data)
+            responseHandle.write(Data([0x0a]))
+        } catch {
+            reportError("ASHelper: --serve response serialization failed: \(error)")
+        }
+    }
+
+    while let line = readLine() {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { continue }
+        guard let data = trimmed.data(using: .utf8) else {
+            writeResponse(serverResponse(
+                id: UUID().uuidString,
+                operation: "unknown",
+                results: [],
+                error: "request_not_utf8"
+            ))
+            continue
+        }
+        do {
+            guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw NSError(domain: "ASHelper", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "request_object_required"
+                ])
+            }
+            let (response, shouldShutdown) = runJSONLRequest(request)
+            writeResponse(response)
+            if shouldShutdown { break }
+        } catch {
+            writeResponse(serverResponse(
+                id: UUID().uuidString,
+                operation: "unknown",
+                results: [],
+                error: String(describing: error)
+            ))
+        }
+    }
+    return 0
+}
+
 let args = ProcessInfo.processInfo.arguments
 guard args.count >= 2 else { fail("ASHelper: missing command.") }
-if args[1] == "--capabilities" {
+if args[1] == "--serve" {
+    guard args.count == 2 else { fail("ASHelper: --serve takes no arguments.") }
+    exit(runJSONLinesServer())
+}
+else if args[1] == "--capabilities" {
     guard args.count == 2 else { fail("ASHelper: --capabilities takes no arguments.") }
     print("metal_available=\(MetalCompressor.shared != nil)")
     print("metalfx_spatial_available=\(metalFXSpatialAvailable())")
@@ -3461,6 +4242,17 @@ else if args[1] == "--metalfx-spatial-dds-batch" {
         exit(1)
     }
 }
+else if args[1] == "--tensorops-dds-batch" || args[1] == "--fp8-tensorops-dds-batch" {
+    guard args.count == 3 else {
+        fail("ASHelper: --tensorops-dds-batch expects a request JSON path.")
+    }
+    guard #available(macOS 27.0, *) else {
+        fail("ASHelper: TensorOps requires macOS 27 or newer.")
+    }
+    if !tensorOpsDirectDDSBatch(requestPath: args[2]) {
+        exit(1)
+    }
+}
 else if args[1] == "--tensorops-upscale" || args[1] == "--fp8-tensorops-upscale" {
     guard args.count == 5 else { fail("ASHelper: --tensorops-upscale expects pack, input, and output paths.") }
     guard #available(macOS 27.0, *) else {
@@ -3480,7 +4272,9 @@ else if args[1] == "--tensorops-upscale-batch" || args[1] == "--fp8-tensorops-up
         let runtime = try FP8SRRuntime.cached(packPath: args[2])
         var index = 3
         while index + 1 < args.count {
-            try runtime.upscale(inputPath: args[index], outputPath: args[index + 1])
+            try autoreleasepool {
+                try runtime.upscale(inputPath: args[index], outputPath: args[index + 1])
+            }
             index += 2
         }
     } catch {

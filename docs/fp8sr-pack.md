@@ -42,6 +42,14 @@ Utils/mac/ASHelper --tensorops-upscale-batch \
   /path/to/model.fp8sr input-1.png output-1.png input-2.png output-2.png
 ```
 
+実タイルのopaque JPEGは、PNGを中間保存しないdirect DDS CLIを使用します。request JSONの`pack`へ同じFP8SRパックを指定し、各itemの`input`、`mask`、色補正、`format`、`.gpu.tmp.dds`出力先を渡します。TensorOpsは1 child processあたり8画像のchunkで順次処理し、chunk終了後にプロセスを終了して一時Metal/画像リソースを回収します。
+
+```sh
+Utils/mac/ASHelper --tensorops-dds-batch /path/to/tensorops-dds.json
+```
+
+このdirect DDS経路では`png_intermediate=false`となり、`_tensorops_upscaled.png`、`tile_input.png`、`tile_output.png`は生成しません。各DDSは検証後にatomic replaceされます。TensorOpsまたはchild processが失敗した場合は失敗画像だけをCore Image Lanczosへ送り、成功済み画像は再処理しません。`--tensorops-upscale`と`--tensorops-upscale-batch`は従来どおりPNG互換CLIです。
+
 Ortho4XPで`upscale_backend=tensorops`を選んだ場合、macOS 27未満、TensorOps非対応、パック不在/不正、透明入力、GPU実行失敗、非有限値、出力サイズ不正ではCore Image Lanczosへフォールバックします。通常のタイル処理では、条件を満たす直接JPEGだけをbatch経路へ集約します。マスク、色補正、結合プロバイダ、高ズームの前処理が必要な画像は個別経路を使います。旧`upscale_backend=fp8_tensorops`と旧CLIは互換aliasです。
 
 ログには少なくとも次の実行証拠を出します。

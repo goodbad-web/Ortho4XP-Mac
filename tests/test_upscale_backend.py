@@ -185,7 +185,8 @@ def test_metalfx_batch_records_each_output(tmp_path):
         "for index in range(2, len(sys.argv), 2):\n"
         "    image = Image.open(sys.argv[index])\n"
         "    output = sys.argv[index + 1]\n"
-        "    image.resize((image.width * 2, image.height * 2)).save(output)\n",
+        "    image.resize((image.width * 2, image.height * 2)).save(output)\n"
+        "    print('metalfx_batch_item={}/2 backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=batch'.format((index - 2) // 2 + 1))\n",
         encoding="utf-8",
     )
     helper.chmod(0o755)
@@ -206,6 +207,40 @@ def test_metalfx_batch_records_each_output(tmp_path):
     assert result["batch_tasks"] == 2
     assert result["batch_success"] == 2
     assert output_a.is_file() and output_b.is_file()
+
+
+def test_metalfx_batch_distinguishes_ci_fallback(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    reference = tmp_path / "reference.png"
+    output_a = tmp_path / "output-a.png"
+    output_b = tmp_path / "output-b.png"
+    Image.new("RGB", (2, 2), (30, 60, 90)).save(source)
+    Image.new("RGB", (4, 4), (30, 60, 90)).save(reference)
+    helper = tmp_path / "fake_fallback_ashelper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from PIL import Image\n"
+        "assert sys.argv[1] == '--metalfx-spatial-upscale-batch'\n"
+        "for index in range(2, len(sys.argv), 2):\n"
+        "    image = Image.open(sys.argv[index])\n"
+        "    image.resize((image.width * 2, image.height * 2)).save(sys.argv[index + 1])\n"
+        "    print('metalfx_batch_item={}/2 backend=metalfx_spatial effective_backend=ci_lanczos dispatch=batch'.format((index - 2) // 2 + 1))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    result = VERIFY.compare_metalfx_batch(
+        helper,
+        [(source, output_a, reference), (source, output_b, reference)],
+        1,
+    )
+
+    assert result["status"] == "SKIP(metalfx_fallback)"
+    assert result["effective_backend"] == "ci_lanczos"
+    assert result["batch_fallback"] == 2
 
 
 def _direct_dds_spec(tmp_path, name, item_index):
@@ -322,3 +357,93 @@ def test_metalfx_direct_dds_batch_keeps_success_and_reports_one_failure(tmp_path
     assert not Path(specs[1]["final_path"]).exists()
     assert Path(specs[2]["final_path"]).is_file()
     assert not Path(specs[1]["temporary_path"]).exists()
+
+
+def test_tensorops_direct_dds_uses_pack_chunks_and_no_png(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(TILE.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    monkeypatch.setattr(
+        TILE.IMG,
+        "validate_dds_file",
+        lambda path, **kwargs: (Path(path).is_file(), None),
+    )
+    request_log = tmp_path / "tensorops-request"
+    helper = tmp_path / "fake_tensorops_direct_dds_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        f"open({str(request_log)!r} + '-' + str(os.getpid()), 'w', encoding='utf-8').write(json.dumps(request))\n"
+        "for index, item in enumerate(request['items'], 1):\n"
+        "    open(item['output'], 'wb').write(b'DDS tensorops')\n"
+        "    print('tensorops_dds_item={}/{} backend=tensorops effective_backend=tensorops dispatch=direct_dds dtype=MetalFloat8E4M3 rss_mb=321'.format(index, len(request['items'])))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    specs = [_direct_dds_spec(tmp_path, f"image-{index}", index) for index in range(9)]
+    pack_path = tmp_path / "model.fp8sr"
+
+    result = TILE._run_tensorops_direct_dds_batch(
+        str(helper), str(pack_path), specs, chunk_size=8
+    )
+
+    assert result["batch_tasks"] == 9
+    assert result["batch_success"] == 9
+    assert result["batch_failed"] == 0
+    assert result["batch_workers"] == 1
+    assert result["batch_chunks"] == 2
+    assert result["chunk_size"] == 8
+    assert result["peak_rss_mb"] == 321
+    assert all(Path(spec["final_path"]).is_file() for spec in specs)
+    assert not list(tmp_path.glob("*.png"))
+    assert not list((tmp_path / "ortho4xp" / "tmp").glob(".tensorops-dds-*.json"))
+    requests = list(tmp_path.glob("tensorops-request-*"))
+    assert len(requests) == 2
+    for request_path in requests:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        assert request["version"] == 1
+        assert request["pack"] == str(pack_path)
+        assert len(request["items"]) <= 8
+        assert all(item["output"].endswith(".gpu.tmp.dds") for item in request["items"])
+
+
+def test_tensorops_direct_dds_keeps_completed_chunk_on_sigkill(tmp_path, monkeypatch):
+    monkeypatch.setattr(TILE.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    monkeypatch.setattr(
+        TILE.IMG,
+        "validate_dds_file",
+        lambda path, **kwargs: (Path(path).is_file(), None),
+    )
+    helper = tmp_path / "fake_tensorops_sigkill_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import signal\n"
+        "import sys\n"
+        "request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        "if any(item['input'].endswith('image-8.jpg') for item in request['items']):\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        "for item in request['items']:\n"
+        "    open(item['output'], 'wb').write(b'DDS tensorops')\n"
+        "    print('tensorops_dds_item=1/{} backend=tensorops effective_backend=tensorops dispatch=direct_dds rss_mb=400'.format(len(request['items'])))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    specs = [_direct_dds_spec(tmp_path, f"image-{index}", index) for index in range(9)]
+
+    result = TILE._run_tensorops_direct_dds_batch(
+        str(helper), str(tmp_path / "model.fp8sr"), specs, chunk_size=8
+    )
+
+    assert result["batch_success"] == 8
+    assert result["batch_failed"] == 1
+    assert result["failed_items"] == [specs[8]["item"]]
+    assert result["signal"] == 9
+    assert result["fallback_reasons"]["process_signal_9"] >= 1
+    assert all(Path(spec["final_path"]).is_file() for spec in specs[:8])
+    assert not Path(specs[8]["final_path"]).exists()
+    assert not Path(specs[8]["temporary_path"]).exists()
