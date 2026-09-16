@@ -1,0 +1,41 @@
+{
+  "format": "FP8SR",
+  "version": 1,
+  "upscale_factor": 2,
+  "layout": "NHWC",
+  "input_channels": 3,
+  "output_channels": 3,
+  "weight_dtype": "MetalFloat8E4M3",
+  "activation_dtype": "Float16",
+  "accumulation_dtype": "Float16",
+  "weight_row_stride_bytes": 128,
+  "layers": [
+    {
+      "name": "conv0",
+      "kernel": 3,
+      "in_channels": 3,
+      "out_channels": 32,
+      "weights": "conv0.fp8",
+      "bias": "conv0.f16",
+      "scale": 1.0
+    },
+    {
+      "name": "conv1",
+      "kernel": 3,
+      "in_channels": 32,
+      "out_channels": 32,
+      "weights": "conv1.fp8",
+      "bias": "conv1.f16",
+      "scale": 1.0
+    },
+    {
+      "name": "conv2",
+      "kernel": 3,
+      "in_channels": 32,
+      "out_channels": 12,
+      "weights": "conv2.fp8",
+      "bias": "conv2.f16",
+      "scale": 1.0
+    }
+  ]
+}
