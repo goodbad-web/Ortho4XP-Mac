@@ -95,8 +95,10 @@ class TileConversionScheduler:
         self._started = False
         self._threads: List[threading.Thread] = []
         self._results: Dict[str, ConversionResult] = {}
+        self._accepted_task_ids = set()
         self._results_lock = threading.RLock()
         self._error: Optional[BaseException] = None
+        self._failure_cleanup_done = threading.Event()
 
     def start(self) -> None:
         if self._started:
@@ -132,13 +134,13 @@ class TileConversionScheduler:
 
         if not self._started:
             self.start()
-        if self._closed.is_set() or self._cancelled.is_set():
+        if self._closed.is_set() or self._cancelled.is_set() or self.error is not None:
             self._record(task, False, "cancelled", "scheduler_closed")
             return False
         wait_started = time.perf_counter()
         if timeout is None:
             while True:
-                if self._closed.is_set() or self._cancelled.is_set():
+                if self._closed.is_set() or self._cancelled.is_set() or self.error is not None:
                     self._record(task, False, "cancelled", "scheduler_closed")
                     return False
                 try:
@@ -152,6 +154,8 @@ class TileConversionScheduler:
             except queue.Full:
                 self._record(task, False, "scheduler", "queue_full")
                 return False
+        with self._results_lock:
+            self._accepted_task_ids.add(task.task_id)
         if self.metrics is not None and hasattr(self.metrics, "record_queue_wait"):
             self.metrics.record_queue_wait(
                 "input",
@@ -185,6 +189,12 @@ class TileConversionScheduler:
             self.start()
         if not self._closed.is_set():
             self.close()
+        # A worker failure must not turn wait() into an unbounded join.  The
+        # failure handler drains accepted-but-undispatched work and injects
+        # route sentinels; this short grace period only covers a dispatcher
+        # that was already in progress when the failure occurred.
+        if timeout is None and self.error is not None:
+            timeout = 1.0
         deadline = None if timeout is None else time.monotonic() + timeout
         for thread in self._threads:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -196,13 +206,22 @@ class TileConversionScheduler:
 
     @property
     def error(self) -> Optional[BaseException]:
-        return self._error
+        with self._results_lock:
+            return self._error
+
+    @property
+    def submitted_count(self) -> int:
+        """Return the number of task ids accepted by the scheduler."""
+
+        with self._results_lock:
+            return len(self._accepted_task_ids)
 
     def result_for(self, task_id: str) -> Optional[ConversionResult]:
         with self._results_lock:
             return self._results.get(task_id)
 
     def _classify_loop(self) -> None:
+        current_task: Optional[ConversionTask] = None
         try:
             while True:
                 item = self._input.get()
@@ -213,8 +232,10 @@ class TileConversionScheduler:
                         self._cpu.put(_CLOSE)
                         return
                     task = item
+                    current_task = task
                     if self._cancelled.is_set():
                         self._record(task, False, "cancelled", "cancelled_before_dispatch")
+                        current_task = None
                         continue
                     if self.dispatch_gpu is not None and self.gpu_eligible(task):
                         self._gpu.put(task)
@@ -222,11 +243,12 @@ class TileConversionScheduler:
                     else:
                         self._cpu.put(task)
                         self._record_queue(self._cpu, "cpu")
+                    current_task = None
                 finally:
                     self._input.task_done()
         except BaseException as error:  # pragma: no cover - defensive worker guard
-            self._error = error
-            self.logger(f"conversion classifier failed: {error}")
+            pending = [current_task] if current_task is not None else []
+            self._set_worker_error(error, "classifier", pending)
 
     def _route_loop(
         self,
@@ -235,6 +257,7 @@ class TileConversionScheduler:
         batch_size: int,
     ) -> None:
         pending: List[ConversionTask] = []
+        current_task: Optional[ConversionTask] = None
         try:
             while True:
                 timeout = self.batch_wait_seconds if pending else None
@@ -249,20 +272,85 @@ class TileConversionScheduler:
                         if pending:
                             self._dispatch_batch(pending, backend)
                         return
+                    current_task = item
                     if self._cancelled.is_set():
                         self._record(item, False, "cancelled", "cancelled_before_dispatch")
+                        current_task = None
                         continue
                     pending.append(item)
+                    current_task = None
                     if len(pending) >= batch_size:
                         self._dispatch_batch(pending, backend)
                         pending = []
                 finally:
                     work_queue.task_done()
         except BaseException as error:  # pragma: no cover - defensive worker guard
-            self._error = error
-            self.logger(f"conversion {backend} worker failed: {error}")
-            for task in pending:
-                self._record(task, False, backend, type(error).__name__)
+            failed_tasks = list(pending)
+            if current_task is not None:
+                failed_tasks.append(current_task)
+            self._set_worker_error(error, backend, failed_tasks)
+
+    def _set_worker_error(
+        self,
+        error: BaseException,
+        worker: str,
+        pending: Sequence[ConversionTask],
+    ) -> None:
+        """Fail and drain the scheduler after a worker exits unexpectedly."""
+
+        with self._results_lock:
+            first_error = self._error is None
+            if first_error:
+                self._error = error
+            cleanup_needed = not self._failure_cleanup_done.is_set()
+            if cleanup_needed:
+                self._failure_cleanup_done.set()
+
+        if not cleanup_needed:
+            return
+
+        self._cancelled.set()
+        self._closed.set()
+        failure_reason = f"{worker}_worker_{type(error).__name__}"
+        for task in pending:
+            self._record(task, False, worker, failure_reason)
+
+        # The classifier may have left tasks in the input queue, and a route
+        # worker may have left tasks in its queue.  Mark every one as failed
+        # and balance task_done() before publishing route close sentinels.
+        self._drain_queue(self._input, "scheduler", failure_reason)
+        self._drain_queue(self._cpu, "cpu", failure_reason)
+        self._drain_queue(self._gpu, "gpu", failure_reason)
+        for work_queue in (self._cpu, self._gpu):
+            try:
+                work_queue.put_nowait(_CLOSE)
+            except queue.Full:
+                # The queue was drained above.  A live worker can only make
+                # progress from here; wait() will apply its bounded grace
+                # period if it does not terminate.
+                pass
+        if first_error:
+            try:
+                self.logger(f"conversion {worker} worker failed: {error}")
+            except BaseException:
+                pass
+
+    def _drain_queue(
+        self,
+        work_queue: queue.Queue[Any],
+        backend: str,
+        reason: str,
+    ) -> None:
+        while True:
+            try:
+                item = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if item is not _CLOSE and isinstance(item, ConversionTask):
+                    self._record(item, False, backend, reason)
+            finally:
+                work_queue.task_done()
 
     def _dispatch_batch(self, tasks: Sequence[ConversionTask], backend: str) -> None:
         if not tasks:
@@ -367,6 +455,8 @@ class TileConversionScheduler:
 
     def _record_result(self, result: ConversionResult) -> None:
         with self._results_lock:
+            if result.task_id in self._results:
+                return
             self._results[result.task_id] = result
         if self.metrics is not None and hasattr(self.metrics, "increment"):
             self.metrics.increment(

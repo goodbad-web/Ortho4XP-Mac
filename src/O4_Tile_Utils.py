@@ -784,14 +784,8 @@ def _conversion_worker_config(tile, effective_gpu):
     }
 
 
-def _build_streaming_gpu_spec(task_id, item, dds_format):
-    """Prepare one direct-cache conversion for the resident ASHelper route.
-
-    The first streaming GPU lane intentionally handles only opaque provider
-    cache inputs without an upscale.  Combined providers, WebP inputs, and
-    upscale backends stay on the existing CPU/legacy paths until their
-    intermediate-image contracts are moved into the JSONL protocol.
-    """
+def _streaming_gpu_source(item):
+    """Return read-only source details for streaming GPU eligibility."""
     tile, til_x_left, til_y_top, zoomlevel, provider_code = item
     if provider_code not in IMG.providers_dict:
         return None
@@ -822,6 +816,40 @@ def _build_streaming_gpu_spec(task_id, item, dds_format):
 
     with Image.open(input_path) as source_image:
         input_size = source_image.size
+
+    return {
+        "tile": tile,
+        "til_x_left": til_x_left,
+        "til_y_top": til_y_top,
+        "zoomlevel": zoomlevel,
+        "provider_code": provider_code,
+        "out_file_name": FNAMES.dds_file_name_from_attributes(
+            til_x_left, til_y_top, zoomlevel, provider_code
+        ),
+        "input_path": input_path,
+        "input_size": input_size,
+    }
+
+
+def _build_streaming_gpu_spec(task_id, item, dds_format):
+    """Prepare one direct-cache conversion for the resident ASHelper route.
+
+    The first streaming GPU lane intentionally handles only opaque provider
+    cache inputs without an upscale.  Combined providers, WebP inputs, and
+    upscale backends stay on the existing CPU/legacy paths until their
+    intermediate-image contracts are moved into the JSONL protocol.
+    """
+    source = _streaming_gpu_source(item)
+    if source is None:
+        return None
+    tile = source["tile"]
+    til_x_left = source["til_x_left"]
+    til_y_top = source["til_y_top"]
+    zoomlevel = source["zoomlevel"]
+    provider_code = source["provider_code"]
+    out_file_name = source["out_file_name"]
+    input_path = source["input_path"]
+    input_size = source["input_size"]
 
     png_file_name = out_file_name.replace("dds", "png")
     mask_path = "none"
@@ -1025,20 +1053,13 @@ class _StreamingConversionRunner:
             return False
         item = task.payload
         try:
-            spec = _build_streaming_gpu_spec(task.task_id, item, self.dds_format)
+            # Eligibility is deliberately read-only.  In particular, do not
+            # call _build_streaming_gpu_spec here: that path may materialize
+            # a mask, which would otherwise be generated and removed again
+            # before the actual GPU dispatch.
+            return _streaming_gpu_source(item) is not None
         except Exception:
             return False
-        # Eligibility must be side-effect free from the scheduler's point of
-        # view. The actual request is rebuilt in _dispatch_gpu; masks produced
-        # by a speculative check are removed immediately.
-        if spec is None:
-            return False
-        for cleanup_path in spec.get("cleanup_paths", ()):
-            try:
-                os.remove(cleanup_path)
-            except OSError:
-                pass
-        return True
 
     def _dispatch_gpu(self, tasks):
         if self.gpu_server is None or self.gpu_server.gpu_disabled:
@@ -1117,9 +1138,12 @@ class _StreamingConversionRunner:
             self.scheduler.close()
         try:
             results = self.scheduler.wait()
-            success = bool(results) and all(result.ok for result in results)
-            if not results:
-                success = True
+            expected = self.scheduler.submitted_count
+            success = (
+                self.scheduler.error is None
+                and len(results) == expected
+                and (expected == 0 or all(result.ok for result in results))
+            )
             return success, results
         finally:
             if self.gpu_server is not None and self._owns_gpu_server:
@@ -1510,15 +1534,16 @@ def _run_metalfx_direct_dds_batch(as_helper, specs, worker_limit=2, chunk_size=8
 
     stats["duration_ms"] = (time.perf_counter() - batch_started) * 1000.0
     fallback_reasons = stats["fallback_reasons"]
-    effective_backend = (
-        "metalfx_spatial"
-        if stats["batch_fallback"] == 0
-        else (
-            "ci_lanczos"
-            if stats["batch_fallback"] == stats["batch_success"]
-            else "mixed"
-        )
-    )
+    if stats["batch_success"] == 0:
+        effective_backend = "failed"
+    elif stats["batch_failed"] > 0:
+        effective_backend = "mixed"
+    elif stats["batch_fallback"] == stats["batch_success"]:
+        effective_backend = "ci_lanczos"
+    elif stats["batch_fallback"] == 0:
+        effective_backend = "metalfx_spatial"
+    else:
+        effective_backend = "mixed"
     UI.vprint(
         1,
         "   MetalFX direct DDS summary: "
@@ -1560,6 +1585,8 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
             "batch_workers": 1,
             "batch_chunks": 0,
             "chunk_size": max(1, int(chunk_size)),
+            "effective_backend": "none",
+            "tensorops_dispatch_observed": False,
             "peak_rss_mb": 0,
             "rss_after_item_mb": 0,
             "temporary_bytes": 0,
@@ -1582,6 +1609,8 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
         "batch_workers": 1,
         "batch_chunks": len(chunks),
         "chunk_size": chunk_size,
+        "effective_backend": "failed",
+        "tensorops_dispatch_observed": False,
         "peak_rss_mb": 0,
         "rss_after_item_mb": 0,
         "temporary_bytes": 0,
@@ -1669,6 +1698,8 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
                     item_rss_mb = 0
                 stats["peak_rss_mb"] = max(stats["peak_rss_mb"], item_rss_mb)
                 stats["rss_after_item_mb"] = item_rss_mb
+                if fields.get("tensorops_dispatch_observed", "").lower() == "true":
+                    stats["tensorops_dispatch_observed"] = True
 
                 temp_path = spec["temporary_path"]
                 valid, dds_error = IMG.validate_dds_file(
@@ -1722,14 +1753,23 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
         UI.vprint(1, f"   TensorOps direct DDS: {completed}/{len(specs)}")
 
     stats["duration_ms"] = (time.perf_counter() - started) * 1000.0
+    if stats["batch_success"] == 0:
+        stats["effective_backend"] = "failed"
+    elif stats["batch_fallback"] == stats["batch_success"]:
+        stats["effective_backend"] = "ci_lanczos"
+    elif stats["batch_fallback"] == 0 and stats["batch_failed"] == 0:
+        stats["effective_backend"] = "tensorops"
+    else:
+        stats["effective_backend"] = "mixed"
     UI.vprint(
         1,
         "   TensorOps direct DDS summary: "
-        f"backend=tensorops effective_backend=tensorops dispatch=direct_dds "
+        f"backend=tensorops effective_backend={stats['effective_backend']} dispatch=direct_dds "
         f"png_intermediate=false batch_tasks={stats['batch_tasks']} "
         f"batch_success={stats['batch_success']} batch_fallback={stats['batch_fallback']} "
         f"batch_failed={stats['batch_failed']} batch_workers=1 "
         f"batch_chunks={stats['batch_chunks']} chunk_size={stats['chunk_size']} "
+        f"tensorops_dispatch_observed={str(stats['tensorops_dispatch_observed']).lower()} "
         f"peak_rss_mb={stats['peak_rss_mb']} rss_after_item_mb={stats['rss_after_item_mb']} "
         f"temporary_bytes={stats['temporary_bytes']} signal={stats['signal'] or 0} "
         f"duration_ms={stats['duration_ms']:.2f}"

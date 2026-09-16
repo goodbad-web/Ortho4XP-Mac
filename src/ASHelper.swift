@@ -2488,8 +2488,20 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
         let reasonSummary = fallbackReasons.keys.sorted().map {
             "\($0):\(fallbackReasons[$0] ?? 0)"
         }.joined(separator: ",")
+        let effectiveBackend: String
+        if successCount == 0 {
+            effectiveBackend = "failed"
+        } else if failedCount > 0 {
+            effectiveBackend = "mixed"
+        } else if fallbackCount == successCount {
+            effectiveBackend = "ci_lanczos"
+        } else if fallbackCount == 0 {
+            effectiveBackend = "tensorops"
+        } else {
+            effectiveBackend = "mixed"
+        }
         print(
-            "backend=tensorops effective_backend=tensorops dispatch=direct_dds "
+            "backend=tensorops effective_backend=\(effectiveBackend) dispatch=direct_dds "
                 + "png_intermediate=false batch_tasks=\(request.items.count) "
                 + "batch_success=\(successCount) batch_fallback=\(fallbackCount) "
                 + "batch_failed=\(failedCount) batch_workers=1 batch_chunks=1 chunk_size=\(request.items.count) "
@@ -4329,24 +4341,25 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
         return [serverTaskResult("batch", success: false, backend: "server", error: "tasks_required")]
     }
 
+    // Keep one resident helper memory-bounded.  A request is already the
+    // scheduler's GPU batch, so launching every item concurrently would keep
+    // multiple decoded images, CI graphs, mip buffers, and BC payloads alive
+    // at once.  Process items serially and let the caller batch at the process
+    // boundary when it needs a stronger reclamation point.
     var results = Array(repeating: [String: Any](), count: tasks.count)
-    let resultLock = NSLock()
-    DispatchQueue.concurrentPerform(iterations: tasks.count) { index in
-        let task = tasks[index]
+    for (index, task) in tasks.enumerated() {
         let taskID = serverTaskID(task, index: index)
         guard let input = serverString(task, "input"),
               let output = serverString(task, "output"),
               let format = serverString(task, "format"),
               format == "BC1" || format == "BC3" else {
-            resultLock.lock()
             results[index] = serverTaskResult(
                 taskID,
                 success: false,
                 backend: "server",
                 error: "invalid_task"
             )
-            resultLock.unlock()
-            return
+            continue
         }
 
         let ok = convertWithPreprocess(
@@ -4362,14 +4375,12 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
             format: format,
             useGPU: useGPU
         )
-        resultLock.lock()
         results[index] = serverTaskResult(
             taskID,
             success: ok,
             backend: useGPU ? "metal" : "cpu",
             error: ok ? nil : "conversion_failed"
         )
-        resultLock.unlock()
     }
     return results
 }

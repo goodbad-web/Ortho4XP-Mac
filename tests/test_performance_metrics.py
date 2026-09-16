@@ -35,4 +35,3 @@ def test_metrics_write_atomic_schema_and_attempts(tmp_path):
     assert payload["attempts"][0]["counters"]["textures_downloaded"] == 3
     assert payload["attempts"][0]["queue"]["conversion"]["max_size"] == 2
     assert payload["attempts"][0]["batches"]["cpu"]["items"] == 3
-

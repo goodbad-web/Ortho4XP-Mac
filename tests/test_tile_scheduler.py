@@ -99,3 +99,30 @@ def test_cancel_marks_queued_work_and_returns():
     assert by_id["second"].backend == "cancelled"
     assert not by_id["second"].ok
 
+
+def test_worker_failure_drains_accepted_work_without_hanging():
+    def gpu_eligible(task):
+        if task.task_id == "boom":
+            raise RuntimeError("eligibility failure")
+        return True
+
+    scheduler = TileConversionScheduler(
+        dispatch_cpu=lambda tasks: True,
+        dispatch_gpu=lambda tasks: True,
+        gpu_eligible=gpu_eligible,
+        queue_size=4,
+        batch_wait_ms=0,
+    )
+    for task_id in ("boom", "queued-1", "queued-2"):
+        assert scheduler.submit(ConversionTask(task_id, ()))
+
+    results = scheduler.wait(timeout=2)
+
+    assert scheduler.error is not None
+    assert scheduler.submitted_count == 3
+    assert {result.task_id for result in results} == {
+        "boom",
+        "queued-1",
+        "queued-2",
+    }
+    assert all(not result.ok for result in results)
