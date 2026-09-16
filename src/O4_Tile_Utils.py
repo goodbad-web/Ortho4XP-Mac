@@ -39,6 +39,7 @@ skip_converts = False
 enable_streaming_conversion = False
 conversion_queue_size = 0
 gpu_batch_size = 0
+gpu_dds_workers = 8
 gpu_batch_wait_ms = 50
 enable_parallel_overlay = False
 max_parallel_tiles = 1
@@ -57,6 +58,158 @@ _AUTO_REDUCE_SETTING_NAMES = (
     "limit_tris",
 )
 _ASHELPER_CAPABILITY_CACHE = {}
+
+# TensorOps keeps several FP16 activation/output buffers resident until the
+# command buffer completes.  The estimate below intentionally models the
+# fixed FP8SR graph rather than relying on the source JPEG size.  It is used
+# only for scheduling; ASHelper remains the authority for validating the
+# actual model pack and tile geometry.
+TENSOROPS_MEMORY_FRACTION = 0.70
+TENSOROPS_MAX_WORKERS = 4
+TENSOROPS_FIXED_RESERVE_BYTES = 256 * 1024 * 1024
+TENSOROPS_ESTIMATE_SAFETY_FACTOR = 1.35
+TENSOROPS_MAX_TILE_DIMENSION = 2050
+
+
+def _tensorops_estimated_working_set_bytes(spec):
+    """Estimate one TensorOps child peak for a direct-DDS item.
+
+    The current FP8SR contract has K values 32, 320, 320 and three 32-channel
+    layer outputs.  A 2048px tile therefore dominates the estimate even when
+    the source JPEG is small.  The safety factor covers Metal allocator and
+    readback overhead observed in the real helper process.
+    """
+
+    try:
+        width, height = (int(value) for value in spec.get("input_size", (0, 0)))
+    except (AttributeError, TypeError, ValueError):
+        width, height = 0, 0
+    if width <= 0 or height <= 0:
+        return TENSOROPS_FIXED_RESERVE_BYTES
+
+    tile_width = min(width, TENSOROPS_MAX_TILE_DIMENSION)
+    tile_height = min(height, TENSOROPS_MAX_TILE_DIMENSION)
+    tile_pixels = tile_width * tile_height
+    # FP16 activations: (32 + 320 + 320) values per pixel.  The three layer
+    # outputs add 3 * 32 values per pixel.  Input RGBA and the final RGBA
+    # output are retained for the duration of a tiled request.  Include the
+    # temporary compressed DDS payload as well; it is written before the
+    # parent atomically publishes the final path.
+    graph_bytes = tile_pixels * 2 * (32 + 320 + 320 + (3 * 32))
+    full_frame_bytes = width * height * (4 + 16)
+    dds_bytes = _tensorops_estimated_dds_bytes(spec)
+    estimated = (
+        graph_bytes + full_frame_bytes + dds_bytes
+    ) * TENSOROPS_ESTIMATE_SAFETY_FACTOR
+    return int(estimated + TENSOROPS_FIXED_RESERVE_BYTES)
+
+
+def _tensorops_estimated_dds_bytes(spec):
+    """Estimate one temporary DDS payload including its complete mip chain."""
+
+    try:
+        width, height = (int(value) for value in spec.get("input_size", (0, 0)))
+        output_width = width * 2
+        output_height = height * 2
+        target_format = str(spec.get("target_format", "BC3")).upper()
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    if output_width <= 0 or output_height <= 0:
+        return 0
+    block_bytes = 8 if target_format == "BC1" else 16
+    payload_bytes = 0
+    level_width = output_width
+    level_height = output_height
+    while True:
+        payload_bytes += (
+            max(1, (level_width + 3) // 4)
+            * max(1, (level_height + 3) // 4)
+            * block_bytes
+        )
+        if level_width == 1 and level_height == 1:
+            break
+        level_width = max(1, level_width // 2)
+        level_height = max(1, level_height // 2)
+    # BC7 uses the optional DX10 extension header. ASHelper currently accepts
+    # BC1/BC3, but keeping the estimate format-aware makes the planner safe
+    # for a future direct-DDS converter as well.
+    header_bytes = 128 + (20 if target_format == "BC7" else 0)
+    return header_bytes + payload_bytes
+
+
+def _tensorops_memory_plan(specs, max_workers=None, chunk_size=8):
+    """Return a conservative worker plan for TensorOps direct-DDS work."""
+
+    chunk_size = max(1, int(chunk_size))
+    chunk_count = (len(specs) + chunk_size - 1) // chunk_size if specs else 0
+    if not specs:
+        return {
+            "can_run": False,
+            "workers": 0,
+            "chunk_count": 0,
+            "memory_budget_mb": 0,
+            "parent_rss_mb": 0,
+            "estimated_worker_mb": 0,
+            "estimated_total_mb": 0,
+            "reason": "empty",
+        }
+
+    requested = max_convert_slots if max_workers is None else max_workers
+    try:
+        requested = max(1, int(requested))
+    except (TypeError, ValueError):
+        requested = 1
+    requested = min(TENSOROPS_MAX_WORKERS, requested, chunk_count)
+    def input_max_dimension(spec):
+        try:
+            return max(int(value) for value in spec.get("input_size", (0, 0)))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    large_input = any(input_max_dimension(spec) >= 2048 for spec in specs)
+    if large_input:
+        # A 2048px input already occupies the large tiled working set.  Keep
+        # it in one child even on high-memory hosts; MetalFX remains the
+        # explicit retry path when the serialized TensorOps child fails.
+        requested = min(requested, 1)
+    estimated_worker_bytes = max(
+        _tensorops_estimated_working_set_bytes(spec) for spec in specs
+    )
+    physical_bytes = int(PERF.physical_memory_bytes() or 0)
+    parent_rss_bytes = int(PERF.peak_rss_bytes() or 0)
+    if physical_bytes <= 0:
+        # A host without a readable physical-memory value cannot be safely
+        # auto-sized.  Keep the historical single-child behavior instead of
+        # guessing a larger parallelism.
+        workers = 1
+        reason = "physical_memory_unavailable"
+        budget_bytes = 0
+    else:
+        budget_bytes = int(physical_bytes * TENSOROPS_MEMORY_FRACTION)
+        available_bytes = budget_bytes - parent_rss_bytes - TENSOROPS_FIXED_RESERVE_BYTES
+        workers = min(
+            requested,
+            max(0, available_bytes // max(1, estimated_worker_bytes)),
+        )
+        if workers <= 0:
+            reason = "memory_budget_exceeded"
+        elif large_input:
+            reason = "large_input_serialized"
+        else:
+            reason = "ok"
+
+    return {
+        "can_run": workers > 0,
+        "workers": int(workers),
+        "chunk_count": chunk_count,
+        "memory_budget_mb": int(budget_bytes / (1024 * 1024)),
+        "parent_rss_mb": int(parent_rss_bytes / (1024 * 1024)),
+        "estimated_worker_mb": int(estimated_worker_bytes / (1024 * 1024)),
+        "estimated_total_mb": int(
+            estimated_worker_bytes * workers / (1024 * 1024)
+        ),
+        "reason": reason,
+    }
 
 
 def _is_generated_dds_name(name):
@@ -704,16 +857,13 @@ def _start_ashelper_jsonl_server(tile, metrics=None):
     use_gpu = bool(
         getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
     )
-    streaming_requested = bool(
-        getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
-    )
     dds_converter = getattr(
         tile, "dds_converter", getattr(UI, "dds_converter", "nvcompress")
     )
     wants_server = bool(
         use_gpu
         and (
-            (streaming_requested and dds_converter == "TextureConverter")
+            dds_converter == "TextureConverter"
             or getattr(tile, "use_gpu_for_masks", False)
             or getattr(tile, "use_gpu_for_dem_smoothing", False)
         )
@@ -1181,13 +1331,24 @@ def _activate_dsf(dsf_tmp_path, dsf_path):
         raise
 
 
-def _sync_terrain_load_centers(tile):
-    """Synchronize generated terrain metadata with the final DDS headers."""
+def _sync_terrain_load_centers(tile, validated_dimensions=None):
+    """Synchronize generated terrain metadata with the final DDS headers.
+
+    ``validated_dimensions`` is populated only by the current build after a
+    DDS has passed the complete validator. Any other DDS still takes the
+    historical header-reading path, so an untrusted existing file cannot
+    bypass validation.
+    """
     terrain_dir = os.path.join(tile.build_dir, "terrain")
     if not os.path.isdir(terrain_dir):
         raise FileNotFoundError(terrain_dir)
 
+    validated_dimensions = validated_dimensions or {}
     staged = []
+    synchronized_count = 0
+    unchanged_count = 0
+    rewritten_count = 0
+    dimension_cache_hits = 0
     try:
         for dir_path, _, names in os.walk(terrain_dir):
             for name in names:
@@ -1218,12 +1379,21 @@ def _sync_terrain_load_centers(tile):
                 dds_path = os.path.normpath(
                     os.path.join(os.path.dirname(terrain_path), base_texture)
                 )
-                width, height = IMG.read_dds_dimensions(dds_path)
+                cached_dimensions = validated_dimensions.get(os.path.abspath(dds_path))
+                if cached_dimensions is not None:
+                    width, height = cached_dimensions
+                    dimension_cache_hits += 1
+                else:
+                    width, height = IMG.read_dds_dimensions(dds_path)
                 tokens = lines[load_center_index].split()
                 if len(tokens) != 5:
                     raise ValueError(
                         f"Invalid LOAD_CENTER in generated terrain: {terrain_path}"
                     )
+                synchronized_count += 1
+                if tokens[-1] == str(width):
+                    unchanged_count += 1
+                    continue
                 tokens[-1] = str(width)
                 lines[load_center_index] = " ".join(tokens) + "\n"
 
@@ -1233,6 +1403,7 @@ def _sync_terrain_load_centers(tile):
                     stream.flush()
                     os.fsync(stream.fileno())
                 staged.append((temporary_path, terrain_path))
+                rewritten_count += 1
 
         for temporary_path, terrain_path in staged:
             os.replace(temporary_path, terrain_path)
@@ -1244,7 +1415,13 @@ def _sync_terrain_load_centers(tile):
                 pass
         raise
 
-    return len(staged)
+    tile._terrain_load_center_stats = {
+        "files": synchronized_count,
+        "unchanged": unchanged_count,
+        "rewritten": rewritten_count,
+        "dimension_cache_hits": dimension_cache_hits,
+    }
+    return synchronized_count
 
 
 def _resolve_gpu_batch_mask(tile, til_x_left, til_y_top, zoomlevel, provider_code, png_file_name):
@@ -1579,16 +1756,23 @@ def _build_tensorops_direct_dds_spec(item, dds_format):
     return spec
 
 
-def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
-    """Run TensorOps in one child per bounded chunk and publish valid DDS atomically."""
+def _run_tensorops_direct_dds_batch(
+    as_helper,
+    pack_path,
+    specs,
+    chunk_size=8,
+    worker_limit=1,
+):
+    """Run bounded TensorOps children and publish valid DDS files atomically."""
     if not specs:
         return {
             "failed_items": [],
+            "failed_specs": [],
             "batch_tasks": 0,
             "batch_success": 0,
             "batch_fallback": 0,
             "batch_failed": 0,
-            "batch_workers": 1,
+            "batch_workers": 0,
             "batch_chunks": 0,
             "chunk_size": max(1, int(chunk_size)),
             "effective_backend": "none",
@@ -1600,23 +1784,31 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
             "fallback_reasons": {},
         }
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     chunk_size = max(1, int(chunk_size))
     chunks = [
         specs[index : index + chunk_size]
         for index in range(0, len(specs), chunk_size)
     ]
+    try:
+        batch_workers = min(4, max(1, int(worker_limit)), len(chunks))
+    except (TypeError, ValueError):
+        batch_workers = 1
     started = time.perf_counter()
     stats = {
         "failed_items": [],
+        "failed_specs": [],
         "batch_tasks": len(specs),
         "batch_success": 0,
         "batch_fallback": 0,
         "batch_failed": 0,
-        "batch_workers": 1,
+        "batch_workers": batch_workers,
         "batch_chunks": len(chunks),
         "chunk_size": chunk_size,
         "effective_backend": "failed",
         "tensorops_dispatch_observed": False,
+        "neural_accelerator_confirmed": False,
         "peak_rss_mb": 0,
         "rss_after_item_mb": 0,
         "temporary_bytes": 0,
@@ -1631,16 +1823,18 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
         )
 
     def mark_failed(spec, reason):
-        stats["batch_failed"] += 1
-        stats["failed_items"].append(spec["item"])
-        record_reason(reason)
+        if spec["item"] not in stats["failed_items"]:
+            stats["batch_failed"] += 1
+            stats["failed_items"].append(spec["item"])
+            stats["failed_specs"].append(spec)
+            record_reason(reason)
         try:
             os.remove(spec["temporary_path"])
         except OSError:
             pass
 
-    os.makedirs(os.path.join(UI.Ortho4XP_dir, "tmp"), exist_ok=True)
-    for chunk_index, chunk in enumerate(chunks, start=1):
+    def run_chunk(chunk):
+        os.makedirs(os.path.join(UI.Ortho4XP_dir, "tmp"), exist_ok=True)
         request_fd, request_path = tempfile.mkstemp(
             prefix=".tensorops-dds-",
             suffix=".json",
@@ -1649,114 +1843,135 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
         request = {
             "version": 1,
             "pack": pack_path,
+            "fallback_to_ci": False,
             "items": [spec["request"] for spec in chunk],
         }
         try:
             with os.fdopen(request_fd, "w", encoding="utf-8") as stream:
+                request_fd = None
                 json.dump(request, stream, separators=(",", ":"))
-            try:
-                result = subprocess.run(
-                    [as_helper, "--tensorops-dds-batch", request_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                )
-                output = result.stdout or ""
-            except Exception as error:
-                result = None
-                output = ""
-                reason = f"ashelper_exception:{type(error).__name__}"
-                for spec in chunk:
-                    mark_failed(spec, reason)
-                UI.vprint(1, f"   TensorOps direct DDS: chunk {chunk_index}/{len(chunks)} failed ({reason})")
-                continue
-
-            output_lines = output.splitlines()
-            item_lines = [
-                line for line in output_lines
-                if line.startswith("tensorops_dds_item=")
-            ]
-            output_level = 0 if result.returncode != 0 else 2
-            for line in output_lines:
-                UI.vprint(output_level, "      " + line)
-
-            signal_reason = (
-                f"process_signal_{abs(result.returncode)}"
-                if result.returncode < 0
-                else None
+            result = subprocess.run(
+                [as_helper, "--tensorops-dds-batch", request_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
             )
-            if signal_reason:
-                stats["signal"] = abs(result.returncode)
-                record_reason(signal_reason)
-
-            for index, spec in enumerate(chunk):
-                fields = {}
-                if index < len(item_lines):
-                    fields = dict(
-                        field.split("=", 1)
-                        for field in item_lines[index].split()
-                        if "=" in field
-                    )
-                try:
-                    item_rss_mb = int(float(fields.get("rss_mb", 0) or 0))
-                except (TypeError, ValueError):
-                    item_rss_mb = 0
-                stats["peak_rss_mb"] = max(stats["peak_rss_mb"], item_rss_mb)
-                stats["rss_after_item_mb"] = item_rss_mb
-                if fields.get("tensorops_dispatch_observed", "").lower() == "true":
-                    stats["tensorops_dispatch_observed"] = True
-
-                temp_path = spec["temporary_path"]
-                valid, dds_error = IMG.validate_dds_file(
-                    temp_path,
-                    expected_format=spec["target_format"],
-                    expected_dimensions=(
-                        spec["input_size"][0] * 2,
-                        spec["input_size"][1] * 2,
-                    ),
-                    require_mipmaps=True,
-                )
-                if not valid:
-                    reason = (
-                        fields.get("fallback_reason")
-                        or ("process_signal_9" if result.returncode == -9 else None)
-                        or (f"ashelper_exit_{result.returncode}" if result.returncode else None)
-                        or dds_error
-                        or "direct_dds_invalid"
-                    )
-                    mark_failed(spec, reason)
-                    continue
-
-                try:
-                    output_bytes = os.path.getsize(temp_path)
-                    os.replace(temp_path, spec["final_path"])
-                except (OSError, ValueError) as error:
-                    mark_failed(spec, f"atomic_publish:{type(error).__name__}")
-                    continue
-
-                stats["batch_success"] += 1
-                stats["temporary_bytes"] += output_bytes
-                if fields.get("effective_backend") == "ci_lanczos":
-                    stats["batch_fallback"] += 1
-                    if fields.get("fallback_reason"):
-                        record_reason(fields["fallback_reason"])
-
-            if result.returncode < 0:
-                for spec in chunk[len(item_lines):]:
-                    if spec["item"] not in stats["failed_items"]:
-                        mark_failed(spec, signal_reason or f"process_signal_{abs(result.returncode)}")
+            return chunk, result, None
+        except Exception as error:
+            return chunk, None, error
         finally:
-            try:
-                os.close(request_fd)
-            except OSError:
-                pass
+            if request_fd is not None:
+                try:
+                    os.close(request_fd)
+                except OSError:
+                    pass
             try:
                 os.remove(request_path)
             except OSError:
                 pass
-        completed = min(chunk_index * chunk_size, len(specs))
-        UI.vprint(1, f"   TensorOps direct DDS: {completed}/{len(specs)}")
+
+    def process_chunk(chunk, result, error):
+        if error is not None:
+            reason = f"ashelper_exception:{type(error).__name__}"
+            for spec in chunk:
+                mark_failed(spec, reason)
+            return reason
+
+        output = result.stdout or ""
+        output_lines = output.splitlines()
+        item_lines = [
+            line for line in output_lines
+            if line.startswith("tensorops_dds_item=")
+        ]
+        output_level = 0 if result.returncode != 0 else 2
+        for line in output_lines:
+            UI.vprint(output_level, "      " + line)
+
+        signal_reason = (
+            f"process_signal_{abs(result.returncode)}"
+            if result.returncode < 0
+            else None
+        )
+        if signal_reason:
+            stats["signal"] = abs(result.returncode)
+
+        for index, spec in enumerate(chunk):
+            fields = {}
+            if index < len(item_lines):
+                fields = dict(
+                    field.split("=", 1)
+                    for field in item_lines[index].split()
+                    if "=" in field
+                )
+            try:
+                item_rss_mb = int(float(fields.get("rss_mb", 0) or 0))
+            except (TypeError, ValueError):
+                item_rss_mb = 0
+            stats["peak_rss_mb"] = max(stats["peak_rss_mb"], item_rss_mb)
+            stats["rss_after_item_mb"] = item_rss_mb
+            if fields.get("tensorops_dispatch_observed", "").lower() == "true":
+                stats["tensorops_dispatch_observed"] = True
+            if fields.get("neural_accelerator_confirmed", "").lower() == "true":
+                stats["neural_accelerator_confirmed"] = True
+
+            temp_path = spec["temporary_path"]
+            valid, dds_error = IMG.validate_dds_file(
+                temp_path,
+                expected_format=spec["target_format"],
+                expected_dimensions=(
+                    spec["input_size"][0] * 2,
+                    spec["input_size"][1] * 2,
+                ),
+                require_mipmaps=True,
+            )
+            if not valid:
+                reason = (
+                    fields.get("fallback_reason")
+                    or signal_reason
+                    or (f"ashelper_exit_{result.returncode}" if result.returncode else None)
+                    or dds_error
+                    or "direct_dds_invalid"
+                )
+                mark_failed(spec, reason)
+                continue
+
+            try:
+                output_bytes = os.path.getsize(temp_path)
+                os.replace(temp_path, spec["final_path"])
+            except (OSError, ValueError) as publish_error:
+                mark_failed(spec, f"atomic_publish:{type(publish_error).__name__}")
+                continue
+
+            stats["batch_success"] += 1
+            stats["temporary_bytes"] += output_bytes
+            if fields.get("effective_backend") == "ci_lanczos":
+                stats["batch_fallback"] += 1
+                if fields.get("fallback_reason"):
+                    record_reason(fields["fallback_reason"])
+
+        if result.returncode < 0:
+            for spec in chunk[len(item_lines):]:
+                mark_failed(spec, signal_reason or f"process_signal_{abs(result.returncode)}")
+        return signal_reason
+
+    os.makedirs(os.path.join(UI.Ortho4XP_dir, "tmp"), exist_ok=True)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+        futures = {executor.submit(run_chunk, chunk): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            chunk = futures[future]
+            try:
+                completed_chunk, result, error = future.result()
+            except Exception as error:
+                completed_chunk, result = chunk, None
+            reason = process_chunk(completed_chunk, result, error)
+            completed += len(completed_chunk)
+            suffix = f" failed ({reason})" if reason and result is None else ""
+            UI.vprint(
+                1,
+                f"   TensorOps direct DDS: {completed}/{len(specs)}{suffix}",
+            )
 
     stats["duration_ms"] = (time.perf_counter() - started) * 1000.0
     if stats["batch_success"] == 0:
@@ -1775,9 +1990,10 @@ def _run_tensorops_direct_dds_batch(as_helper, pack_path, specs, chunk_size=8):
         f"backend=tensorops effective_backend={stats['effective_backend']} dispatch=direct_dds "
         f"png_intermediate=false batch_tasks={stats['batch_tasks']} "
         f"batch_success={stats['batch_success']} batch_fallback={stats['batch_fallback']} "
-        f"batch_failed={stats['batch_failed']} batch_workers=1 "
+        f"batch_failed={stats['batch_failed']} batch_workers={stats['batch_workers']} "
         f"batch_chunks={stats['batch_chunks']} chunk_size={stats['chunk_size']} "
         f"tensorops_dispatch_observed={str(stats['tensorops_dispatch_observed']).lower()} "
+        f"neural_accelerator_confirmed={str(stats['neural_accelerator_confirmed']).lower()} "
         f"peak_rss_mb={stats['peak_rss_mb']} rss_after_item_mb={stats['rss_after_item_mb']} "
         f"temporary_bytes={stats['temporary_bytes']} signal={stats['signal'] or 0} "
         f"duration_ms={stats['duration_ms']:.2f}"
@@ -1974,6 +2190,9 @@ def _build_tile(tile, persist_config=True):
         return 0
 
     timer = time.time()
+    # Only dimensions from DDS files validated in this invocation are cached.
+    # This local map is intentionally not persisted on the Tile object.
+    validated_dds_dimensions = {}
 
     if persist_config and not tile.write_to_config():
         UI.exit_message_and_bottom_line("ERROR: Could not save tile configuration.")
@@ -2213,8 +2432,6 @@ def _build_tile(tile, persist_config=True):
 
             def can_defer_to_tensorops_batch(item):
                 item_tile, item_x, item_y, item_zoomlevel, provider_code = item
-                if int(item_zoomlevel) >= 18:
-                    return False
                 if not IMG.should_upscale_texture(
                     item_tile, item_x, item_y, item_zoomlevel, provider_code
                 ):
@@ -2396,9 +2613,11 @@ def _build_tile(tile, persist_config=True):
                 else convert_list
             )
 
-            # TensorOps direct DDS work is split into one child process per
-            # bounded chunk. The child exit is a hard memory-reclaim boundary;
-            # successful chunks remain published when a later chunk fails.
+            # TensorOps direct DDS work is split into bounded child processes.
+            # The child exit is a hard memory-reclaim boundary; successful
+            # chunks remain published when a later chunk fails.  TensorOps is
+            # only allowed to use the number of children that fits inside the
+            # memory plan, while a failed item gets a MetalFX retry before CI.
             if conversion_success and defer_tensorops_batch:
                 UI.vprint(
                     1,
@@ -2408,6 +2627,7 @@ def _build_tile(tile, persist_config=True):
                 tensorops_direct_specs = []
                 tensorops_direct_failed = []
                 tensorops_direct_cleanup = []
+                tensorops_direct_failed_specs = []
                 try:
                     for item in tensorops_batch_items:
                         spec = _build_tensorops_direct_dds_spec(item, dds_format)
@@ -2428,21 +2648,124 @@ def _build_tile(tile, persist_config=True):
                     tensorops_direct_specs = []
                     tensorops_direct_failed = list(tensorops_batch_items)
 
-                batch_result = _run_tensorops_direct_dds_batch(
-                    as_helper,
-                    tensorops_model_path,
+                memory_plan = _tensorops_memory_plan(
                     tensorops_direct_specs,
+                    max_workers=max_convert_slots,
                     chunk_size=8,
                 )
-                tensorops_direct_failed.extend(batch_result["failed_items"])
+                UI.vprint(
+                    1,
+                    "   TensorOps memory plan: "
+                    f"reason={memory_plan['reason']} "
+                    f"memory_budget_mb={memory_plan['memory_budget_mb']} "
+                    f"parent_rss_mb={memory_plan['parent_rss_mb']} "
+                    f"estimated_worker_mb={memory_plan['estimated_worker_mb']} "
+                    f"estimated_total_mb={memory_plan['estimated_total_mb']} "
+                    f"batch_workers={memory_plan['workers']}",
+                )
+                if tensorops_direct_specs and memory_plan["can_run"]:
+                    batch_result = _run_tensorops_direct_dds_batch(
+                        as_helper,
+                        tensorops_model_path,
+                        tensorops_direct_specs,
+                        chunk_size=8,
+                        worker_limit=memory_plan["workers"],
+                    )
+                    tensorops_direct_failed_specs = list(
+                        batch_result.get("failed_specs", [])
+                    )
+                    tensorops_direct_failed = list(batch_result["failed_items"])
+                elif tensorops_direct_specs:
+                    tensorops_direct_failed_specs = list(tensorops_direct_specs)
+                    tensorops_direct_failed = [
+                        spec["item"] for spec in tensorops_direct_failed_specs
+                    ]
+                    batch_result = {
+                        "batch_success": 0,
+                        "failed_items": tensorops_direct_failed,
+                        "failed_specs": tensorops_direct_failed_specs,
+                        "batch_fallback": 0,
+                        "batch_failed": len(tensorops_direct_failed),
+                        "batch_workers": 0,
+                        "batch_chunks": memory_plan["chunk_count"],
+                        "effective_backend": "memory_budget_exceeded",
+                    }
+                else:
+                    batch_result = {
+                        "batch_success": 0,
+                        "failed_items": list(tensorops_direct_failed),
+                        "failed_specs": [],
+                        "batch_fallback": 0,
+                        "batch_failed": len(tensorops_direct_failed),
+                        "batch_workers": 0,
+                        "batch_chunks": 0,
+                        "effective_backend": "preparation_failed",
+                    }
+
+                # Reuse the prepared opaque-DDS specs for the MetalFX retry so
+                # the failed TensorOps item is re-read from its original JPEG.
+                # A preparation failure has no reusable spec, so try to build
+                # one and leave only the items that still fail for CI.
+                metalfx_retry_specs = list(tensorops_direct_failed_specs)
+                tensorops_items_without_spec = [
+                    item for item in tensorops_direct_failed
+                    if not any(spec["item"] == item for spec in metalfx_retry_specs)
+                ]
+                tensorops_fallback_unprepared = []
+                for item in tensorops_items_without_spec:
+                    try:
+                        spec = _build_metalfx_direct_dds_spec(item, dds_format)
+                    except Exception as error:
+                        UI.vprint(
+                            1,
+                            "WARNING: TensorOps fallback preparation failed: "
+                            f"{error}",
+                        )
+                        tensorops_fallback_unprepared.append(item)
+                        continue
+                    metalfx_retry_specs.append(spec)
+                    tensorops_direct_cleanup.extend(spec["cleanup_paths"])
+
+                remaining_specs = []
+                if metalfx_retry_specs and metalfx_available:
+                    UI.vprint(
+                        1,
+                        "   TensorOps fallback: retrying failed items with "
+                        f"MetalFX ({len(metalfx_retry_specs)} images)...",
+                    )
+                    metalfx_result = _run_metalfx_direct_dds_batch(
+                        as_helper,
+                        metalfx_retry_specs,
+                        worker_limit=2,
+                        chunk_size=8,
+                    )
+                    failed_items = list(metalfx_result["failed_items"])
+                    remaining_specs = [
+                        spec for spec in metalfx_retry_specs
+                        if spec["item"] in failed_items
+                    ]
+                    tensorops_direct_failed = tensorops_fallback_unprepared + [
+                        spec["item"] for spec in remaining_specs
+                    ]
+                    metalfx_success_count = (
+                        len(metalfx_retry_specs) - len(remaining_specs)
+                    )
+                else:
+                    remaining_specs = list(metalfx_retry_specs)
+                    tensorops_direct_failed = tensorops_fallback_unprepared + [
+                        spec["item"] for spec in remaining_specs
+                    ]
+                    metalfx_success_count = 0
+
                 fallback_success = True
-                if tensorops_direct_failed:
+                cpu_fallback_items = list(tensorops_direct_failed)
+                if cpu_fallback_items:
                     fallback_config = dict(config_data)
                     fallback_config["upscale_backend"] = "ci_lanczos"
                     fallback_config["defer_fp8_batch"] = False
                     fallback_config["defer_gpu_batch"] = False
                     fallback_success = _run_cpu_fallback(
-                        tensorops_direct_failed,
+                        cpu_fallback_items,
                         fallback_config,
                         2,
                         {
@@ -2452,9 +2775,11 @@ def _build_tile(tile, persist_config=True):
                         },
                     )
                 success_count += batch_result["batch_success"]
-                success_count += len(tensorops_direct_failed) if fallback_success else 0
+                success_count += metalfx_success_count
+                success_count += len(cpu_fallback_items) if fallback_success else 0
                 conversion_success = bool(
-                    fallback_success and success_count == len(convert_list)
+                    (not cpu_fallback_items or fallback_success)
+                    and success_count == len(convert_list)
                 )
                 defer_gpu_batch = False
                 defer_tensorops_batch = False
@@ -2469,6 +2794,7 @@ def _build_tile(tile, persist_config=True):
                 import O4_RAMDisk_Utils
                 UI.vprint(1, "-> Executing ultra-fast GPU Batch DDS Conversion via ASHelper...")
                 batch_args = []
+                batch_requests = []
                 temp_files_to_delete = []
                 batch_generated_mask_files = []
                 prepared_input_paths = [None] * len(batch_convert_list)
@@ -2663,6 +2989,21 @@ def _build_tile(tile, persist_config=True):
                         batch_tmp_path,
                         target_fmt
                     ])
+                    batch_requests.append(
+                        {
+                            "id": f"dds-{item_index + 1}",
+                            "input": input_path,
+                            "mask": mask_path,
+                            "r": r,
+                            "g": g,
+                            "b": b,
+                            "contrast": contrast,
+                            "brightness": brightness,
+                            "saturation": saturation,
+                            "output": batch_tmp_path,
+                            "format": target_fmt,
+                        }
+                    )
                     batch_output_specs.append(
                         (batch_tmp_path, out_file_path, target_fmt, input_path)
                     )
@@ -2670,33 +3011,214 @@ def _build_tile(tile, persist_config=True):
                 if conversion_success and batch_args:
                     batch_attempted = True
                     chunk_size = 64
-                    for i in range(0, len(batch_args), chunk_size * 10):
-                        chunk = batch_args[i:i + chunk_size * 10]
-                        cmd = [as_helper, "--convert-batch-v3", "true"] + chunk
-                        try:
-                            batch_result = subprocess.run(
-                                cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True,
-                                check=False,
-                            )
-                            ret = batch_result.returncode
-                            if batch_result.stdout:
-                                output_level = 0 if ret != 0 else 2
-                                for line in batch_result.stdout.splitlines():
-                                    UI.vprint(output_level, "      " + line)
-                            if ret != 0:
-                                UI.vprint(1, f"ERROR: GPU Batch DDS conversion failed with return code {ret}")
+                    batch_started = time.perf_counter()
+                    server = getattr(tile, "_ashelper_jsonl_server", None)
+                    server_failed = bool(server is not None and server.gpu_disabled)
+                    server_used = bool(
+                        server is not None
+                        and not server_failed
+                        and metal_available
+                    )
+                    if server_failed:
+                        # A resident helper that already failed is not retried
+                        # through another GPU entry point. The existing CPU
+                        # fallback below will reprocess the original inputs.
+                        conversion_success = False
+                    gpu_worker_count = max(
+                        1,
+                        min(
+                            12,
+                            int(
+                                getattr(
+                                    tile,
+                                    "gpu_dds_workers",
+                                    gpu_dds_workers,
+                                )
+                                or 8
+                            ),
+                        ),
+                    )
+                    gpu_backend_counts = {"metal": 0, "cpu": 0, "unknown": 0}
+                    gpu_telemetry = {
+                        "decode_ms": 0.0,
+                        "preprocess_ms": 0.0,
+                        "compression_ms": 0.0,
+                        "write_ms": 0.0,
+                        "total_ms": 0.0,
+                        "peak_rss_mb": 0.0,
+                    }
+                    if server_failed:
+                        UI.vprint(
+                            1,
+                            "WARNING: Resident ASHelper is disabled; using CPU DDS fallback.",
+                        )
+                    elif server_used:
+                        for start in range(0, len(batch_requests), chunk_size):
+                            request_chunk = batch_requests[start : start + chunk_size]
+                            try:
+                                server_response = server.convert_batch(
+                                    request_chunk,
+                                    gpu=True,
+                                    parallelism=gpu_worker_count,
+                                )
+                            except Exception as error:
+                                UI.vprint(
+                                    1,
+                                    "ERROR: Resident ASHelper DDS conversion failed: "
+                                    + str(error),
+                                )
                                 conversion_success = False
                                 break
-                        except Exception as e:
-                            UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
-                            conversion_success = False
-                            break
+                            server_results = server_response.get("results", [])
+                            if not isinstance(server_results, list) or len(server_results) != len(request_chunk):
+                                UI.vprint(
+                                    1,
+                                    "ERROR: Resident ASHelper returned an incomplete DDS batch.",
+                                )
+                                conversion_success = False
+                                break
+                            for result in server_results:
+                                backend = str(result.get("backend", "unknown"))
+                                if backend not in gpu_backend_counts:
+                                    backend = "unknown"
+                                gpu_backend_counts[backend] += 1
+                                for field in gpu_telemetry:
+                                    try:
+                                        value = float(result.get(field, 0.0) or 0.0)
+                                        if field == "peak_rss_mb":
+                                            gpu_telemetry[field] = max(
+                                                gpu_telemetry[field], value
+                                            )
+                                        else:
+                                            gpu_telemetry[field] += value
+                                    except (TypeError, ValueError):
+                                        pass
+                            if not server_response.get("ok", False):
+                                UI.vprint(
+                                    1,
+                                    "ERROR: Resident ASHelper returned a failed DDS batch.",
+                                )
+                                conversion_success = False
+                                break
+                    else:
+                        for i in range(0, len(batch_args), chunk_size * 10):
+                            chunk = batch_args[i:i + chunk_size * 10]
+                            cmd = [as_helper, "--convert-batch-v3", "true"] + chunk
+                            try:
+                                batch_result = subprocess.run(
+                                    cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True,
+                                    check=False,
+                                )
+                                ret = batch_result.returncode
+                                if batch_result.stdout:
+                                    output_level = 0 if ret != 0 else 2
+                                    for line in batch_result.stdout.splitlines():
+                                        UI.vprint(output_level, "      " + line)
+                                        if line.startswith("backend=dds "):
+                                            fields = dict(
+                                                field.split("=", 1)
+                                                for field in line.split()
+                                                if "=" in field
+                                            )
+                                            metal_items = int(fields.get("metal_items", 0))
+                                            cpu_items = int(fields.get("cpu_fallback_items", 0))
+                                            known_items = metal_items + cpu_items
+                                            gpu_backend_counts["metal"] += metal_items
+                                            gpu_backend_counts["cpu"] += cpu_items
+                                            gpu_backend_counts["unknown"] += max(
+                                                0,
+                                                int(fields.get("batch_tasks", 0)) - known_items,
+                                            )
+                                            for field in gpu_telemetry:
+                                                try:
+                                                    value = float(
+                                                        fields.get(field, 0.0) or 0.0
+                                                    )
+                                                    if field == "peak_rss_mb":
+                                                        gpu_telemetry[field] = max(
+                                                            gpu_telemetry[field], value
+                                                        )
+                                                    else:
+                                                        gpu_telemetry[field] += value
+                                                except (TypeError, ValueError):
+                                                    pass
+                                if ret != 0:
+                                    UI.vprint(1, f"ERROR: GPU Batch DDS conversion failed with return code {ret}")
+                                    conversion_success = False
+                                    break
+                            except Exception as e:
+                                UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
+                                conversion_success = False
+                                break
+                    batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
+                    if metrics is not None:
+                        if server_failed:
+                            batch_backend = "failed"
+                        elif server_used:
+                            batch_backend = (
+                                "metal"
+                                if gpu_backend_counts["metal"] == len(batch_requests)
+                                else "mixed"
+                                if gpu_backend_counts["metal"]
+                                else "cpu"
+                            )
+                        else:
+                            batch_backend = "metal" if metal_available else "cpu"
+                        metrics.record_batch(
+                            "gpu_dds",
+                            len(batch_requests),
+                            duration_ms=batch_duration_ms,
+                            status="completed" if conversion_success else "fallback",
+                        )
+                        metrics.increment(
+                            "gpu_dds_metal_items", gpu_backend_counts["metal"]
+                        )
+                        metrics.increment(
+                            "gpu_dds_cpu_fallback_items", gpu_backend_counts["cpu"]
+                        )
+                        metrics.increment(
+                            "gpu_dds_unknown_items", gpu_backend_counts["unknown"]
+                        )
+                        metrics.set_value(
+                            "gpu_dds_backend",
+                            batch_backend,
+                        )
+                        metrics.set_value(
+                            "gpu_dds_worker_count",
+                            gpu_worker_count if server_used else (0 if server_failed else 8),
+                        )
+                        metrics.set_value(
+                            "gpu_dds_chunk_count",
+                            (len(batch_requests) + chunk_size - 1) // chunk_size,
+                        )
+                        metrics.set_value(
+                            "gpu_dds_items_per_second",
+                            len(batch_requests) / (batch_duration_ms / 1000.0)
+                            if batch_duration_ms > 0
+                            else 0.0,
+                        )
+                        for field, value in gpu_telemetry.items():
+                            metrics.set_value("gpu_dds_" + field, value)
+                        metrics.increment(
+                            "gpu_dds_failures",
+                            gpu_backend_counts["unknown"],
+                        )
+                        UI.vprint(
+                            1,
+                            "   GPU DDS summary: "
+                            f"backend={'resident' if server_used else ('failed' if server_failed else 'batch-v3')} "
+                            f"workers={gpu_worker_count if server_used else (0 if server_failed else 8)} "
+                            f"items={len(batch_requests)} "
+                            f"metal={gpu_backend_counts['metal']} "
+                            f"cpu_fallback={gpu_backend_counts['cpu']} "
+                            f"duration_ms={batch_duration_ms:.2f}",
+                        )
                     if conversion_success:
                         invalid_outputs = []
-                        for temp_path, _, target_fmt, input_path in batch_output_specs:
+                        for temp_path, final_path, target_fmt, input_path in batch_output_specs:
                             try:
                                 with Image.open(input_path) as source_image:
                                     expected_dimensions = source_image.size
@@ -2711,6 +3233,10 @@ def _build_tile(tile, persist_config=True):
                             )
                             if not dds_valid:
                                 invalid_outputs.append((temp_path, dds_error))
+                            else:
+                                validated_dds_dimensions[os.path.abspath(final_path)] = (
+                                    expected_dimensions
+                                )
                         if invalid_outputs:
                             for path, reason in invalid_outputs:
                                 UI.vprint(
@@ -2788,8 +3314,35 @@ def _build_tile(tile, persist_config=True):
     if UI.red_flag:
         UI.exit_message_and_bottom_line()
         return 0
+    performance_metrics = getattr(tile, "_performance_metrics", None)
     try:
-        synced_terrain_count = _sync_terrain_load_centers(tile)
+        if performance_metrics is None:
+            synced_terrain_count = _sync_terrain_load_centers(
+                tile, validated_dds_dimensions
+            )
+        else:
+            with performance_metrics.stage("terrain metadata"):
+                synced_terrain_count = _sync_terrain_load_centers(
+                    tile, validated_dds_dimensions
+                )
+        sync_stats = getattr(tile, "_terrain_load_center_stats", {})
+        if performance_metrics is not None:
+            performance_metrics.increment(
+                "terrain_load_center_files",
+                sync_stats.get("files", synced_terrain_count),
+            )
+            performance_metrics.increment(
+                "terrain_load_center_rewrites",
+                sync_stats.get("rewritten", 0),
+            )
+            performance_metrics.increment(
+                "terrain_load_center_unchanged",
+                sync_stats.get("unchanged", 0),
+            )
+            performance_metrics.increment(
+                "terrain_load_center_dimension_cache_hits",
+                sync_stats.get("dimension_cache_hits", 0),
+            )
         UI.vprint(
             1,
             " *Synchronized LOAD_CENTER metadata for",
@@ -2807,7 +3360,11 @@ def _build_tile(tile, persist_config=True):
         FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf",
     )
     try:
-        _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
+        if performance_metrics is None:
+            _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
+        else:
+            with performance_metrics.stage("DSF activation"):
+                _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
     except Exception as error:
         UI.vprint(0, "ERROR: could not activate DSF file; existing tile was preserved:", error)
         try:
@@ -2936,6 +3493,9 @@ def _start_full_pipeline(tile, include_overlays):
                 getattr(tile, "conversion_queue_size", conversion_queue_size)
             ),
             "gpu_batch_size": int(getattr(tile, "gpu_batch_size", gpu_batch_size)),
+            "gpu_dds_workers": int(
+                getattr(tile, "gpu_dds_workers", gpu_dds_workers)
+            ),
             "gpu_batch_wait_ms": int(
                 getattr(tile, "gpu_batch_wait_ms", gpu_batch_wait_ms)
             ),

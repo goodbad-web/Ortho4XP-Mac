@@ -142,3 +142,66 @@ def test_neural_accelerator_counters_are_parsed_and_recorded(tmp_path):
         },
     )
     assert record["neural_accelerator_confirmed"] is True
+
+
+def test_direct_dds_comparison_validates_backend_and_mipmaps(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "source.jpg"
+    Image.new("RGB", (2, 2), (30, 60, 90)).save(source, format="JPEG")
+    request_log = tmp_path / "requests.jsonl"
+    helper = tmp_path / "fake_direct_dds_helper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import struct\n"
+        "import sys\n"
+        f"with open({str(request_log)!r}, 'a', encoding='utf-8') as log:\n"
+        "    request = json.load(open(sys.argv[2], encoding='utf-8'))\n"
+        "    log.write(json.dumps(request) + '\\n')\n"
+        "header = bytearray(124)\n"
+        "struct.pack_into('<I', header, 0, 124)\n"
+        "struct.pack_into('<I', header, 8, 4)\n"
+        "struct.pack_into('<I', header, 12, 4)\n"
+        "struct.pack_into('<I', header, 24, 2)\n"
+        "struct.pack_into('<I', header, 72, 32)\n"
+        "header[80:84] = b'DXT5'\n"
+        "for item in request['items']:\n"
+        "    with open(item['output'], 'wb') as output:\n"
+        "        output.write(b'DDS ' + header + bytes(32))\n"
+        "    prefix = 'tensorops_dds_item' if sys.argv[1].startswith('--tensorops') else 'metalfx_dds_item'\n"
+        "    backend = 'tensorops' if prefix.startswith('tensorops') else 'metalfx_spatial'\n"
+        "    extra = ' tensorops_dispatch_observed=true' if backend == 'tensorops' else ''\n"
+        "    print(f'{prefix}=1/1 backend={backend} effective_backend={backend} dispatch=direct_dds' + extra + ' tensorops_ms=3 metalfx_ms=4 readback_ms=2 dds_ms=1 total_ms=6 rss_mb=42')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    tensorops_result = verify_metal.compare_direct_dds_backend(
+        helper,
+        "tensorops",
+        tmp_path / "pack",
+        source,
+        None,
+        tmp_path / "tensorops.dds",
+        1,
+    )
+    metalfx_result = verify_metal.compare_direct_dds_backend(
+        helper,
+        "metalfx_spatial",
+        None,
+        source,
+        None,
+        tmp_path / "metalfx.dds",
+        1,
+    )
+
+    assert tensorops_result["status"] == "PASS"
+    assert tensorops_result["effective_backend"] == "tensorops"
+    assert tensorops_result["dds"]["mipmaps"] == 2
+    assert metalfx_result["status"] == "PASS"
+    assert metalfx_result["effective_backend"] == "metalfx_spatial"
+    requests = [json.loads(line) for line in request_log.read_text().splitlines()]
+    assert requests[0]["fallback_to_ci"] is False
+    assert "pack" in requests[0]
+    assert "pack" not in requests[-1]

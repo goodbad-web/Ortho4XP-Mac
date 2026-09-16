@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import re
+import resource
 import shlex
 import shutil
 import struct
@@ -259,6 +260,32 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
+def run_measured(command: list[str]) -> tuple[subprocess.CompletedProcess[str], dict[str, float]]:
+    """Run one child and collect wall/user/sys time plus peak RSS."""
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    started = time.perf_counter()
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    rss = float(after.ru_maxrss)
+    if sys.platform == "darwin":
+        rss /= 1024.0 * 1024.0
+    else:
+        rss /= 1024.0
+    return result, {
+        "wall_ms": (time.perf_counter() - started) * 1000.0,
+        "user_ms": max(0.0, (after.ru_utime - before.ru_utime) * 1000.0),
+        "sys_ms": max(0.0, (after.ru_stime - before.ru_stime) * 1000.0),
+        "peak_rss_mb": rss,
+    }
+
+
 def tensorops_dispatch_metadata(diagnostics: str) -> dict[str, Any]:
     """Extract tiled TensorOps execution details from ASHelper diagnostics."""
     metadata: dict[str, Any] = {
@@ -419,6 +446,13 @@ def execution_record(
             "tile_input_sizes",
             "tile_halo",
             "tensorops_output_size",
+            "expected_dimensions",
+            "mask",
+            "fallback_reasons",
+            "telemetry",
+            "dds",
+            "warmup",
+            "speed_ratio_tensorops_over_metalfx",
             "diagnostic",
         ):
             if key in result:
@@ -505,21 +539,22 @@ def compare_upscale_backend(
         }
 
     samples_ms: list[float] = []
+    user_samples_ms: list[float] = []
+    sys_samples_ms: list[float] = []
+    rss_samples_mb: list[float] = []
     last_result: subprocess.CompletedProcess[str] | None = None
     for _ in range(runs):
         try:
             output.unlink()
         except FileNotFoundError:
             pass
-        started = time.perf_counter()
-        last_result = subprocess.run(
-            [str(helper), command_name, str(source), str(output)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        last_result, timing = run_measured(
+            [str(helper), command_name, str(source), str(output)]
         )
-        samples_ms.append((time.perf_counter() - started) * 1000.0)
+        samples_ms.append(timing["wall_ms"])
+        user_samples_ms.append(timing["user_ms"])
+        sys_samples_ms.append(timing["sys_ms"])
+        rss_samples_mb.append(timing["peak_rss_mb"])
         if last_result.returncode != 0 or not output.is_file():
             return {
                 "status": "FAIL",
@@ -549,6 +584,9 @@ def compare_upscale_backend(
             "median": percentile(samples_ms, 0.5),
             "p95": percentile(samples_ms, 0.95),
             "first_measured": samples_ms[0],
+            "user_ms": user_samples_ms,
+            "sys_ms": sys_samples_ms,
+            "peak_rss_mb": rss_samples_mb,
             "scope": "ASHelper process plus image decode, upscale, readback, and PNG encode",
         },
         "quality": quality,
@@ -594,6 +632,9 @@ def compare_metalfx_batch(
         }
 
     samples_ms: list[float] = []
+    user_samples_ms: list[float] = []
+    sys_samples_ms: list[float] = []
+    rss_samples_mb: list[float] = []
     last_result: subprocess.CompletedProcess[str] | None = None
     for _ in range(runs):
         for output in outputs:
@@ -734,21 +775,22 @@ def compare_tensorops_backend(
         }
 
     samples_ms: list[float] = []
+    user_samples_ms: list[float] = []
+    sys_samples_ms: list[float] = []
+    rss_samples_mb: list[float] = []
     last_result: subprocess.CompletedProcess[str] | None = None
     for _ in range(runs):
         try:
             output.unlink()
         except FileNotFoundError:
             pass
-        started = time.perf_counter()
-        last_result = subprocess.run(
-            command_prefix + [str(output)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        last_result, timing = run_measured(
+            command_prefix + [str(output)]
         )
-        samples_ms.append((time.perf_counter() - started) * 1000.0)
+        samples_ms.append(timing["wall_ms"])
+        user_samples_ms.append(timing["user_ms"])
+        sys_samples_ms.append(timing["sys_ms"])
+        rss_samples_mb.append(timing["peak_rss_mb"])
         if last_result.returncode != 0 or not output.is_file():
             diagnostic = (last_result.stdout or "").strip()
             return {
@@ -770,15 +812,8 @@ def compare_tensorops_backend(
             "output": str(output),
             "error": str(error),
         }
-    diagnostics = "\n".join(
-        value
-        for value in (
-            warmup.stdout or "",
-            last_result.stdout if last_result is not None else "",
-        )
-        if value
-    ).strip()
-    dispatch_metadata = tensorops_dispatch_metadata(diagnostics)
+    measured_diagnostics = last_result.stdout if last_result is not None else ""
+    dispatch_metadata = tensorops_dispatch_metadata(measured_diagnostics)
     return {
         "status": "PASS",
         "backend": "tensorops",
@@ -791,13 +826,511 @@ def compare_tensorops_backend(
             "median": percentile(samples_ms, 0.5),
             "p95": percentile(samples_ms, 0.95),
             "first_measured": samples_ms[0],
+            "user_ms": user_samples_ms,
+            "sys_ms": sys_samples_ms,
+            "peak_rss_mb": rss_samples_mb,
             "scope": "ASHelper process plus image decode, TensorOps dispatch, readback, and PNG encode",
         },
         "quality": quality,
-        "diagnostic": diagnostics,
+        # Keep execution evidence tied to the measured run. The warmup is
+        # intentionally not allowed to satisfy the dispatch assertion.
+        "diagnostic": measured_diagnostics.strip(),
         **dispatch_metadata,
-        "tensorops_dispatch_observed": "tensorops_dispatch=completed" in diagnostics,
+        "tensorops_dispatch_observed": "tensorops_dispatch=completed" in measured_diagnostics,
     }
+
+
+def make_tensorops_comparison_fixture(
+    directory: Path,
+    input_size: int,
+    mask: Path | None = None,
+) -> tuple[Path, Path, Path | None]:
+    """Create one deterministic provider-like input and its 2x reference.
+
+    The pattern is authored once at 512px and resized for larger cases.  This
+    keeps fixture creation deterministic without spending the benchmark's
+    time budget on a Python per-pixel loop for an 8192px reference image.
+    """
+    from PIL import Image, ImageDraw
+
+    if input_size < 1:
+        raise ValueError("input_size must be positive")
+    base_size = 512
+    base = Image.new("RGB", (base_size, base_size))
+    pixels = base.load()
+    for y in range(base_size):
+        for x in range(base_size):
+            pixels[x, y] = (
+                (x * 255) // (base_size - 1),
+                (y * 255) // (base_size - 1),
+                ((x * 3 + y * 5) * 255) // (base_size * 8 - 8),
+            )
+    draw = ImageDraw.Draw(base)
+    draw.rectangle((24, 24, 180, 180), fill=(225, 35, 45), outline=(255, 255, 255))
+    draw.ellipse((210, 40, 470, 300), fill=(35, 185, 80), outline=(10, 10, 10))
+    draw.line((0, 390, base_size, 390), fill=(250, 240, 30), width=7)
+    for x in range(base_size // 2, base_size, 8):
+        draw.line((x, 320, x, 500), fill=(30, 30, 30), width=2)
+
+    resampling = getattr(Image, "Resampling", Image)
+    source_image = (
+        base
+        if input_size == base_size
+        else base.resize((input_size, input_size), resampling.BICUBIC)
+    )
+    source_path = directory / f"tensorops_comparison_source_{input_size}.jpg"
+    reference_path = directory / f"tensorops_comparison_reference_{input_size * 2}.png"
+    # JPEG mirrors direct provider-cache input while the PNG lane still tests
+    # the same decoder and dimensions used by the production helper.
+    source_image.save(source_path, format="JPEG", quality=97, subsampling=0)
+    source_image.resize((input_size * 2, input_size * 2), resampling.BICUBIC).save(
+        reference_path,
+        format="PNG",
+    )
+    return source_path, reference_path, mask
+
+
+def _direct_dds_item(
+    source: Path,
+    output: Path,
+    mask: Path | None,
+    target_format: str = "BC3",
+) -> dict[str, Any]:
+    return {
+        "input": str(source),
+        "mask": str(mask) if mask is not None else "none",
+        "output": str(output),
+        "format": target_format,
+        "color": {
+            "r": 1.0,
+            "g": 1.0,
+            "b": 1.0,
+            "contrast": 1.0,
+            "brightness": 0.0,
+            "saturation": 1.0,
+        },
+    }
+
+
+def _direct_dds_telemetry(output: str, backend: str) -> dict[str, Any]:
+    prefix = "tensorops_dds_item=" if backend == "tensorops" else "metalfx_dds_item="
+    lines = [line for line in output.splitlines() if line.startswith(prefix)]
+    if not lines:
+        return {"effective_backend": "unknown", "diagnostic": output.strip()}
+    fields = {
+        field.split("=", 1)[0]: field.split("=", 1)[1]
+        for field in lines[-1].split()
+        if "=" in field
+    }
+    telemetry: dict[str, Any] = {
+        "effective_backend": fields.get("effective_backend", "unknown"),
+        "fallback_reason": fields.get("fallback_reason"),
+        "item_line": lines[-1],
+    }
+    for name in (
+        "tensorops_ms",
+        "metalfx_ms",
+        "readback_ms",
+        "dds_ms",
+        "total_ms",
+        "rss_mb",
+    ):
+        if name in fields:
+            try:
+                telemetry[name] = float(fields[name])
+            except ValueError:
+                telemetry[name] = fields[name]
+    for name in ("tensorops_dispatch_observed", "neural_accelerator_confirmed"):
+        if name in fields:
+            telemetry[name] = fields[name].lower() == "true"
+    return telemetry
+
+
+def compare_direct_dds_backend(
+    helper: Path,
+    backend: str,
+    pack: Path | None,
+    source: Path,
+    mask: Path | None,
+    output: Path,
+    runs: int,
+) -> dict[str, Any]:
+    """Measure a one-item direct-DDS request after one warmup run."""
+    from PIL import Image
+
+    if backend not in ("tensorops", "metalfx_spatial"):
+        raise ValueError(f"unsupported direct DDS backend: {backend}")
+    if backend == "tensorops" and pack is None:
+        return {
+            "status": "FAIL(pack_missing)",
+            "backend": backend,
+            "source": str(source),
+        }
+
+    request_path = output.with_name(output.stem + f"_{backend}.request.json")
+    item = _direct_dds_item(source, output, mask)
+    request: dict[str, Any] = {"version": 1, "items": [item]}
+    command = [str(helper)]
+    if backend == "tensorops":
+        request["pack"] = str(pack)
+        # Keep the fallback order observable in the caller: TensorOps ->
+        # MetalFX -> CI Lanczos.  The standalone CLI remains backward-
+        # compatible when this key is omitted.
+        request["fallback_to_ci"] = False
+        command.append("--tensorops-dds-batch")
+    else:
+        command.append("--metalfx-spatial-dds-batch")
+    command.append(str(request_path))
+    warmup_output = output.with_name(output.stem + "_warmup.dds")
+    warmup_item = dict(item)
+    warmup_item["output"] = str(warmup_output)
+    warmup_request = dict(request)
+    warmup_request["items"] = [warmup_item]
+    expected_fourcc = "DXT5"
+
+    def validate_dds_metadata(info: dict[str, Any], expected_dimensions: list[int]) -> str | None:
+        if [info["width"], info["height"]] != expected_dimensions:
+            return "size"
+        if info["fourcc"] != expected_fourcc:
+            return f"format_{info['fourcc']}"
+        if int(info["mipmaps"]) <= 1:
+            return "mipmaps_missing"
+        return None
+
+    try:
+        request_path.write_text(
+            json.dumps(warmup_request, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        warmup = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        warmup_telemetry = _direct_dds_telemetry(warmup.stdout or "", backend)
+        try:
+            warmup_info = dds_info(warmup_output)
+            warmup_metadata = {
+                key: value for key, value in warmup_info.items() if key != "data"
+            }
+        except ValueError as error:
+            return {
+                "status": "FAIL(warmup_dds_invalid)",
+                "backend": backend,
+                "warmup_exit": warmup.returncode,
+                "diagnostic": (warmup.stdout or "").strip(),
+                "error": str(error),
+                "telemetry": warmup_telemetry,
+            }
+        finally:
+            try:
+                warmup_output.unlink()
+            except FileNotFoundError:
+                pass
+        with Image.open(source) as source_image:
+            expected_dimensions = [source_image.width * 2, source_image.height * 2]
+        warmup_validation_error = validate_dds_metadata(
+            warmup_info,
+            expected_dimensions,
+        )
+        if warmup_validation_error is not None:
+            return {
+                "status": f"FAIL(warmup_{warmup_validation_error})",
+                "backend": backend,
+                "warmup_exit": warmup.returncode,
+                "expected_dimensions": expected_dimensions,
+                "dds": warmup_metadata,
+                "telemetry": warmup_telemetry,
+            }
+        if warmup.returncode != 0:
+            return {
+                "status": "FAIL(warmup_exit)",
+                "backend": backend,
+                "warmup_exit": warmup.returncode,
+                "diagnostic": (warmup.stdout or "").strip(),
+                "telemetry": warmup_telemetry,
+            }
+
+        samples_ms: list[float] = []
+        user_samples_ms: list[float] = []
+        sys_samples_ms: list[float] = []
+        rss_samples_mb: list[float] = []
+        telemetry_samples: list[dict[str, Any]] = []
+        last_result: subprocess.CompletedProcess[str] | None = None
+        for _ in range(runs):
+            try:
+                output.unlink()
+            except FileNotFoundError:
+                pass
+            # The request now points at the measured output rather than the
+            # warmup path.  Rewriting it also makes the artifact self-
+            # describing if a run is interrupted.
+            request_path.write_text(
+                json.dumps(request, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            last_result, timing = run_measured(command)
+            samples_ms.append(timing["wall_ms"])
+            user_samples_ms.append(timing["user_ms"])
+            sys_samples_ms.append(timing["sys_ms"])
+            rss_samples_mb.append(timing["peak_rss_mb"])
+            telemetry = _direct_dds_telemetry(last_result.stdout or "", backend)
+            telemetry_samples.append(telemetry)
+            if last_result.returncode != 0 or not output.is_file():
+                return {
+                    "status": "FAIL(run)",
+                    "backend": backend,
+                    "warmup_exit": warmup.returncode,
+                    "run_exit": last_result.returncode,
+                    "diagnostic": (last_result.stdout or "").strip(),
+                    "timing_ms": {
+                        "samples": samples_ms,
+                        "user_ms": user_samples_ms,
+                        "sys_ms": sys_samples_ms,
+                        "peak_rss_mb": rss_samples_mb,
+                    },
+                    "telemetry": telemetry_samples,
+                }
+            try:
+                info = dds_info(output)
+                dds_metadata = {
+                    key: value for key, value in info.items() if key != "data"
+                }
+            except ValueError as error:
+                return {
+                    "status": "FAIL(dds_invalid)",
+                    "backend": backend,
+                    "run_exit": last_result.returncode,
+                    "error": str(error),
+                    "telemetry": telemetry_samples,
+                }
+            validation_error = validate_dds_metadata(info, expected_dimensions)
+            if validation_error is not None:
+                return {
+                    "status": f"FAIL({validation_error})",
+                    "backend": backend,
+                    "expected_dimensions": expected_dimensions,
+                    "dds": dds_metadata,
+                    "telemetry": telemetry_samples,
+                }
+
+        effective_backends = {
+            str(sample.get("effective_backend", "unknown"))
+            for sample in telemetry_samples
+        }
+        expected_backend = backend
+        status = "PASS"
+        if effective_backends != {expected_backend}:
+            status = "FAIL(unexpected_fallback)"
+        if backend == "tensorops" and not all(
+            sample.get("tensorops_dispatch_observed") is True
+            for sample in telemetry_samples
+        ):
+            status = "FAIL(tensorops_dispatch_missing)"
+        return {
+            "status": status,
+            "backend": backend,
+            "requested_backend": backend,
+            "effective_backend": (
+                next(iter(effective_backends)) if len(effective_backends) == 1 else "mixed"
+            ),
+            "source": str(source),
+            "mask": str(mask) if mask is not None else "none",
+            "output": str(output),
+            "expected_dimensions": expected_dimensions,
+            "runs": runs,
+            "timing_ms": {
+                "samples": samples_ms,
+                "median": percentile(samples_ms, 0.5),
+                "p95": percentile(samples_ms, 0.95),
+                "first_measured": samples_ms[0],
+                "user_ms": user_samples_ms,
+                "sys_ms": sys_samples_ms,
+                "peak_rss_mb": rss_samples_mb,
+                "scope": "ASHelper direct-DDS process through validated DDS completion",
+            },
+            "telemetry": telemetry_samples,
+            "dds": dds_metadata,
+            "warmup": {
+                "exit": warmup.returncode,
+                "effective_backend": warmup_telemetry.get("effective_backend"),
+            },
+            "fallback_reasons": sorted(
+                {
+                    str(sample["fallback_reason"])
+                    for sample in telemetry_samples
+                    if sample.get("fallback_reason")
+                }
+            ),
+        }
+    finally:
+        try:
+            request_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            warmup_output.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def compare_tensorops_backend_matrix(
+    helper: Path,
+    pack: Path,
+    artifact_dir: Path,
+    runs: int,
+    metalfx_available: bool,
+    records: list[dict[str, Any]],
+    mask: Path | None = None,
+) -> dict[str, Any]:
+    """Compare TensorOps and MetalFX on fixed PNG and direct-DDS sizes."""
+    report: dict[str, Any] = {
+        "status": "PASS",
+        "backends": ["tensorops", "metalfx_spatial"],
+        "input_sizes": [512, 2048, 4096],
+        "warmup_runs": 1,
+        "measured_runs": runs,
+        "fixed_settings": {
+            "format": "BC3",
+            "mask": str(mask) if mask is not None else "none",
+            "color": {
+                "r": 1.0,
+                "g": 1.0,
+                "b": 1.0,
+                "contrast": 1.0,
+                "brightness": 0.0,
+                "saturation": 1.0,
+            },
+        },
+        "quality_gate": {
+            "psnr_drop_db": QUALITY_PSNR_DROP_DB,
+            "error_increase_ratio": QUALITY_ERROR_INCREASE_RATIO,
+            "baseline": "tensorops PNG output against the deterministic reference",
+        },
+        "cases": {},
+    }
+    for input_size in (512, 2048, 4096):
+        source, reference, direct_mask = make_tensorops_comparison_fixture(
+            artifact_dir,
+            input_size,
+            mask,
+        )
+        case: dict[str, Any] = {
+            "source": str(source),
+            "reference": str(reference),
+        }
+        tensor_output = artifact_dir / f"tensorops_comparison_{input_size}.png"
+        tensor_result = compare_tensorops_backend(
+            helper,
+            pack,
+            source,
+            reference,
+            tensor_output,
+            runs,
+        )
+        case["tensorops"] = {"png": tensor_result}
+        records.append(
+            execution_record(
+                backend="tensorops",
+                role="backend_comparison_png",
+                dtype="MetalFloat8E4M3",
+                status=tensor_result["status"],
+                requested_backend="tensorops",
+                effective_backend=tensor_result.get("effective_backend", "tensorops"),
+                source=source,
+                output=tensor_output,
+                result=tensor_result,
+            )
+        )
+        if tensor_result["status"] != "PASS":
+            report["status"] = "FAIL"
+
+        if metalfx_available:
+            metal_output = artifact_dir / f"metalfx_comparison_{input_size}.png"
+            metal_result = compare_upscale_backend(
+                helper,
+                "metalfx_spatial",
+                source,
+                reference,
+                metal_output,
+                runs,
+            )
+            case["metalfx_spatial"] = {"png": metal_result}
+            records.append(
+                execution_record(
+                    backend="metalfx_spatial",
+                    role="backend_comparison_png",
+                    status=metal_result["status"],
+                    requested_backend="metalfx_spatial",
+                    effective_backend=metal_result.get(
+                        "effective_backend", "metalfx_spatial"
+                    ),
+                    source=source,
+                    output=metal_output,
+                    result=metal_result,
+                )
+            )
+            if metal_result["status"] != "PASS":
+                report["status"] = "FAIL"
+            elif tensor_result["status"] == "PASS":
+                gate = precision_quality_gate(
+                    metal_result["quality"], tensor_result["quality"]
+                )
+                case["png_quality_gate"] = gate
+                if gate["status"] != "PASS":
+                    report["status"] = "FAIL"
+        else:
+            case["metalfx_spatial"] = {"status": "SKIP(metalfx_unavailable)"}
+
+        if metalfx_available:
+            direct_case: dict[str, Any] = {}
+            for backend in ("tensorops", "metalfx_spatial"):
+                output = artifact_dir / f"{backend}_direct_dds_{input_size}.dds"
+                direct_result = compare_direct_dds_backend(
+                    helper,
+                    backend,
+                    pack if backend == "tensorops" else None,
+                    source,
+                    direct_mask,
+                    output,
+                    runs,
+                )
+                direct_case[backend] = direct_result
+                records.append(
+                    execution_record(
+                        backend=backend,
+                        role="backend_comparison_direct_dds",
+                        dtype="MetalFloat8E4M3" if backend == "tensorops" else None,
+                        status=direct_result["status"],
+                        requested_backend=backend,
+                        effective_backend=direct_result.get(
+                            "effective_backend", backend
+                        ),
+                        source=source,
+                        output=output,
+                        result=direct_result,
+                    )
+                )
+                if direct_result["status"] != "PASS":
+                    report["status"] = "FAIL"
+            tensor_direct = direct_case["tensorops"]
+            metal_direct = direct_case["metalfx_spatial"]
+            if (
+                tensor_direct.get("status") == "PASS"
+                and metal_direct.get("status") == "PASS"
+            ):
+                tensor_median = tensor_direct["timing_ms"]["median"]
+                metal_median = metal_direct["timing_ms"]["median"]
+                direct_case["speed_ratio_tensorops_over_metalfx"] = (
+                    tensor_median / metal_median if metal_median else None
+                )
+            case["direct_dds"] = direct_case
+        else:
+            case["direct_dds"] = {"status": "SKIP(metalfx_unavailable)"}
+        report["cases"][str(input_size)] = case
+    return report
 
 
 def _tool_available(name: str) -> bool:
@@ -1560,6 +2093,11 @@ def main() -> int:
     parser.add_argument("--batch-count", type=int, default=64)
     parser.add_argument("--compare-upscale", action="store_true")
     parser.add_argument(
+        "--compare-tensorops",
+        action="store_true",
+        help="compare FP8 TensorOps and MetalFX on 512/2048/4096 PNG and direct-DDS fixtures",
+    )
+    parser.add_argument(
         "--compare-fp8",
         action="store_true",
         help="compare the deterministic FP8SR fixture or an external --fp8-pack",
@@ -1667,6 +2205,59 @@ def main() -> int:
             )
             if not precision_ok and tensorops_available:
                 overall_ok = False
+
+        if args.compare_tensorops:
+            tensorops_comparison_report: dict[str, Any] = {}
+            if not fp8_tensorops_available:
+                tensorops_comparison_report["status"] = "SKIP(tensorops_unavailable)"
+                print("TensorOps/MetalFX comparison=SKIP(tensorops_unavailable)")
+            elif not metalfx_spatial_available:
+                tensorops_comparison_report["status"] = "SKIP(metalfx_spatial_unavailable)"
+                print("TensorOps/MetalFX comparison=SKIP(metalfx_spatial_unavailable)")
+            else:
+                from fp8sr_pack import create_fixture, validate_pack
+
+                comparison_pack = args.fp8_pack
+                if comparison_pack is None:
+                    comparison_pack = create_fixture(
+                        artifact_dir / "tensorops-comparison-pack",
+                        "MetalFloat8E4M3",
+                    )
+                try:
+                    validate_pack(comparison_pack)
+                except (OSError, ValueError) as error:
+                    tensorops_comparison_report = {
+                        "status": "FAIL(pack_invalid)",
+                        "pack": str(comparison_pack),
+                        "error": str(error),
+                    }
+                    overall_ok = False
+                    print(
+                        "TensorOps/MetalFX comparison=FAIL(pack_invalid) "
+                        f"error={error}"
+                    )
+                else:
+                    tensorops_comparison_report = compare_tensorops_backend_matrix(
+                        args.helper,
+                        comparison_pack,
+                        artifact_dir,
+                        args.compare_runs,
+                        metalfx_spatial_available,
+                        records,
+                        mask=mask,
+                    )
+                    tensorops_comparison_report["pack"] = str(comparison_pack)
+                    tensorops_comparison_report.update(
+                        pack_record_metadata(comparison_pack)
+                    )
+                    print(
+                        "TensorOps/MetalFX comparison="
+                        f"{tensorops_comparison_report['status']} "
+                        f"cases={json.dumps(tensorops_comparison_report.get('cases', {}), sort_keys=True)}"
+                    )
+                    if tensorops_comparison_report["status"] != "PASS":
+                        overall_ok = False
+            report["tensorops_comparison"] = tensorops_comparison_report
 
         if args.gpu_tools:
             if precision_pack_for_gpu is None:

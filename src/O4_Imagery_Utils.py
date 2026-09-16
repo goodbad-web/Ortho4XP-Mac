@@ -2965,13 +2965,16 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
         return input_path, "none", None
     effective_backend = backend
     fallback_reason = None
+    fallback_chain = []
     alpha_mode = "rgba" if _image_has_non_opaque_alpha(input_path) else "opaque"
-    # MetalFX Spatial now handles non-opaque inputs in ASHelper by sending
+    # MetalFX Spatial handles non-opaque inputs in ASHelper by sending
     # straight RGB through MetalFX and resizing alpha separately. TensorOps
-    # still requires an opaque source and keeps its historical fallback.
+    # still requires an opaque source, so it is skipped for RGBA and MetalFX
+    # becomes the first fallback rather than jumping directly to CI.
     if backend == "tensorops" and alpha_mode == "rgba":
-        effective_backend = "ci_lanczos"
         fallback_reason = "alpha"
+        fallback_chain.append("tensorops_alpha")
+        effective_backend = "metalfx_spatial"
 
     if backend == "tensorops" and fallback_reason is None and (
         not fp8_model_path
@@ -2979,7 +2982,8 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
         or not os.path.isfile(os.path.join(fp8_model_path, "manifest.json"))
     ):
         fallback_reason = "fp8_model_unavailable"
-        effective_backend = "ci_lanczos"
+        fallback_chain.append("tensorops_pack")
+        effective_backend = "metalfx_spatial"
 
     if not as_helper_cmd and effective_backend != "ci_lanczos":
         fallback_reason = fallback_reason or "ashelper_unavailable"
@@ -3003,44 +3007,41 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
             except OSError:
                 pass
 
-    valid_output = False
-    result = None
-    helper_diagnostics = ""
     started = time.perf_counter()
-    if effective_backend == "ci_lanczos":
-        valid_output = _run_lanczos_fallback(input_path, output_path, as_helper_cmd)
-    else:
+    def run_helper_once(candidate_backend, candidate_output, model_path=None):
         command = _upscale_command(
             as_helper_cmd,
-            effective_backend,
+            candidate_backend,
             input_path,
-            output_path,
-            fp8_model_path,
+            candidate_output,
+            model_path,
         )
-        if command is not None:
-            try:
-                result = subprocess.run(
-                    command,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-                helper_diagnostics = result.stdout or ""
-                if result.stdout:
-                    for line in result.stdout.splitlines():
-                        UI.vprint(2, "      " + line)
-                valid_output = result.returncode == 0 and _valid_upscale_output(
-                    input_path, output_path
-                )
-            except (OSError, subprocess.SubprocessError):
-                result = None
+        if command is None:
+            return None, "", False
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None, "", False
+        diagnostics = result.stdout or ""
+        if diagnostics:
+            for line in diagnostics.splitlines():
+                UI.vprint(2, "      " + line)
+        return result, diagnostics, bool(
+            result.returncode == 0
+            and _valid_upscale_output(input_path, candidate_output)
+        )
 
-    duration_ms = (time.perf_counter() - started) * 1000.0
-    helper_effective = None
-    helper_alpha_mode = None
-    if helper_diagnostics:
-        for line in helper_diagnostics.splitlines():
+    def helper_metadata(diagnostics):
+        helper_effective = None
+        helper_alpha_mode = None
+        helper_reason = None
+        for line in diagnostics.splitlines():
             fields = dict(
                 field.split("=", 1)
                 for field in line.split()
@@ -3049,58 +3050,106 @@ def run_upscale(input_path, backend, as_helper_cmd, fp8_model_path=None):
             if fields.get("backend") == "metalfx_spatial":
                 helper_effective = fields.get("effective_backend") or helper_effective
                 helper_alpha_mode = fields.get("alpha_mode") or helper_alpha_mode
-                if fields.get("fallback_reason"):
-                    fallback_reason = fallback_reason or fields["fallback_reason"]
-        if helper_alpha_mode:
-            alpha_mode = helper_alpha_mode
+                helper_reason = fields.get("fallback_reason") or helper_reason
+        return helper_effective, helper_alpha_mode, helper_reason
 
+    def report_success(path, result_backend, reason=None, chain=()):
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        message = (
+            "      backend=" + backend
+            + " effective_backend=" + result_backend
+            + " alpha_mode=" + alpha_mode
+            + " dispatch=single duration_ms=" + f"{duration_ms:.2f}"
+            + (" fallback_reason=" + reason if reason else "")
+            + (" fallback_chain=" + ",".join(chain) if chain else "")
+        )
+        UI.vprint(2, message)
+        return path, result_backend, reason
+
+    if effective_backend == "ci_lanczos":
+        output_path = upscale_output_path(input_path, "ci_lanczos")
+        if _run_lanczos_fallback(input_path, output_path, as_helper_cmd):
+            return report_success(output_path, "ci_lanczos", fallback_reason, fallback_chain)
+        failure_reason = fallback_reason or "ci_lanczos_failed"
+        UI.vprint(
+            1,
+            "      backend=" + backend
+            + " effective_backend=failed alpha_mode=" + alpha_mode
+            + " dispatch=single duration_ms="
+            + f"{(time.perf_counter() - started) * 1000.0:.2f}"
+            + " fallback_reason=" + failure_reason,
+        )
+        return None, None, failure_reason
+
+    result, diagnostics, valid_output = run_helper_once(
+        effective_backend,
+        output_path,
+        fp8_model_path if effective_backend == "tensorops" else None,
+    )
+    helper_effective, helper_alpha_mode, helper_reason = helper_metadata(diagnostics)
+    if helper_alpha_mode:
+        alpha_mode = helper_alpha_mode
+    if helper_reason and fallback_reason is None:
+        fallback_reason = helper_reason
     if valid_output:
-        if backend == "metalfx_spatial" and helper_effective in (
+        if effective_backend == "metalfx_spatial" and helper_effective in (
             "metalfx_spatial",
             "ci_lanczos",
         ):
             effective_backend = helper_effective
-            if effective_backend != backend and fallback_reason is None:
+            if effective_backend != "metalfx_spatial" and fallback_reason is None:
                 fallback_reason = "alpha_processing"
-        UI.vprint(
-            2,
-            "      backend=" + backend
-            + " effective_backend=" + effective_backend
-            + " alpha_mode=" + alpha_mode
-            + " dispatch=single duration_ms=" + f"{duration_ms:.2f}"
-            + (" fallback_reason=" + fallback_reason if fallback_reason else ""),
-        )
-        return output_path, effective_backend, fallback_reason
+        return report_success(output_path, effective_backend, fallback_reason, fallback_chain)
 
-    if backend in ("metalfx_spatial", "tensorops") and effective_backend in (
-        "metalfx_spatial",
-        "tensorops",
-    ):
+    if backend == "tensorops" and effective_backend == "tensorops":
         exit_code = result.returncode if result is not None else "unavailable"
-        reason_backend = "metalfx" if backend == "metalfx_spatial" else "tensorops"
-        fallback_reason = f"{reason_backend}_exit_{exit_code}"
-        output_path = upscale_output_path(input_path, "ci_lanczos")
-        valid_output = _run_lanczos_fallback(input_path, output_path, as_helper_cmd)
-        if valid_output:
-            UI.vprint(
-                2,
-                "      backend=" + backend
-                + " effective_backend=ci_lanczos"
-                + " alpha_mode=" + alpha_mode
-                + " dispatch=single duration_ms=" + f"{duration_ms:.2f}"
-                + " fallback_reason=" + fallback_reason,
+        fallback_reason = fallback_reason or f"tensorops_exit_{exit_code}"
+        fallback_chain.append(f"tensorops_exit_{exit_code}")
+        metalfx_output = upscale_output_path(input_path, "metalfx_spatial")
+        metalfx_result, metalfx_diagnostics, metalfx_valid = run_helper_once(
+            "metalfx_spatial",
+            metalfx_output,
+        )
+        metalfx_effective, metalfx_alpha_mode, metalfx_reason = helper_metadata(
+            metalfx_diagnostics
+        )
+        if metalfx_alpha_mode:
+            alpha_mode = metalfx_alpha_mode
+        if metalfx_valid:
+            result_backend = metalfx_effective or "metalfx_spatial"
+            if result_backend == "ci_lanczos" and metalfx_reason:
+                fallback_chain.append("metalfx_ci")
+            return report_success(
+                metalfx_output,
+                result_backend,
+                fallback_reason,
+                fallback_chain,
             )
-            return output_path, "ci_lanczos", fallback_reason
+        metalfx_exit = (
+            metalfx_result.returncode if metalfx_result is not None else "unavailable"
+        )
+        fallback_chain.append(f"metalfx_exit_{metalfx_exit}")
 
+    elif effective_backend == "metalfx_spatial":
+        metalfx_exit = result.returncode if result is not None else "unavailable"
+        fallback_reason = fallback_reason or f"metalfx_exit_{metalfx_exit}"
+        fallback_chain.append(f"metalfx_exit_{metalfx_exit}")
+
+    output_path = upscale_output_path(input_path, "ci_lanczos")
+    if _run_lanczos_fallback(input_path, output_path, as_helper_cmd):
+        return report_success(output_path, "ci_lanczos", fallback_reason, fallback_chain)
+
+    failure_reason = fallback_reason or f"{effective_backend}_failed"
     UI.vprint(
         1,
         "      backend=" + backend
-        + " effective_backend=failed"
-        + " alpha_mode=" + alpha_mode
-        + " dispatch=single duration_ms=" + f"{duration_ms:.2f}"
-        + " fallback_reason=" + (fallback_reason or f"{effective_backend}_failed"),
+        + " effective_backend=failed alpha_mode=" + alpha_mode
+        + " dispatch=single duration_ms="
+        + f"{(time.perf_counter() - started) * 1000.0:.2f}"
+        + " fallback_reason=" + failure_reason
+        + (" fallback_chain=" + ",".join(fallback_chain) if fallback_chain else ""),
     )
-    return None, None, fallback_reason or f"{effective_backend}_failed"
+    return None, None, failure_reason
 
 def convert_texture(
     tile, til_x_left, til_y_top, zoomlevel, provider_code, type="dds", prepared_file=None

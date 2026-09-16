@@ -65,7 +65,16 @@ MetalFX SpatialとCore Image Lanczosの2倍アップスケールをM5 Max上で�
 ./Utils/run/verify_metal.sh --compare-upscale --compare-runs 5 --keep-artifacts
 ```
 
-この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。バックエンドの正規記録名は`ci_lanczos`、`metalfx_spatial`、`tensorops`で、旧`lanczos`と`fp8_tensorops`は互換aliasとして受け付ける。MetalFX Spatialは本番設定で明示的に選択した場合だけ使用する。不透明RGBは直接MetalFXへ送り、直接プロバイダのJPEGはMetalFX batch後に色補正・マスク・DDS化する。RGBAはRGBをstraight-alphaのままMetalFXで処理し、alphaを`CIBicubicScaleTransform`で2倍化して再合成する。alpha分離・再合成に失敗した場合、または非対応・GPU実行失敗時はCore Image Lanczosへフォールバックする。
+この比較は同一の決定的な入力と高解像度の正解画像を使い、RGBのMAE/RMSE/PSNRと、ASHelperプロセス・画像入出力を含むmedian/p95時間を報告する。バックエンドの正規記録名は`ci_lanczos`、`metalfx_spatial`、`tensorops`で、旧`lanczos`と`fp8_tensorops`は互換aliasとして受け付ける。新規または未設定の`upscale_backend`は`metalfx_spatial`を既定値とし、既存の明示設定は変更しない。不透明RGBは直接MetalFXへ送り、直接プロバイダのJPEGはMetalFX batch後に色補正・マスク・DDS化する。RGBAはRGBをstraight-alphaのままMetalFXで処理し、alphaを`CIBicubicScaleTransform`で2倍化して再合成する。alpha分離・再合成に失敗した場合、または非対応・GPU実行失敗時はCore Image Lanczosへフォールバックする。
+
+TensorOpsとMetalFXを同一条件で比較する標準レーンは、1回のウォームアップ後に指定回数（既定5回）を測定する。512px、2048px、4096pxの決定的なprovider形式入力について、PNGの品質ゲートとdirect DDSのサイズ、BC3、mipmap、effective backendを検証し、wall/user/sys時間、peak RSS、TensorOps/MetalFX・readback・DDSの内訳をJSONLへ記録する。
+
+```sh
+./Utils/run/verify_metal.sh --compare-tensorops --compare-runs 5 \
+  --keep-artifacts --record-jsonl /private/tmp/ortho4xp-backend-comparison.jsonl
+```
+
+MetalFX出力の品質ゲートは同じ入力に対するFP8 TensorOps PNG出力を基準にし、PSNR低下0.25dB以内、MAE/RMSE増加5%以内とする。`--compare-tensorops`は実機向けの明示的な比較レーンなので、4096px direct DDSを含む実行時間とディスク使用量を見込んでから実行する。
 
 MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
 
@@ -81,7 +90,7 @@ MetalFXの単画像RGBA経路と順次batch経路は、次で確認できる。
 
 direct DDS batchは既定2 worker、最大4 worker、1プロセス8画像chunkで実行する。verbosity 1では`MetalFX Spatial DDS batch: completed/total`、続けて`png_intermediate=false`、`metalfx_ms`、`readback_ms`、`dds_ms`、`temporary_bytes`、fallback理由を表示する。単独経路と性能を比較する場合は、同じ入力を次のように実行する。
 
-TensorOps direct DDSはGPU同時実行を避け、既定1 worker・1 child processあたり8画像のchunkで実行する。chunk終了時にASHelperを終了するため、Metal/PNG/CGImageの一時リソースをプロセス境界で回収できる。ログには`batch_workers=1`、`batch_chunks`、`chunk_size=8`、`peak_rss_mb`、`rss_after_item_mb`、`signal=9`（SIGKILL時）、`fallback_reasons=process_signal_9`を記録する。TensorOps batchが失敗した場合は失敗chunkの画像だけを`ci_lanczos`へ送り、成功済みDDSは再処理しない。`--tensorops-upscale`とそのbatchはPNG互換CLIとして残るが、実タイルのdirect DDSでは`png_intermediate=false`となり、`_tensorops_upscaled.png`や`tile_input.png`を生成しない。
+TensorOps direct DDSは1プロセス8画像のchunkを単位にし、画像別activation/output、DDS一時payloadとmipmap、親プロセスRSS、物理メモリの70%を含む推定working setからworker数を動的に決める（最大4）。512px級は安全な範囲で並列化し、2048px以上は通常1 workerに制限する。物理メモリを取得できない場合も安全のため1 workerとする。chunk終了時にASHelperを終了するため、Metal/PNG/CGImageの一時リソースをプロセス境界で回収できる。ログには`batch_workers`、`batch_chunks`、`chunk_size=8`、`memory_budget_mb`、`parent_rss_mb`、`estimated_worker_mb`、`estimated_total_mb`、`peak_rss_mb`、`rss_after_item_mb`、`signal=9`（SIGKILL時）、`fallback_reasons`を記録する。TensorOps batchが失敗した場合は元JPEGを使って失敗画像だけをMetalFXへ再処理し、MetalFXも失敗した画像だけを`ci_lanczos`へ送る。成功済みDDSは再処理しない。`--tensorops-upscale`とそのbatchはPNG互換CLIとして残るが、実タイルのdirect DDSでは`png_intermediate=false`となり、`_tensorops_upscaled.png`や`tile_input.png`を生成しない。
 
 ```sh
 cat >/private/tmp/metalfx-direct-dds.json <<'JSON'

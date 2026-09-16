@@ -81,6 +81,20 @@ final class BatchFailureState {
     }
 }
 
+/// Per-item telemetry used by both the resident JSONL server and the legacy
+/// positional batch CLI.  The object is intentionally item-local, so callers
+/// can update it without introducing a lock into the hot conversion path.
+final class DDSConversionTelemetry {
+    var backend = "unknown"
+    var success = false
+    var decodeMs = 0.0
+    var preprocessMs = 0.0
+    var compressionMs = 0.0
+    var writeMs = 0.0
+    var totalMs = 0.0
+    var peakRssMB = 0.0
+}
+
 struct MetalFXDirectDDSColor: Codable {
     let r: Double
     let g: Double
@@ -107,6 +121,15 @@ struct TensorOpsDirectDDSRequest: Codable {
     let version: Int
     let pack: String
     let items: [MetalFXDirectDDSItem]
+    // The normal standalone CLI keeps its historical CI fallback.  The
+    // Ortho4XP scheduler disables it so it can retry the original JPEG with
+    // MetalFX before using CI as the final fallback.
+    let fallbackToCI: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case version, pack, items
+        case fallbackToCI = "fallback_to_ci"
+    }
 }
 
 func residentMemoryMB() -> UInt64 {
@@ -428,6 +451,7 @@ struct FP8SRMatmulParams {
     uint m;
     uint n;
     uint k;
+    uint activationStride;
 };
 
 struct FP8SRPixelParams {
@@ -446,8 +470,9 @@ kernel void fp8sr_im2col_image(
     ulong total = pixelCount * ulong(params.targetK);
     ulong logicalIndex = params.baseIndex + ulong(gid);
     if (logicalIndex >= total) return;
-    uint pixel = uint(logicalIndex / ulong(params.targetK));
-    uint feature = uint(logicalIndex % ulong(params.targetK));
+    uint compactIndex = uint(logicalIndex);
+    uint pixel = compactIndex / params.targetK;
+    uint feature = compactIndex - pixel * params.targetK;
     if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
         destination[logicalIndex] = half(0.0h);
         return;
@@ -471,8 +496,9 @@ kernel void fp8sr_im2col_features(
     ulong total = pixelCount * ulong(params.targetK);
     ulong logicalIndex = params.baseIndex + ulong(gid);
     if (logicalIndex >= total) return;
-    uint pixel = uint(logicalIndex / ulong(params.targetK));
-    uint feature = uint(logicalIndex % ulong(params.targetK));
+    uint compactIndex = uint(logicalIndex);
+    uint pixel = compactIndex / params.targetK;
+    uint feature = compactIndex - pixel * params.targetK;
     if (feature >= params.kernelSize * params.kernelSize * params.sourceChannels) {
         destination[logicalIndex] = half(0.0h);
         return;
@@ -503,7 +529,7 @@ kernel void fp8sr_matmul(
     auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
         activationBuffer,
         dextents<int, 2>{int(params.k), int(params.m)},
-        array<int, 2>{1, int(params.k)});
+        array<int, 2>{1, int(params.activationStride)});
     auto weights = tensor<device metal_fp8_e4m3_format, dextents<int, 2>, tensor_inline>(
         weightBuffer,
         dextents<int, 2>{int(params.n), int(params.k)},
@@ -533,7 +559,7 @@ kernel void fp8sr_matmul_fp16(
     auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
         activationBuffer,
         dextents<int, 2>{int(params.k), int(params.m)},
-        array<int, 2>{1, int(params.k)});
+        array<int, 2>{1, int(params.activationStride)});
     auto weights = tensor<device half, dextents<int, 2>, tensor_inline>(
         reinterpret_cast<device half *>(weightBuffer),
         dextents<int, 2>{int(params.n), int(params.k)},
@@ -563,7 +589,7 @@ kernel void fp8sr_matmul_fp4(
     auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
         activationBuffer,
         dextents<int, 2>{int(params.k), int(params.m)},
-        array<int, 2>{1, int(params.k)});
+        array<int, 2>{1, int(params.activationStride)});
     auto weights = tensor<device metal_fp4_e2m1_format, dextents<int, 2>, tensor_inline>(
         weightBuffer,
         dextents<int, 2>{int(params.n), int(params.k)},
@@ -593,7 +619,7 @@ kernel void fp8sr_matmul_int2(
     auto activation = tensor<device half, dextents<int, 2>, tensor_inline>(
         activationBuffer,
         dextents<int, 2>{int(params.k), int(params.m)},
-        array<int, 2>{1, int(params.k)});
+        array<int, 2>{1, int(params.activationStride)});
     auto weights = tensor<device int2b_format, dextents<int, 2>, tensor_inline>(
         weightBuffer,
         dextents<int, 2>{int(params.n), int(params.k)},
@@ -658,6 +684,11 @@ class MetalCompressor {
     let pipe: MTLComputePipelineState
     let q: MTLCommandQueue
     let loader: MTKTextureLoader
+    let ciContext: CIContext
+    private let bufferPoolLock = NSLock()
+    private var bufferPool: [Int: [MTLBuffer]] = [:]
+    private var bufferPoolBytes = 0
+    private let maxBufferPoolBytes = 512 * 1024 * 1024
     
     private init?() {
         guard let dev = MTLCreateSystemDefaultDevice(),
@@ -669,6 +700,26 @@ class MetalCompressor {
         self.pipe = pipe
         self.q = q
         self.loader = MTKTextureLoader(device: dev)
+        self.ciContext = CIContext(mtlDevice: dev, options: nil)
+    }
+
+    func acquireSharedBuffer(length: Int) -> MTLBuffer? {
+        bufferPoolLock.lock()
+        defer { bufferPoolLock.unlock() }
+        if var candidates = bufferPool[length], let buffer = candidates.popLast() {
+            bufferPool[length] = candidates
+            bufferPoolBytes -= length
+            return buffer
+        }
+        return dev.makeBuffer(length: length, options: .storageModeShared)
+    }
+
+    func recycleSharedBuffer(_ buffer: MTLBuffer) {
+        bufferPoolLock.lock()
+        defer { bufferPoolLock.unlock() }
+        guard bufferPoolBytes + buffer.length <= maxBufferPoolBytes else { return }
+        bufferPool[buffer.length, default: []].append(buffer)
+        bufferPoolBytes += buffer.length
     }
 }
 
@@ -1324,6 +1375,8 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
         return nil
     }
     
+    guard let cmb = q.makeCommandBuffer() else { return nil }
+
     // 2. Render preprocessed CIImage directly into the MTLTexture level 0 [100% Zero-Copy]
     // [Y-Flip Fix] CIImage has bottom-left origin, while MTLTexture has top-left origin.
     // We must vertically flip the image so it compiles right-side up in X-Plane.
@@ -1331,12 +1384,16 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
         .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
         .transformed(by: CGAffineTransform(translationX: 0, y: bounds.height))
     
-    let ctx = CIContext(options: [.useSoftwareRenderer: false])
     let colorSpace = CGColorSpaceCreateDeviceRGB()
-    ctx.render(flippedCI, to: mtlTexture, commandBuffer: nil, bounds: bounds, colorSpace: colorSpace)
+    comp.ciContext.render(
+        flippedCI,
+        to: mtlTexture,
+        commandBuffer: cmb,
+        bounds: bounds,
+        colorSpace: colorSpace
+    )
     
     // 3. Generate lower mipmap levels directly inside VRAM using GPU Blit Encoder
-    guard let cmb = q.makeCommandBuffer() else { return nil }
     guard let mipEncoder = cmb.makeBlitCommandEncoder() else {
         reportError("ASHelper: Failed to create the Metal mipmap blit encoder.")
         return nil
@@ -1346,10 +1403,15 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     
     // 4. Run Metal compute kernels to compress each mipmap level
     var buffers: [MTLBuffer] = []
+    defer {
+        for buffer in buffers {
+            comp.recycleSharedBuffer(buffer)
+        }
+    }
     for level in 0..<mtlTexture.mipmapLevelCount {
         let lW = max(1, w >> level); let lH = max(1, h >> level); let bW = (lW + 3) / 4; let bH = (lH + 3) / 4
         let sz = bW * bH * (mode == 0 ? 8 : 16)
-        guard let buf = dev.makeBuffer(length: sz, options: .storageModeShared),
+        guard let buf = comp.acquireSharedBuffer(length: sz),
               buf.length == sz else { return nil }
         buffers.append(buf)
         
@@ -1363,7 +1425,7 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
         enc.dispatchThreadgroups(MTLSize(width: (bW + 15) / 16, height: (bH + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
     }
-    
+
     cmb.commit()
     cmb.waitUntilCompleted()
     guard cmb.status == .completed else {
@@ -1515,8 +1577,16 @@ func convertCGImageWithPreprocess(
     saturation: Double,
     outputPath: String,
     format: String,
-    useGPU: Bool
+    useGPU: Bool,
+    telemetry: DDSConversionTelemetry? = nil
 ) -> Bool {
+    let started = CFAbsoluteTimeGetCurrent()
+    var completed = false
+    defer {
+        telemetry?.success = completed
+        telemetry?.totalMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+        telemetry?.peakRssMB = Double(residentMemoryMB())
+    }
     guard format == "BC1" || format == "BC3" else {
         reportError("ASHelper does not support \(format) output. Use nvcompress instead.")
         return false
@@ -1637,6 +1707,8 @@ func convertCGImageWithPreprocess(
         }
     }
     
+    telemetry?.preprocessMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+
     // 4. Zero-Copy rendering and direct VRAM compression
     let bounds = finalCI.extent
     let w = Int(bounds.width)
@@ -1651,9 +1723,11 @@ func convertCGImageWithPreprocess(
     var out = hdr.toData()
     if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
     var compressed = false
+    let compressionStarted = CFAbsoluteTimeGetCurrent()
     if useGPU, let gData = compressWithPreprocessedCIImage(finalCI: finalCI, mode: formatCode, useGPU: useGPU) {
         out.append(gData)
         compressed = true
+        telemetry?.backend = "metal"
     }
     if !compressed {
         let canUseDecodedSourceDirectly =
@@ -1682,9 +1756,15 @@ func convertCGImageWithPreprocess(
             reportError("ASHelper: Failed to compress image '\(sourceLabel)'.")
             return false
         }
+        telemetry?.backend = "cpu"
     }
+    telemetry?.compressionMs = (CFAbsoluteTimeGetCurrent() - compressionStarted) * 1000.0
 
-    return writeDDS(out, to: outputPath)
+    let writeStarted = CFAbsoluteTimeGetCurrent()
+    let written = writeDDS(out, to: outputPath)
+    telemetry?.writeMs = (CFAbsoluteTimeGetCurrent() - writeStarted) * 1000.0
+    completed = written
+    return written
 }
 
 func convertWithPreprocess(
@@ -1698,15 +1778,18 @@ func convertWithPreprocess(
     saturation: Double,
     outputPath: String,
     format: String,
-    useGPU: Bool
+    useGPU: Bool,
+    telemetry: DDSConversionTelemetry? = nil
 ) -> Bool {
+    let started = CFAbsoluteTimeGetCurrent()
     let jpegURL = URL(fileURLWithPath: jpegPath)
     guard let source = CGImageSourceCreateWithURL(jpegURL as CFURL, nil),
           let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         reportError("ASHelper: Failed to load source image '\(jpegPath)'.")
         return false
     }
-    return convertCGImageWithPreprocess(
+    telemetry?.decodeMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+    let result = convertCGImageWithPreprocess(
         sourceImage: sourceImage,
         sourceLabel: jpegPath,
         maskPath: maskPath,
@@ -1718,8 +1801,11 @@ func convertWithPreprocess(
         saturation: saturation,
         outputPath: outputPath,
         format: format,
-        useGPU: useGPU
+        useGPU: useGPU,
+        telemetry: telemetry
     )
+    telemetry?.totalMs += telemetry?.decodeMs ?? 0.0
+    return result
 }
 
 func lanczosImage(inputPath: String) -> CGImage? {
@@ -2323,7 +2409,8 @@ private struct TensorOpsDirectDDSItemResult {
 @available(macOS 27.0, *)
 private func processTensorOpsDirectDDSItem(
     item: MetalFXDirectDDSItem,
-    runtime: FP8SRRuntime?
+    runtime: FP8SRRuntime?,
+    fallbackToCI: Bool
 ) -> TensorOpsDirectDDSItemResult {
     let started = CFAbsoluteTimeGetCurrent()
     var tensorOpsMs = 0.0
@@ -2382,6 +2469,21 @@ private func processTensorOpsDirectDDSItem(
         )
     } catch {
         fallbackReason = String(describing: error)
+    }
+
+    guard fallbackToCI else {
+        return TensorOpsDirectDDSItemResult(
+            success: false,
+            effectiveBackend: "failed",
+            tensorOpsDispatchObserved: false,
+            alphaMode: "opaque",
+            fallbackReason: fallbackReason ?? "tensorops_failed",
+            tensorOpsMs: tensorOpsMs,
+            readbackMs: readbackMs,
+            ddsMs: 0.0,
+            totalMs: (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+            rssMB: residentMemoryMB()
+        )
     }
 
     let fallbackStarted = CFAbsoluteTimeGetCurrent()
@@ -2450,7 +2552,11 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
 
         for (index, item) in request.items.enumerated() {
             let result = autoreleasepool {
-                processTensorOpsDirectDDSItem(item: item, runtime: runtime)
+                processTensorOpsDirectDDSItem(
+                    item: item,
+                    runtime: runtime,
+                    fallbackToCI: request.fallbackToCI ?? true
+                )
             }
             peakRSSMB = max(peakRSSMB, result.rssMB)
             if result.success {
@@ -2695,6 +2801,7 @@ private struct FP8SRMatmulParams {
     var m: UInt32
     var n: UInt32
     var k: UInt32
+    var activationStride: UInt32
 }
 
 @available(macOS 27.0, *)
@@ -2731,7 +2838,11 @@ private final class FP8SRRuntime {
     private let pixelShufflePipeline: MTLComputePipelineState
     private let layers: [Layer]
     private var transientBuffers: [MTLBuffer] = []
+    private var scratchPool: [MTLBuffer] = []
+    private var scratchPoolBytes = 0
     private var nextCompletionValue: UInt64 = 1
+
+    private static let maxScratchPoolBytes = 8 * 1024 * 1024 * 1024
 
     var weightDTypeName: String {
         layers.first?.weightDType ?? "unknown"
@@ -2946,6 +3057,16 @@ private final class FP8SRRuntime {
         return ((elements + 63) / 64) * 64
     }
 
+    private static func matmulKernelElements(_ layer: FP8SRManifestLayer) -> Int {
+        let elements = layer.kernel * layer.kernel * layer.inChannels
+        // MPP consumes 32-wide K tiles. Keep the activation's physical stride
+        // padded for the external pack, but skip only the known zero padding
+        // after a logical K that is already 32-aligned. Non-aligned layers
+        // must round up so the final real weights are not dropped.
+        if elements <= 32 { return 32 }
+        return max(32, ((elements + 31) / 32) * 32)
+    }
+
     private static func makeSharedBuffer(device: MTLDevice, data: Data) throws -> MTLBuffer {
         let length = max(128, (data.count + 127) & ~127)
         guard let buffer = device.makeBuffer(length: length, options: .storageModeShared) else {
@@ -2954,6 +3075,36 @@ private final class FP8SRRuntime {
         buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: length)
         data.copyBytes(to: buffer.contents().assumingMemoryBound(to: UInt8.self), count: data.count)
         return buffer
+    }
+
+    private func acquireScratchBuffer(length: Int) throws -> MTLBuffer {
+        let alignedLength = max(128, (length + 127) & ~127)
+        var bestIndex: Int?
+        for index in scratchPool.indices where scratchPool[index].length >= alignedLength {
+            if bestIndex == nil || scratchPool[index].length < scratchPool[bestIndex!].length {
+                bestIndex = index
+            }
+        }
+        if let index = bestIndex {
+            let buffer = scratchPool.remove(at: index)
+            scratchPoolBytes -= buffer.length
+            return buffer
+        }
+        guard let buffer = device.makeBuffer(
+            length: alignedLength,
+            options: .storageModeShared
+        ) else {
+            throw FP8SRError.unavailable("buffer_allocation")
+        }
+        return buffer
+    }
+
+    private func recycleScratchBuffer(_ buffer: MTLBuffer) {
+        guard scratchPoolBytes + buffer.length <= Self.maxScratchPoolBytes else {
+            return
+        }
+        scratchPool.append(buffer)
+        scratchPoolBytes += buffer.length
     }
 
     private static func makeWeightBuffer(
@@ -3059,8 +3210,9 @@ private final class FP8SRRuntime {
 
     private func encodeDispatchBarrier(_ encoder: MTL4ComputeCommandEncoder) {
         // MTL4 keeps multiple dispatches in one encoder, so dependent kernels
-        // need an explicit intra-pass barrier. Without it, a matmul may read
-        // the zero-filled activation buffer before im2col has completed.
+        // need an explicit intra-pass barrier. Without it, a dependent
+        // matmul or postprocess may read a buffer before its producer has
+        // completed.
         encoder.barrier(
             afterEncoderStages: .dispatch,
             beforeEncoderStages: .dispatch,
@@ -3195,7 +3347,6 @@ private final class FP8SRRuntime {
             threadsPerGrid: MTLSize(width: Int(params.pixelCount), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
         )
-        encodeDispatchBarrier(encoder)
     }
 
     private static let coreTileDimension = 2048
@@ -3439,16 +3590,15 @@ private final class FP8SRRuntime {
         }
 
         guard let commandBuffer = device.makeCommandBuffer(),
-              let errorBuffer = device.makeBuffer(length: 128, options: .storageModeShared),
-              let outputBuffer = device.makeBuffer(
-                  length: max(128, try checkedMultiply(width, height, 16, label: "output_buffer")),
-                  options: .storageModeShared
+              let errorBuffer = try? acquireScratchBuffer(length: 128),
+              let outputBuffer = try? acquireScratchBuffer(
+                  length: try checkedMultiply(width, height, 16, label: "output_buffer")
               ) else {
             throw FP8SRError.execution("command_buffer")
         }
-        errorBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: errorBuffer.length)
-        outputBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: outputBuffer.length)
+        errorBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee = 0
         transientBuffers.removeAll(keepingCapacity: true)
+        var scratchBuffersInUse: [MTLBuffer] = [errorBuffer, outputBuffer]
         var temporaryResources: [MTLAllocation] = [inputTexture, errorBuffer, outputBuffer]
         defer {
             for resource in temporaryResources {
@@ -3458,6 +3608,9 @@ private final class FP8SRRuntime {
                 residencySet.removeAllocation(buffer)
             }
             transientBuffers.removeAll(keepingCapacity: true)
+            for buffer in scratchBuffersInUse {
+                recycleScratchBuffer(buffer)
+            }
             residencySet.commit()
         }
         residencySet.addAllocation(inputTexture)
@@ -3473,18 +3626,12 @@ private final class FP8SRRuntime {
         var previousOutput: MTLBuffer?
         for (index, layer) in layers.enumerated() {
             let kPadded = FP8SRRuntime.paddedKernelElements(layer.manifest)
-            let activationBuffer = try FP8SRRuntime.makeSharedBuffer(
-                device: device,
-                data: Data(count: max(128, try checkedMultiply(kPadded, pixelCount, 2, label: "activation_buffer")))
+            let activationBuffer = try acquireScratchBuffer(
+                length: try checkedMultiply(kPadded, pixelCount, 2, label: "activation_buffer")
             )
             residencySet.addAllocation(activationBuffer)
             temporaryResources.append(activationBuffer)
-            _ = try makeTensor(
-                buffer: activationBuffer,
-                dimensions: [kPadded, pixelCount],
-                strides: [1, kPadded],
-                dataType: .float16
-            )
+            scratchBuffersInUse.append(activationBuffer)
             if index == 0 {
                 var params = FP8SRIm2ColParams(
                     width: UInt32(width), height: UInt32(height),
@@ -3513,21 +3660,23 @@ private final class FP8SRRuntime {
                 )
             }
 
-            let outputLength = max(128, try checkedMultiply(32, pixelCount, 2, label: "layer_output") + 128)
-            guard let layerOutput = device.makeBuffer(length: outputLength, options: .storageModeShared) else {
-                throw FP8SRError.execution("layer_output")
-            }
-            layerOutput.contents().initializeMemory(as: UInt8.self, repeating: 0, count: layerOutput.length)
+            let layerOutputBytes = try checkedMultiply(32, pixelCount, 2, label: "layer_output")
+            let outputLength = max(128, layerOutputBytes + 128)
+            let layerOutput = try acquireScratchBuffer(length: outputLength)
+            layerOutput.contents().initializeMemory(
+                as: UInt8.self,
+                repeating: 0,
+                count: layerOutputBytes
+            )
             residencySet.addAllocation(layerOutput)
             temporaryResources.append(layerOutput)
-            _ = try makeTensor(
-                buffer: layerOutput,
-                dimensions: [32, pixelCount],
-                strides: [1, 32],
-                dataType: .float16
-            )
+            scratchBuffersInUse.append(layerOutput)
+            let matmulK = FP8SRRuntime.matmulKernelElements(layer.manifest)
             var matmulParams = FP8SRMatmulParams(
-                m: UInt32(pixelCount), n: 32, k: UInt32(kPadded)
+                m: UInt32(pixelCount),
+                n: 32,
+                k: UInt32(matmulK),
+                activationStride: UInt32(kPadded)
             )
             try encodeMatmul(
                 encoder: encoder,
@@ -3731,7 +3880,10 @@ private final class FP8SRRuntime {
                 dataType: .float16
             )
             var matmulParams = FP8SRMatmulParams(
-                m: UInt32(pixelCount), n: 32, k: UInt32(kPadded)
+                m: UInt32(pixelCount),
+                n: 32,
+                k: UInt32(FP8SRRuntime.matmulKernelElements(layer.manifest)),
+                activationStride: UInt32(kPadded)
             )
             try encodeMatmul(
                 encoder: encoder,
@@ -4356,6 +4508,16 @@ private func serverDouble(
     return defaultValue
 }
 
+private func serverInt(
+    _ request: [String: Any],
+    _ key: String,
+    defaultValue: Int
+) -> Int {
+    if let number = request[key] as? NSNumber { return number.intValue }
+    if let string = request[key] as? String, let value = Int(string) { return value }
+    return defaultValue
+}
+
 private func serverTaskResult(
     _ taskID: String,
     success: Bool,
@@ -4379,46 +4541,69 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
         return [serverTaskResult("batch", success: false, backend: "server", error: "tasks_required")]
     }
 
-    // Keep one resident helper memory-bounded.  A request is already the
-    // scheduler's GPU batch, so launching every item concurrently would keep
-    // multiple decoded images, CI graphs, mip buffers, and BC payloads alive
-    // at once.  Process items serially and let the caller batch at the process
-    // boundary when it needs a stronger reclamation point.
+    // Keep one resident helper memory-bounded.  The caller sends bounded
+    // chunks, while this fixed worker pool keeps the M5 Max GPU occupied
+    // without creating one task per image on the global dispatch pool.
+    let concurrencyLimit = min(
+        12,
+        max(1, serverInt(request, "parallelism", defaultValue: 1))
+    )
     var results = Array(repeating: [String: Any](), count: tasks.count)
-    for (index, task) in tasks.enumerated() {
-        let taskID = serverTaskID(task, index: index)
-        guard let input = serverString(task, "input"),
-              let output = serverString(task, "output"),
-              let format = serverString(task, "format"),
-              format == "BC1" || format == "BC3" else {
+    let resultLock = NSLock()
+    let semaphore = DispatchSemaphore(value: concurrencyLimit)
+    DispatchQueue.concurrentPerform(iterations: tasks.count) { index in
+        semaphore.wait()
+        defer { semaphore.signal() }
+        autoreleasepool {
+            let task = tasks[index]
+            let taskID = serverTaskID(task, index: index)
+            guard let input = serverString(task, "input"),
+                  let output = serverString(task, "output"),
+                  let format = serverString(task, "format"),
+                  format == "BC1" || format == "BC3" else {
+                resultLock.lock()
+                results[index] = serverTaskResult(
+                    taskID,
+                    success: false,
+                    backend: "server",
+                    error: "invalid_task"
+                )
+                resultLock.unlock()
+                return
+            }
+
+            let telemetry = DDSConversionTelemetry()
+            let ok = convertWithPreprocess(
+                jpegPath: input,
+                maskPath: serverString(task, "mask") ?? "none",
+                r: serverDouble(task, "r", defaultValue: 1.0),
+                g: serverDouble(task, "g", defaultValue: 1.0),
+                b: serverDouble(task, "b", defaultValue: 1.0),
+                contrast: serverDouble(task, "contrast", defaultValue: 1.0),
+                brightness: serverDouble(task, "brightness", defaultValue: 0.0),
+                saturation: serverDouble(task, "saturation", defaultValue: 1.0),
+                outputPath: output,
+                format: format,
+                useGPU: useGPU,
+                telemetry: telemetry
+            )
+            resultLock.lock()
             results[index] = serverTaskResult(
                 taskID,
-                success: false,
-                backend: "server",
-                error: "invalid_task"
+                success: ok,
+                backend: telemetry.backend,
+                error: ok ? nil : "conversion_failed",
+                extra: [
+                    "decode_ms": telemetry.decodeMs,
+                    "preprocess_ms": telemetry.preprocessMs,
+                    "compression_ms": telemetry.compressionMs,
+                    "write_ms": telemetry.writeMs,
+                    "total_ms": telemetry.totalMs,
+                    "peak_rss_mb": telemetry.peakRssMB,
+                ]
             )
-            continue
+            resultLock.unlock()
         }
-
-        let ok = convertWithPreprocess(
-            jpegPath: input,
-            maskPath: serverString(task, "mask") ?? "none",
-            r: serverDouble(task, "r", defaultValue: 1.0),
-            g: serverDouble(task, "g", defaultValue: 1.0),
-            b: serverDouble(task, "b", defaultValue: 1.0),
-            contrast: serverDouble(task, "contrast", defaultValue: 1.0),
-            brightness: serverDouble(task, "brightness", defaultValue: 0.0),
-            saturation: serverDouble(task, "saturation", defaultValue: 1.0),
-            outputPath: output,
-            format: format,
-            useGPU: useGPU
-        )
-        results[index] = serverTaskResult(
-            taskID,
-            success: ok,
-            backend: useGPU ? "metal" : "cpu",
-            error: ok ? nil : "conversion_failed"
-        )
     }
     return results
 }
@@ -4817,11 +5002,50 @@ else if args[1] == "--convert-batch-v3" {
     let failureState = BatchFailureState()
     let concurrencyLimit = min(8, max(1, tasks.count))
     let semaphore = DispatchSemaphore(value: concurrencyLimit)
+    let telemetryLock = NSLock()
+    var metalCount = 0
+    var cpuCount = 0
+    var failedCount = 0
+    var decodeMs = 0.0
+    var preprocessMs = 0.0
+    var compressionMs = 0.0
+    var writeMs = 0.0
+    var totalMs = 0.0
+    var peakRssMB = 0.0
     DispatchQueue.concurrentPerform(iterations: tasks.count) { i in
         semaphore.wait()
         defer { semaphore.signal() }
         let t = tasks[i]
-        if !convertWithPreprocess(jpegPath: t.jpeg, maskPath: t.mask, r: t.r, g: t.g, b: t.b, contrast: t.contrast, brightness: t.brightness, saturation: t.saturation, outputPath: t.output, format: t.format, useGPU: useGPU) {
+        let telemetry = DDSConversionTelemetry()
+        let ok = convertWithPreprocess(
+            jpegPath: t.jpeg,
+            maskPath: t.mask,
+            r: t.r,
+            g: t.g,
+            b: t.b,
+            contrast: t.contrast,
+            brightness: t.brightness,
+            saturation: t.saturation,
+            outputPath: t.output,
+            format: t.format,
+            useGPU: useGPU,
+            telemetry: telemetry
+        )
+        telemetryLock.lock()
+        if telemetry.backend == "metal" {
+            metalCount += 1
+        } else if telemetry.backend == "cpu" {
+            cpuCount += 1
+        }
+        if !ok { failedCount += 1 }
+        decodeMs += telemetry.decodeMs
+        preprocessMs += telemetry.preprocessMs
+        compressionMs += telemetry.compressionMs
+        writeMs += telemetry.writeMs
+        totalMs += telemetry.totalMs
+        peakRssMB = max(peakRssMB, telemetry.peakRssMB)
+        telemetryLock.unlock()
+        if !ok {
             failureState.recordFailure(
                 index: i,
                 input: t.jpeg,
@@ -4830,6 +5054,21 @@ else if args[1] == "--convert-batch-v3" {
             )
         }
     }
+    let effectiveBackend = cpuCount == 0 && metalCount == tasks.count
+        ? "metal"
+        : (metalCount == 0 ? "cpu" : "mixed")
+    print(
+        "backend=dds effective_backend=\(effectiveBackend) dispatch=batch-v3 "
+            + "batch_tasks=\(tasks.count) batch_success=\(tasks.count - failedCount) "
+            + "batch_failed=\(failedCount) metal_items=\(metalCount) "
+            + "cpu_fallback_items=\(cpuCount) concurrency=\(concurrencyLimit) "
+            + "decode_ms=\(String(format: "%.2f", decodeMs)) "
+            + "preprocess_ms=\(String(format: "%.2f", preprocessMs)) "
+            + "compression_ms=\(String(format: "%.2f", compressionMs)) "
+            + "write_ms=\(String(format: "%.2f", writeMs)) "
+            + "total_item_ms=\(String(format: "%.2f", totalMs)) "
+            + "peak_rss_mb=\(String(format: "%.2f", peakRssMB))"
+    )
     if failureState.hasFailure() {
         failureState.reportFailures()
         exit(1)

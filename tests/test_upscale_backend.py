@@ -38,7 +38,11 @@ def test_fp8_model_pack_config_is_external_and_optional():
     assert "fp8_model_path" in CFG.list_dsf_vars
 
 
-def test_fp8_missing_pack_falls_back_to_lanczos(tmp_path, monkeypatch):
+def test_new_upscale_backend_defaults_to_metalfx_spatial():
+    assert CFG.cfg_vars["upscale_backend"]["default"] == "metalfx_spatial"
+
+
+def test_fp8_missing_pack_falls_back_to_metalfx(tmp_path, monkeypatch):
     from PIL import Image
 
     source = tmp_path / "source.png"
@@ -49,7 +53,7 @@ def test_fp8_missing_pack_falls_back_to_lanczos(tmp_path, monkeypatch):
         f"#!{sys.executable}\n"
         "import sys\n"
         "from PIL import Image\n"
-        "assert sys.argv[1] == '--ci-lanczos-upscale'\n"
+        "assert sys.argv[1] == '--metalfx-spatial-upscale'\n"
         "image = Image.open(sys.argv[2])\n"
         "image.resize((image.width * 2, image.height * 2)).save(sys.argv[3])\n",
         encoding="utf-8",
@@ -64,8 +68,9 @@ def test_fp8_missing_pack_falls_back_to_lanczos(tmp_path, monkeypatch):
     )
 
     assert output is not None
-    assert effective == "ci_lanczos"
+    assert effective == "metalfx_spatial"
     assert reason == "fp8_model_unavailable"
+    assert output.endswith("_metalfx_spatial_upscaled.png")
     with Image.open(output) as image:
         assert image.size == (4, 6)
 
@@ -101,6 +106,38 @@ def test_fp8_helper_failure_falls_back_to_lanczos(tmp_path, monkeypatch):
     assert reason == "tensorops_exit_7"
     with Image.open(output) as image:
         assert image.size == (4, 6)
+
+
+def test_fp8_failure_retries_original_input_with_metalfx(tmp_path, monkeypatch):
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    Image.new("RGB", (2, 3), (20, 40, 60)).save(source)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(IMG.UI, "Ortho4XP_dir", str(tmp_path / "ortho4xp"))
+    helper = tmp_path / "fake_ashelper"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from PIL import Image\n"
+        "if sys.argv[1] == '--tensorops-upscale': sys.exit(7)\n"
+        "assert sys.argv[1] == '--metalfx-spatial-upscale'\n"
+        "image = Image.open(sys.argv[2])\n"
+        "image.resize((image.width * 2, image.height * 2)).save(sys.argv[3])\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    output, effective, reason = IMG.run_upscale(
+        str(source), "tensorops", str(helper), str(pack)
+    )
+
+    assert output is not None
+    assert effective == "metalfx_spatial"
+    assert reason == "tensorops_exit_7"
+    assert output.endswith("_metalfx_spatial_upscaled.png")
 
 
 def test_metalfx_failure_falls_back_to_lanczos(tmp_path, monkeypatch):
@@ -387,13 +424,13 @@ def test_tensorops_direct_dds_uses_pack_chunks_and_no_png(tmp_path, monkeypatch)
     pack_path = tmp_path / "model.fp8sr"
 
     result = TILE._run_tensorops_direct_dds_batch(
-        str(helper), str(pack_path), specs, chunk_size=8
+        str(helper), str(pack_path), specs, chunk_size=8, worker_limit=2
     )
 
     assert result["batch_tasks"] == 9
     assert result["batch_success"] == 9
     assert result["batch_failed"] == 0
-    assert result["batch_workers"] == 1
+    assert result["batch_workers"] == 2
     assert result["batch_chunks"] == 2
     assert result["chunk_size"] == 8
     assert result["peak_rss_mb"] == 321
@@ -406,6 +443,7 @@ def test_tensorops_direct_dds_uses_pack_chunks_and_no_png(tmp_path, monkeypatch)
         request = json.loads(request_path.read_text(encoding="utf-8"))
         assert request["version"] == 1
         assert request["pack"] == str(pack_path)
+        assert request["fallback_to_ci"] is False
         assert len(request["items"]) <= 8
         assert all(item["output"].endswith(".gpu.tmp.dds") for item in request["items"])
 

@@ -33,10 +33,34 @@ def peak_rss_mb() -> float:
     conversion is kept local so the metrics schema remains platform-neutral.
     """
 
-    value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak_rss_bytes() / (1024.0 * 1024.0)
+
+
+def peak_rss_bytes() -> int:
+    """Return the current process peak resident set size in bytes."""
+
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if os.sys.platform == "darwin":
-        return value / (1024.0 * 1024.0)
-    return value / 1024.0
+        return value
+    return value * 1024
+
+
+def physical_memory_bytes() -> int:
+    """Return physical memory when the host exposes a portable sysconf value.
+
+    ``SC_PHYS_PAGES`` is available on the supported macOS and Linux hosts and
+    avoids adding a platform-specific dependency to the scheduler.  A zero
+    result means that the caller should use its conservative fallback.
+    """
+
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return 0
+    if pages <= 0 or page_size <= 0:
+        return 0
+    return pages * page_size
 
 
 def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -102,6 +126,18 @@ class PerformanceMetrics:
     def set_capabilities(self, values: Dict[str, Any]) -> None:
         with self._lock:
             self.data["capabilities"].update(deepcopy(values))
+
+    def set_value(self, name: str, value: Any) -> None:
+        """Store the latest scalar or string measurement for the current run."""
+
+        with self._lock:
+            target = self._target()
+            targets = [target]
+            if target is not self.data["totals"]:
+                targets.append(self.data["totals"])
+            for current in targets:
+                measurements = current.setdefault("measurements", {})
+                measurements[str(name)] = deepcopy(value)
 
     def begin_attempt(
         self,
