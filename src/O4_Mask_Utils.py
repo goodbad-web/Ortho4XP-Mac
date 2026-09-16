@@ -887,22 +887,14 @@ if __name__ == "__main__":
     )  # assuming meters if not degrees
     vector_map = VECT.Vector_Map()
     osm_layer = OSM.OSM_layer()
-    if not os.path.exists(cached_file_name):
-        print("OSM query...")
-        if not OSM.OSM_query_to_OSM_layer(
-            query, "", osm_layer, "all", cached_file_name=cached_file_name
-        ):
-            print("OSM query failed. Exiting.")
-            del vector_map
-            time.sleep(1)
-            sys.exit(0)
-    else:
-        print("Recycling OSM file...")
-        if not osm_layer.update_dicosm(cached_file_name, None):
-            print("OSM extent cache is corrupted. Exiting.")
-            del vector_map
-            time.sleep(1)
-            sys.exit(1)
+    print("OSM query..." if not os.path.exists(cached_file_name) else "Recycling OSM file...")
+    if not OSM.OSM_query_to_OSM_layer(
+        query, "", osm_layer, "all", cached_file_name=cached_file_name
+    ):
+        print("OSM cache is missing, unverified, or corrupted. Exiting.")
+        del vector_map
+        time.sleep(1)
+        sys.exit(1)
     print("Transform to multipolygon...")
     multipolygon_area = OSM.OSM_to_MultiPolygon(osm_layer, 0, 0)
     del osm_layer

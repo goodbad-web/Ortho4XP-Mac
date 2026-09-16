@@ -142,6 +142,51 @@ def _tensorops_estimated_dds_bytes(spec):
     return header_bytes + payload_bytes
 
 
+def _run_tensorops_child(command):
+    """Run one TensorOps child and return its output plus child RSS."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        output = process.stdout.read() if process.stdout is not None else ""
+        if hasattr(os, "wait4"):
+            while True:
+                try:
+                    _, wait_status, usage = os.wait4(process.pid, 0)
+                    break
+                except InterruptedError:
+                    continue
+            if hasattr(os, "waitstatus_to_exitcode"):
+                returncode = os.waitstatus_to_exitcode(wait_status)
+            elif os.WIFEXITED(wait_status):
+                returncode = os.WEXITSTATUS(wait_status)
+            elif os.WIFSIGNALED(wait_status):
+                returncode = -os.WTERMSIG(wait_status)
+            else:
+                returncode = 1
+            process.returncode = returncode
+            rss = float(usage.ru_maxrss)
+            if sys.platform == "darwin":
+                rss /= 1024.0 * 1024.0
+            else:
+                rss /= 1024.0
+            rss_scope = "child_wait4"
+        else:
+            returncode = process.wait()
+            rss = 0.0
+            rss_scope = "unavailable"
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    return (
+        subprocess.CompletedProcess(command, returncode, output),
+        {"peak_rss_mb": rss, "rss_scope": rss_scope},
+    )
+
+
 def _tensorops_memory_plan(specs, max_workers=None, chunk_size=8):
     """Return a conservative worker plan for TensorOps direct-DDS work."""
 
@@ -155,6 +200,7 @@ def _tensorops_memory_plan(specs, max_workers=None, chunk_size=8):
             "memory_budget_mb": 0,
             "parent_rss_mb": 0,
             "estimated_worker_mb": 0,
+            "estimated_dds_mb": 0,
             "estimated_total_mb": 0,
             "reason": "empty",
         }
@@ -179,6 +225,9 @@ def _tensorops_memory_plan(specs, max_workers=None, chunk_size=8):
         requested = min(requested, 1)
     estimated_worker_bytes = max(
         _tensorops_estimated_working_set_bytes(spec) for spec in specs
+    )
+    estimated_dds_bytes = max(
+        _tensorops_estimated_dds_bytes(spec) for spec in specs
     )
     physical_bytes = int(PERF.physical_memory_bytes() or 0)
     parent_rss_bytes = int(PERF.peak_rss_bytes() or 0)
@@ -210,8 +259,14 @@ def _tensorops_memory_plan(specs, max_workers=None, chunk_size=8):
         "memory_budget_mb": int(budget_bytes / (1024 * 1024)),
         "parent_rss_mb": int(parent_rss_bytes / (1024 * 1024)),
         "estimated_worker_mb": int(estimated_worker_bytes / (1024 * 1024)),
+        "estimated_dds_mb": int(estimated_dds_bytes / (1024 * 1024)),
         "estimated_total_mb": int(
-            estimated_worker_bytes * workers / (1024 * 1024)
+            (
+                parent_rss_bytes
+                + TENSOROPS_FIXED_RESERVE_BYTES
+                + estimated_worker_bytes * workers
+            )
+            / (1024 * 1024)
         ),
         "reason": reason,
     }
@@ -1245,6 +1300,16 @@ class _StreamingConversionRunner:
         self.dds_format = getattr(
             tile, "dds_format", getattr(UI, "dds_format", "BC3")
         )
+        try:
+            self.gpu_parallelism = max(
+                1,
+                min(
+                    12,
+                    int(getattr(tile, "gpu_dds_workers", gpu_dds_workers)),
+                ),
+            )
+        except (TypeError, ValueError):
+            self.gpu_parallelism = 1
         use_gpu = bool(
             getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
         )
@@ -1471,6 +1536,7 @@ class _StreamingConversionRunner:
             response = self.gpu_server.convert_batch(
                 [spec["request"] for spec in specs],
                 gpu=True,
+                parallelism=self.gpu_parallelism,
                 transport=transport,
                 server_session_id=self.shared_memory_session_id,
                 generation=generation,
@@ -1516,6 +1582,7 @@ class _StreamingConversionRunner:
                 response = self.gpu_server.convert_batch(
                     [spec["request"] for spec in specs],
                     gpu=True,
+                    parallelism=self.gpu_parallelism,
                     transport="path",
                     server_session_id=self.shared_memory_session_id,
                 )
@@ -1536,6 +1603,7 @@ class _StreamingConversionRunner:
                 retry_response = self.gpu_server.convert_batch(
                     [spec["request"] for spec in retry_specs],
                     gpu=True,
+                    parallelism=self.gpu_parallelism,
                     transport="shared_memory",
                     server_session_id=self.shared_memory_session_id,
                     generation=generation,
@@ -2150,6 +2218,7 @@ def _run_tensorops_direct_dds_batch(
             "tensorops_dispatch_observed": False,
             "peak_rss_mb": 0,
             "rss_after_item_mb": 0,
+            "rss_scope": "child_wait4" if hasattr(os, "wait4") else "unavailable",
             "temporary_bytes": 0,
             "duration_ms": 0.0,
             "fallback_reasons": {},
@@ -2182,6 +2251,7 @@ def _run_tensorops_direct_dds_batch(
         "neural_accelerator_confirmed": False,
         "peak_rss_mb": 0,
         "rss_after_item_mb": 0,
+        "rss_scope": "child_wait4" if hasattr(os, "wait4") else "unavailable",
         "temporary_bytes": 0,
         "duration_ms": 0.0,
         "signal": None,
@@ -2221,16 +2291,12 @@ def _run_tensorops_direct_dds_batch(
             with os.fdopen(request_fd, "w", encoding="utf-8") as stream:
                 request_fd = None
                 json.dump(request, stream, separators=(",", ":"))
-            result = subprocess.run(
-                [as_helper, "--tensorops-dds-batch", request_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
+            result, timing = _run_tensorops_child(
+                [as_helper, "--tensorops-dds-batch", request_path]
             )
-            return chunk, result, None
+            return chunk, result, timing, None
         except Exception as error:
-            return chunk, None, error
+            return chunk, None, None, error
         finally:
             if request_fd is not None:
                 try:
@@ -2242,12 +2308,18 @@ def _run_tensorops_direct_dds_batch(
             except OSError:
                 pass
 
-    def process_chunk(chunk, result, error):
+    def process_chunk(chunk, result, timing, error):
         if error is not None:
             reason = f"ashelper_exception:{type(error).__name__}"
             for spec in chunk:
                 mark_failed(spec, reason)
             return reason
+
+        if timing is not None:
+            stats["peak_rss_mb"] = max(
+                stats["peak_rss_mb"], float(timing.get("peak_rss_mb", 0.0))
+            )
+            stats["rss_scope"] = str(timing.get("rss_scope", "unknown"))
 
         output = result.stdout or ""
         output_lines = output.splitlines()
@@ -2276,11 +2348,22 @@ def _run_tensorops_direct_dds_batch(
                     if "=" in field
                 )
             try:
-                item_rss_mb = int(float(fields.get("rss_mb", 0) or 0))
+                item_rss_mb = int(
+                    float(
+                        fields.get(
+                            "rss_after_item_mb", fields.get("rss_mb", 0)
+                        )
+                        or 0
+                    )
+                )
             except (TypeError, ValueError):
                 item_rss_mb = 0
-            stats["peak_rss_mb"] = max(stats["peak_rss_mb"], item_rss_mb)
-            stats["rss_after_item_mb"] = item_rss_mb
+            # ``ru_maxrss`` from wait4 is the child-process peak.  The value
+            # emitted by Swift is only a point-in-time snapshot after an item;
+            # never merge that snapshot into the peak field.
+            stats["rss_after_item_mb"] = max(
+                stats["rss_after_item_mb"], item_rss_mb
+            )
             if fields.get("tensorops_dispatch_observed", "").lower() == "true":
                 stats["tensorops_dispatch_observed"] = True
             if fields.get("neural_accelerator_confirmed", "").lower() == "true":
@@ -2333,10 +2416,15 @@ def _run_tensorops_direct_dds_batch(
         for future in as_completed(futures):
             chunk = futures[future]
             try:
-                completed_chunk, result, error = future.result()
-            except Exception as error:
-                completed_chunk, result = chunk, None
-            reason = process_chunk(completed_chunk, result, error)
+                completed_chunk, result, timing, error = future.result()
+            except Exception as future_error:
+                completed_chunk, result, timing, error = (
+                    chunk,
+                    None,
+                    None,
+                    future_error,
+                )
+            reason = process_chunk(completed_chunk, result, timing, error)
             completed += len(completed_chunk)
             suffix = f" failed ({reason})" if reason and result is None else ""
             UI.vprint(
@@ -2365,6 +2453,7 @@ def _run_tensorops_direct_dds_batch(
         f"batch_chunks={stats['batch_chunks']} chunk_size={stats['chunk_size']} "
         f"tensorops_dispatch_observed={str(stats['tensorops_dispatch_observed']).lower()} "
         f"neural_accelerator_confirmed={str(stats['neural_accelerator_confirmed']).lower()} "
+        f"rss_scope={stats['rss_scope']} "
         f"peak_rss_mb={stats['peak_rss_mb']} rss_after_item_mb={stats['rss_after_item_mb']} "
         f"temporary_bytes={stats['temporary_bytes']} signal={stats['signal'] or 0} "
         f"duration_ms={stats['duration_ms']:.2f}"
@@ -3031,6 +3120,7 @@ def _build_tile(tile, persist_config=True):
                     f"memory_budget_mb={memory_plan['memory_budget_mb']} "
                     f"parent_rss_mb={memory_plan['parent_rss_mb']} "
                     f"estimated_worker_mb={memory_plan['estimated_worker_mb']} "
+                    f"estimated_dds_mb={memory_plan['estimated_dds_mb']} "
                     f"estimated_total_mb={memory_plan['estimated_total_mb']} "
                     f"batch_workers={memory_plan['workers']}",
                 )
@@ -3421,7 +3511,7 @@ def _build_tile(tile, persist_config=True):
                         "readback_ms": 0.0,
                         "write_ms": 0.0,
                         "total_ms": 0.0,
-                        "peak_rss_mb": 0.0,
+                        "rss_after_item_mb": 0.0,
                     }
                     gpu_telemetry_legacy_fields = {
                         "mask_setup_ms": "mask_ms",
@@ -3481,7 +3571,7 @@ def _build_tile(tile, persist_config=True):
                                             )
                                             or 0.0
                                         )
-                                        if field == "peak_rss_mb":
+                                        if field == "rss_after_item_mb":
                                             gpu_telemetry[field] = max(
                                                 gpu_telemetry[field], value
                                             )
@@ -3547,7 +3637,7 @@ def _build_tile(tile, persist_config=True):
                                                         )
                                                         or 0.0
                                                     )
-                                                    if field == "peak_rss_mb":
+                                                    if field == "rss_after_item_mb":
                                                         gpu_telemetry[field] = max(
                                                             gpu_telemetry[field], value
                                                         )
@@ -4119,6 +4209,25 @@ def _restore_auto_reduce_settings(tile, base_settings):
 
 
 def _build_all(tile, include_overlays=True):
+    """Run the transactional pipeline with degraded vector files visible."""
+    missing = object()
+    previous_allow_degraded = getattr(
+        tile, "_allow_degraded_intermediate", missing
+    )
+    tile._allow_degraded_intermediate = True
+    try:
+        return _build_all_transactional(tile, include_overlays=include_overlays)
+    finally:
+        if previous_allow_degraded is missing:
+            try:
+                delattr(tile, "_allow_degraded_intermediate")
+            except AttributeError:
+                pass
+        else:
+            tile._allow_degraded_intermediate = previous_allow_degraded
+
+
+def _build_all_transactional(tile, include_overlays=True):
     base_settings = _snapshot_auto_reduce_settings(tile)
     budget = DSF_BUDGET.normalize_budget(
         getattr(tile, "dsf_node_budget", DSF_BUDGET.DEFAULT_DSF_NODE_BUDGET)
@@ -4235,6 +4344,10 @@ def _build_all(tile, include_overlays=True):
                     _snapshot_auto_reduce_settings(tile),
                 )
 
+            # A verified-cache recovery can leave a diagnostic failure from a
+            # previous attempt on the tile.  Only failures recorded during
+            # this attempt may affect auto-reduce classification.
+            tile.osm_failures = []
             pipeline_result = (
                 _run_pipeline_once(tile)
                 if retry_stage == "vector data"
@@ -4286,7 +4399,8 @@ def _build_all(tile, include_overlays=True):
                 return OSM.OSM_DEGRADED
             if not pipeline_result:
                 failure = getattr(tile, "last_pipeline_failure", {})
-                if best_candidate is None or failure.get("cancelled"):
+                osm_failures = getattr(tile, "osm_failures", None) or []
+                if best_candidate is None or failure.get("cancelled") or osm_failures:
                     if performance_metrics is not None:
                         performance_metrics.end_attempt(
                             "cancelled" if failure.get("cancelled") else "failed"
@@ -4297,7 +4411,7 @@ def _build_all(tile, include_overlays=True):
                         if best_candidate is not None
                         else "initial"
                     )
-                    return 0
+                    return OSM.OSM_FAILED
                 UI.vprint(
                     0,
                     UI.ui_text(

@@ -210,12 +210,12 @@ def build_curv_tol_weight_map(tile, weight_array):
                 )
                 osm_degraded = True
             else:
-                osm_result = OSM.OSM_queries_to_OSM_layer(
+                osm_result = OSM.run_osm_layer_with_policy(
+                    tile,
+                    "coastline",
                     queries,
                     sea_layer,
-                    tile.lat,
-                    tile.lon,
-                    tags_of_interest,
+                    tags_of_interest=tags_of_interest,
                     cached_suffix="coastline",
                 )
                 if osm_result == OSM.OSM_FAILED:

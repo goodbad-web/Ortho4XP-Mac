@@ -36,13 +36,49 @@ FAILED = "FAILED"
 max_osm_tentatives = 3
 
 # Regional public Overpass instances must not be treated as global fallbacks.
-# A bbox is accepted only when it is fully covered by the endpoint below.
+# The polygons are deliberately inset from the country borders.  A bbox which
+# touches a border, crosses a border, or falls outside the known safe area is
+# sent to a global instance instead of being sent to a regional instance which
+# may return a misleading empty response.
+_FRANCE_OVERPASS_COVERAGE = geometry.Polygon(
+    [
+        (-1.6, 48.5),
+        (-0.8, 49.7),
+        (1.5, 50.1),
+        (4.2, 49.9),
+        (6.2, 49.0),
+        (6.4, 47.8),
+        (6.3, 46.8),
+        (5.9, 45.8),
+        (5.2, 44.2),
+        (4.3, 43.5),
+        (2.0, 43.5),
+        (0.2, 43.7),
+        (-1.5, 43.5),
+        (-1.6, 48.5),
+    ]
+)
+_SWITZERLAND_OVERPASS_COVERAGE = geometry.Polygon(
+    [
+        (6.4, 47.0),
+        (6.9, 47.55),
+        (8.0, 47.7),
+        (9.5, 47.7),
+        (10.1, 47.3),
+        (9.8, 46.4),
+        (9.3, 46.0),
+        (8.2, 45.9),
+        (7.0, 45.9),
+        (6.4, 46.15),
+        (6.4, 47.0),
+    ]
+)
 _overpass_coverage = {
     "DE": None,
     "LZ": None,
     "KU": None,
-    "FR": (41.0, -5.5, 51.5, 10.0),
-    "CH": (45.7, 5.8, 47.9, 10.6),
+    "FR": _FRANCE_OVERPASS_COVERAGE,
+    "CH": _SWITZERLAND_OVERPASS_COVERAGE,
 }
 _OSM_CACHE_MANIFEST_VERSION = 1
 
@@ -121,7 +157,13 @@ class OSM_layer:
             if root.tag.rsplit("}", 1)[-1].lower() != "osm":
                 UI.lvprint(0, "ERROR: OSM input root is not <osm>")
                 return 0
-            pfile = io.StringIO(payload.decode(encoding="utf-8"))
+            # Overpass normally emits one element per line, but valid XML may
+            # also be compacted into one line.  Re-serializing the validated
+            # tree gives the existing line-oriented importer a stable shape
+            # without accepting truncated input.
+            if hasattr(ElementTree, "indent"):
+                ElementTree.indent(root, space="  ")
+            pfile = io.StringIO(ElementTree.tostring(root, encoding="unicode"))
         except Exception as error:
             UI.vprint(1, "    OSM input is corrupted or unreadable:", error)
             return 0
@@ -156,7 +198,11 @@ class OSM_layer:
             except ElementTree.ParseError:
                 return None
 
-        normal_exit = False
+        # ElementTree has already validated the complete document.  An empty
+        # OSM document is commonly emitted as a single compact line, so its
+        # closing tag was consumed together with the opening tag above and
+        # will not appear in the line-oriented parser below.
+        normal_exit = len(root) == 0
         for line in pfile:
             stripped_line = line.lstrip()
             if stripped_line.startswith("<node "):
@@ -559,6 +605,50 @@ def _update_cached_osm(osm_layer, filename, input_tags, target_tags):
         return False
 
 
+def _build_osm_tag_filters(queries, tags_of_interest=None):
+    """Build the parser filters used by both tile and standalone OSM loads."""
+    queries = [] if queries is None else list(queries)
+    if tags_of_interest is None:
+        tags_of_interest = []
+    elif isinstance(tags_of_interest, str):
+        tags_of_interest = [tags_of_interest]
+    else:
+        tags_of_interest = list(tags_of_interest)
+
+    target_tags = {"n": [], "w": [], "r": []}
+    input_tags = {"n": [], "w": [], "r": []}
+    for query in queries:
+        query_parts = [query] if isinstance(query, str) else query
+        for tag in query_parts:
+            if not isinstance(tag, str):
+                continue
+            items = tag.split('"')
+            if not items or not items[0]:
+                continue
+            osm_type = items[0][0]
+            if osm_type not in target_tags:
+                continue
+            try:
+                query_tag = (items[1], items[3])
+            except IndexError:
+                query_tag = (items[1], "") if len(items) > 1 else None
+            if query_tag is None:
+                continue
+            input_tags[osm_type].append(query_tag)
+            if query_tag not in target_tags[osm_type]:
+                target_tags[osm_type].append(query_tag)
+            for interest in tags_of_interest:
+                if isinstance(interest, str):
+                    interest_tag = (interest, "")
+                elif isinstance(interest, (tuple, list)) and len(interest) == 2:
+                    interest_tag = tuple(interest)
+                else:
+                    continue
+                if interest_tag not in target_tags[osm_type]:
+                    target_tags[osm_type].append(interest_tag)
+    return input_tags, target_tags
+
+
 def normalize_osm_failure_policy(value=None):
     policy = osm_download_failure_policy if value is None else value
     return policy if policy in OSM_FAILURE_POLICIES else "abort"
@@ -576,16 +666,14 @@ def _normalized_bbox(bbox):
 def _bbox_is_covered(server_code, bbox):
     coverage = _overpass_coverage.get(server_code)
     normalized = _normalized_bbox(bbox)
-    if coverage is None or normalized is None:
-        return coverage is None
+    if coverage is None:
+        return True
+    if normalized is None:
+        return False
     south, west, north, east = normalized
-    c_south, c_west, c_north, c_east = coverage
-    return (
-        south >= c_south
-        and west >= c_west
-        and north <= c_north
-        and east <= c_east
-    )
+    if south >= north or west >= east:
+        return False
+    return coverage.covers(geometry.box(west, south, east, north))
 
 
 def _server_order(preferred_server, bbox):
@@ -628,6 +716,10 @@ def _query_signature(queries, tags_of_interest=None):
             canonical_queries.append([str(item) for item in query])
         else:
             canonical_queries.append(str(query))
+    if tags_of_interest is None:
+        tags_of_interest = []
+    elif isinstance(tags_of_interest, str):
+        tags_of_interest = [tags_of_interest]
     payload = {
         "queries": canonical_queries,
         "tags_of_interest": [
@@ -718,25 +810,36 @@ def _build_cache_manifest(
 
 def _load_verified_cache(
     osm_layer, filename, manifest_filename, layer_name, bbox, queries, tags_of_interest,
-    input_tags, target_tags,
+    input_tags, target_tags, allow_unbound_request=False,
 ):
     if not os.path.isfile(filename) or not os.path.isfile(manifest_filename):
         return False
     try:
         with open(manifest_filename, "r", encoding="utf-8") as stream:
             manifest = json.load(stream)
+        if not isinstance(manifest, dict):
+            UI.vprint(2, "    OSM cache manifest is not an object:", manifest_filename)
+            return False
         if manifest.get("schema_version") != _OSM_CACHE_MANIFEST_VERSION:
             return False
         if manifest.get("status") != "complete":
             return False
         if manifest.get("layer") != layer_name:
             return False
-        if manifest.get("bbox") != _normalized_bbox(bbox):
-            return False
-        if manifest.get("query_signature") != _query_signature(queries, tags_of_interest):
-            return False
+        if allow_unbound_request:
+            if manifest.get("bbox") is not None:
+                return False
+        else:
+            if manifest.get("bbox") != _normalized_bbox(bbox):
+                return False
+            if manifest.get("query_signature") != _query_signature(
+                queries, tags_of_interest
+            ):
+                return False
         responses = manifest.get("responses")
-        if not isinstance(responses, list) or len(responses) != len(queries):
+        if not isinstance(responses, list) or not responses:
+            return False
+        if not allow_unbound_request and len(responses) != len(queries):
             return False
         response_statuses = []
         for response in responses:
@@ -750,8 +853,9 @@ def _load_verified_cache(
             if response.get("http_status") != 200:
                 return False
             response_server = response.get("server")
+            response_bbox = manifest.get("bbox") if allow_unbound_request else bbox
             if response_server not in overpass_servers or not _bbox_is_covered(
-                response_server, bbox
+                response_server, response_bbox
             ):
                 return False
             response_statuses.append(data_status)
@@ -772,6 +876,7 @@ def _load_verified_cache(
             return False
         _replace_layer(osm_layer, candidate)
         osm_layer.last_result = OSM_COMPLETE
+        osm_layer.last_failure = None
         osm_layer.last_cache_info = {
             "source": "verified-cache",
             "manifest": manifest_filename,
@@ -789,6 +894,34 @@ def _load_verified_cache(
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
         UI.vprint(2, "    OSM cache metadata is invalid:", manifest_filename, error)
         return False
+
+
+def load_verified_osm_cache(
+    queries, osm_layer, lat, lon, tags_of_interest=None, cached_suffix=""
+):
+    """Load the exact verified cache for one tile/layer, if available."""
+    queries = list(queries)
+    if tags_of_interest is None:
+        tags_of_interest = []
+    elif isinstance(tags_of_interest, str):
+        tags_of_interest = [tags_of_interest]
+    input_tags, target_tags = _build_osm_tag_filters(queries, tags_of_interest)
+    bbox = (lat, lon, lat + 1, lon + 1)
+    if not cached_suffix:
+        return False
+    filename = FNAMES.osm_cached(lat, lon, cached_suffix)
+    manifest_filename = FNAMES.osm_cache_manifest(lat, lon, cached_suffix)
+    return _load_verified_cache(
+        osm_layer,
+        filename,
+        manifest_filename,
+        cached_suffix,
+        bbox,
+        queries,
+        tags_of_interest,
+        input_tags,
+        target_tags,
+    )
 
 
 def _retry_after_seconds(response):
@@ -896,6 +1029,115 @@ def prompt_osm_failure(tile, failure, cache_available=False):
     return choice["value"]
 
 
+def run_osm_layer_with_policy(tile, layer_name, queries, osm_layer, **kwargs):
+    """Run a tile OSM layer and apply the configured failure policy."""
+    queries = list(queries)
+    cached_suffix = kwargs.get("cached_suffix", "")
+    tags_of_interest = kwargs.get("tags_of_interest", None)
+
+    while True:
+        result = OSM_queries_to_OSM_layer(
+            queries,
+            osm_layer,
+            tile.lat,
+            tile.lon,
+            **kwargs,
+        )
+        if result == OSM_COMPLETE:
+            return OSM_COMPLETE
+        if result == OSM_DEGRADED:
+            return OSM_DEGRADED
+
+        failure = dict(getattr(osm_layer, "last_failure", {}) or {})
+        failure["layer"] = layer_name
+        cache_info = getattr(osm_layer, "last_cache_info", None)
+        cache = {
+            "used": bool(cache_info),
+            "source": (cache_info or {}).get("source", "none"),
+            "data": FNAMES.osm_cached(tile.lat, tile.lon, cached_suffix)
+            if cached_suffix
+            else None,
+            "manifest": FNAMES.osm_cache_manifest(
+                tile.lat, tile.lon, cached_suffix
+            )
+            if cached_suffix
+            else None,
+            "available": False,
+        }
+        failure["cache"] = cache
+        failures = getattr(tile, "osm_failures", None)
+        if failures is None:
+            failures = []
+            tile.osm_failures = failures
+        failures.append(failure)
+
+        action = getattr(tile, "osm_failure_action", None)
+        if action is None:
+            policy = normalize_osm_failure_policy()
+            if policy == "prompt":
+                cache_probe = OSM_layer()
+                cache_available = bool(
+                    cached_suffix
+                    and load_verified_osm_cache(
+                        queries,
+                        cache_probe,
+                        tile.lat,
+                        tile.lon,
+                        tags_of_interest=tags_of_interest,
+                        cached_suffix=cached_suffix,
+                    )
+                )
+                cache["available"] = cache_available
+                action = prompt_osm_failure(
+                    tile, failure, cache_available=cache_available
+                )
+            else:
+                action = policy
+            if action != "retry":
+                tile.osm_failure_action = action
+
+        if action == "retry":
+            osm_layer.reset()
+            continue
+        if action == "use_cache":
+            cached_layer = OSM_layer()
+            if cached_suffix and load_verified_osm_cache(
+                queries,
+                cached_layer,
+                tile.lat,
+                tile.lon,
+                tags_of_interest=tags_of_interest,
+                cached_suffix=cached_suffix,
+            ):
+                _replace_layer(osm_layer, cached_layer)
+                cache["used"] = True
+                cache["available"] = True
+                cache["source"] = "verified-cache"
+                return OSM_COMPLETE
+            failure["reason"] = "verified-cache-unavailable"
+            _record_layer_failure(osm_layer, failure)
+            return OSM_FAILED
+        if action == "continue_degraded":
+            osm_layer.reset()
+            if not hasattr(tile, "osm_degraded_layers"):
+                tile.osm_degraded_layers = set()
+            tile.osm_degraded_layers.add(layer_name)
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "WARNING: OSM layer {} is unavailable; continuing as degraded.".format(
+                        layer_name
+                    ),
+                    "警告: OSMレイヤー{}を取得できないため、欠落扱いで継続します。".format(
+                        layer_name
+                    ),
+                ),
+            )
+            return OSM_DEGRADED
+
+        return OSM_FAILED
+
+
 ################################################################################
 def OSM_queries_to_OSM_layer(
     queries,
@@ -909,26 +1151,13 @@ def OSM_queries_to_OSM_layer(
     # Keep every query in a temporary layer. A cache and its manifest are
     # published only after the complete query set has succeeded.
     queries = list(queries)
-    tags_of_interest = [] if tags_of_interest is None else tags_of_interest
-    target_tags = {"n": [], "w": [], "r": []}
-    input_tags = {"n": [], "w": [], "r": []}
-    for query in queries:
-        for tag in [query] if isinstance(query, str) else query:
-            items = tag.split('"')
-            osm_type = items[0][0]
-            try:
-                target_tags[osm_type].append((items[1], items[3]))
-                input_tags[osm_type].append((items[1], items[3]))
-            except:
-                target_tags[osm_type].append((items[1], ""))
-                input_tags[osm_type].append((items[1], ""))
-            for tag in tags_of_interest:
-                if isinstance(tag, str):
-                    if (tag, "") not in target_tags[osm_type]:
-                        target_tags[osm_type].append((tag, ""))
-                else:
-                    if tag not in target_tags[osm_type]:
-                        target_tags[osm_type].append(tag)
+    if tags_of_interest is None:
+        tags_of_interest = []
+    elif isinstance(tags_of_interest, str):
+        tags_of_interest = [tags_of_interest]
+    else:
+        tags_of_interest = list(tags_of_interest)
+    input_tags, target_tags = _build_osm_tag_filters(queries, tags_of_interest)
     bbox = (lat, lon, lat + 1, lon + 1)
     cached_data_filename = FNAMES.osm_cached(lat, lon, cached_suffix)
     manifest_filename = FNAMES.osm_cache_manifest(lat, lon, cached_suffix)
@@ -1070,50 +1299,176 @@ def OSM_query_to_OSM_layer(
     server_code=None,
     cached_file_name="",
 ):
-    # this one is simpler and does not depend on the notion of tile
-    tags_of_interest = [] if tags_of_interest is None else tags_of_interest
-    target_tags = {"n": [], "w": [], "r": []}
-    input_tags = {"n": [], "w": [], "r": []}
-    for tag in [query] if isinstance(query, str) else query:
-        items = tag.split('"')
-        osm_type = items[0][0]
-        try:
-            target_tags[osm_type].append((items[1], items[3]))
-            input_tags[osm_type].append((items[1], items[3]))
-        except:
-            target_tags[osm_type].append((items[1], ""))
-            input_tags[osm_type].append((items[1], ""))
-        for tag in tags_of_interest:
-            if isinstance(tag, str):
-                target_tags[osm_type].append((tag, ""))
-            else:
-                target_tags[osm_type].append(tag)
-    if cached_file_name and os.path.isfile(cached_file_name):
-        UI.vprint(1, "    * Recycling OSM data from", cached_file_name)
-        if _update_cached_osm(osm_layer, cached_file_name, input_tags, target_tags):
+    # This helper is used by the standalone mask/extent command.  It must use
+    # the same manifest contract as tile OSM caches, while allowing an
+    # explicitly requested cache-only invocation to omit the original query.
+    if tags_of_interest is None:
+        tags_of_interest = []
+    elif isinstance(tags_of_interest, str):
+        tags_of_interest = [tags_of_interest]
+    else:
+        tags_of_interest = list(tags_of_interest)
+    query_list = (
+        []
+        if query is None
+        else [query]
+        if isinstance(query, str)
+        else list(query)
+    )
+    if query is None:
+        input_tags = None
+        target_tags = None
+    else:
+        input_tags, target_tags = _build_osm_tag_filters(
+            query_list, tags_of_interest
+        )
+
+    manifest_filename = (
+        cached_file_name + ".manifest.json" if cached_file_name else ""
+    )
+    if cached_file_name:
+        verified_layer = OSM_layer()
+        if _load_verified_cache(
+            verified_layer,
+            cached_file_name,
+            manifest_filename,
+            "standalone",
+            bbox,
+            query_list,
+            tags_of_interest,
+            input_tags,
+            target_tags,
+            allow_unbound_request=query is None,
+        ):
+            _replace_layer(osm_layer, verified_layer)
             return 1
-        if not _quarantine_osm_cache(cached_file_name):
-            return 0
-        osm_layer.reset()
-    if not cached_file_name or not os.path.isfile(cached_file_name):
-        response = get_overpass_data(query, bbox, server_code)
-        if UI.red_flag:
-            return 0
-        if not response:
-            UI.lvprint(
+        if os.path.isfile(cached_file_name) or os.path.isfile(manifest_filename):
+            UI.vprint(
                 1,
-                "      No valid answer for",
-                query,
-                "after",
-                max_osm_tentatives,
-                ", skipping it.",
+                "    * Ignoring unverified standalone OSM cache:",
+                cached_file_name,
+            )
+        if query is None:
+            _record_layer_failure(
+                osm_layer,
+                {
+                    "layer": "standalone",
+                    "reason": "verified-cache-required",
+                },
             )
             return 0
-        if not osm_layer.update_dicosm(response, input_tags, target_tags):
-            return 0
-        if cached_file_name:
-            if not osm_layer.write_to_file(cached_file_name):
-                UI.vprint(1, "    WARNING: Could not save OSM cache", cached_file_name)
+
+    if query is None:
+        _record_layer_failure(
+            osm_layer,
+            {"layer": "standalone", "reason": "query-required"},
+        )
+        return 0
+
+    response_result = get_overpass_data(
+        query, bbox, server_code, return_metadata=True
+    )
+    if isinstance(response_result, tuple) and len(response_result) == 2:
+        response, response_info = response_result
+    else:
+        response = response_result
+        response_info = {}
+    if UI.red_flag:
+        _record_layer_failure(
+            osm_layer,
+            {"layer": "standalone", "reason": "cancelled"},
+        )
+        return 0
+    if not response:
+        UI.lvprint(
+            1,
+            "      No valid answer for",
+            query,
+            "after",
+            max_osm_tentatives,
+            ", skipping it.",
+        )
+        _record_layer_failure(
+            osm_layer,
+            {
+                "layer": "standalone",
+                "query": _overpass_query_label(query),
+                "reason": "no-valid-response",
+                "metadata": response_info,
+            },
+        )
+        return 0
+
+    data_status, reason, counts = _inspect_osm_response(response)
+    if data_status is None:
+        _record_layer_failure(
+            osm_layer,
+            {
+                "layer": "standalone",
+                "query": _overpass_query_label(query),
+                "reason": reason or "response-parse-failed",
+                "metadata": response_info,
+            },
+        )
+        return 0
+    response_info = dict(response_info or {})
+    response_info.setdefault("status", data_status)
+    response_info.setdefault("data_status", data_status)
+    response_info.setdefault("http_status", 200)
+    response_info.setdefault("counts", counts)
+    response_info.setdefault("server", server_code or overpass_server_choice)
+
+    candidate_layer = OSM_layer()
+    if not candidate_layer.update_dicosm(response, input_tags, target_tags):
+        _record_layer_failure(
+            osm_layer,
+            {
+                "layer": "standalone",
+                "query": _overpass_query_label(query),
+                "reason": "response-parse-failed",
+                "metadata": response_info,
+            },
+        )
+        return 0
+    _replace_layer(osm_layer, candidate_layer)
+    osm_layer.last_result = OSM_COMPLETE
+    osm_layer.last_failure = None
+
+    if cached_file_name:
+        has_unverified_cache = os.path.isfile(cached_file_name) or os.path.isfile(
+            manifest_filename
+        )
+        can_publish_cache = not has_unverified_cache or _preserve_unverified_osm_cache(
+            cached_file_name, manifest_filename
+        )
+        if can_publish_cache and osm_layer.write_to_file(cached_file_name):
+            manifest = _build_cache_manifest(
+                "standalone",
+                bbox,
+                query_list,
+                tags_of_interest,
+                [response_info],
+                osm_layer,
+                cached_file_name,
+            )
+            if not _write_json_atomic(manifest_filename, manifest):
+                UI.vprint(
+                    1,
+                    "    WARNING: OSM cache remains unverified:",
+                    cached_file_name,
+                )
+        elif not can_publish_cache:
+            UI.vprint(
+                1,
+                "    WARNING: Keeping standalone OSM data in memory; cache publication was skipped.",
+            )
+        else:
+            UI.vprint(1, "    WARNING: Could not save OSM cache", cached_file_name)
+    osm_layer.last_cache_info = {
+        "source": "network",
+        "responses": [response_info],
+        "counts": _layer_counts(osm_layer),
+    }
     return 1
 
 ################################################################################
@@ -1128,12 +1483,17 @@ def _overpass_query_label(query):
 
 
 def _inspect_osm_response(content):
-    if not content or b"</osm>" not in content.lower():
+    if not content:
         return None, "missing closing </osm> tag", None
     try:
         root = ElementTree.fromstring(content)
     except ElementTree.ParseError:
-        return None, "malformed XML response", None
+        reason = (
+            "missing closing </osm> tag"
+            if b"</osm>" not in content.lower()
+            else "malformed XML response"
+        )
+        return None, reason, None
     if root.tag.rsplit("}", 1)[-1].lower() != "osm":
         return None, "unexpected XML root", None
     if any(child.tag.rsplit("}", 1)[-1].lower() == "remark" for child in root):

@@ -20,70 +20,9 @@ good_imagery_list = ()
 
 def _run_osm_queries(tile, layer_name, queries, osm_layer, **kwargs):
     """Run one layer atomically and apply the configured failure policy."""
-    while True:
-        result = OSM.OSM_queries_to_OSM_layer(
-            queries,
-            osm_layer,
-            tile.lat,
-            tile.lon,
-            **kwargs,
-        )
-        if result == OSM.OSM_COMPLETE:
-            return OSM.OSM_COMPLETE
-
-        failure = dict(getattr(osm_layer, "last_failure", {}) or {})
-        failure["layer"] = layer_name
-        cached_suffix = kwargs.get("cached_suffix", "")
-        cache_info = getattr(osm_layer, "last_cache_info", None)
-        failure["cache"] = {
-            "used": bool(cache_info),
-            "source": (cache_info or {}).get("source", "none"),
-            "data": FNAMES.osm_cached(tile.lat, tile.lon, cached_suffix)
-            if cached_suffix
-            else None,
-            "manifest": FNAMES.osm_cache_manifest(tile.lat, tile.lon, cached_suffix)
-            if cached_suffix
-            else None,
-        }
-        failures = getattr(tile, "osm_failures", None)
-        if failures is None:
-            failures = []
-            tile.osm_failures = failures
-        failures.append(failure)
-
-        action = getattr(tile, "osm_failure_action", None)
-        if action is None:
-            policy = OSM.normalize_osm_failure_policy()
-            action = (
-                OSM.prompt_osm_failure(tile, failure, cache_available=False)
-                if policy == "prompt"
-                else policy
-            )
-            if action != "retry":
-                tile.osm_failure_action = action
-
-        if action == "retry":
-            osm_layer.reset()
-            continue
-        if action == "continue_degraded":
-            osm_layer.reset()
-            if not hasattr(tile, "osm_degraded_layers"):
-                tile.osm_degraded_layers = set()
-            tile.osm_degraded_layers.add(layer_name)
-            UI.vprint(
-                0,
-                UI.ui_text(
-                    "WARNING: OSM layer {} is unavailable; continuing as degraded.".format(
-                        layer_name
-                    ),
-                    "警告: OSMレイヤー{}を取得できないため、欠落扱いで継続します。".format(
-                        layer_name
-                    ),
-                ),
-            )
-            return OSM.OSM_DEGRADED
-
-        return OSM.OSM_FAILED
+    return OSM.run_osm_layer_with_policy(
+        tile, layer_name, queries, osm_layer, **kwargs
+    )
 
 
 def _empty_airport_result(tile):

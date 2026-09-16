@@ -1025,7 +1025,13 @@ def initialize_local_combined_providers_dict(tile):
                     )
                     del extents_dict[new_extent_code]
                     return 0
-                if not osm_layer.update_dicosm(cached_file_name, None):
+                if not OSM.OSM_query_to_OSM_layer(
+                    None,
+                    "",
+                    osm_layer,
+                    "all",
+                    cached_file_name=cached_file_name,
+                ):
                     UI.vprint(0, "Error, erroneous OSM data for extent code", name)
                     del extents_dict[new_extent_code]
                     return 0

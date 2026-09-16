@@ -20,10 +20,23 @@ import O4_Mask_Utils as MASK
 import O4_Tile_Utils as TILE
 import O4_GUI_Utils as GUI
 import O4_UI_Utils as UI
+import O4_OSM_Utils as OSM
 import O4_Config_Utils as CFG  # CFG imported last because it can modify other modules variables
 
 
 cmd_line="USAGE: Ortho4XP.py lat lon imagery zl (won't read a tile config)\n  OR:  Ortho4XP.py lat lon (with existing tile config file)"
+CLI_DEGRADED_EXIT_CODE = 3
+
+
+def _continuous_build_exit_code(result, cancelled=False):
+    """Map the tile pipeline state to a distinct CLI result."""
+    if cancelled or result == OSM.OSM_FAILED:
+        return 1
+    if result == OSM.OSM_DEGRADED:
+        return CLI_DEGRADED_EXIT_CODE
+    if result == OSM.OSM_COMPLETE:
+        return 0
+    return 1
 
 if __name__ == '__main__':
     if not os.path.isdir(FNAMES.Utils_dir):
@@ -141,9 +154,19 @@ if __name__ == '__main__':
                     print("ERROR:", e)
                     print(cmd_line); sys.exit(2)
             try:
-                if TILE.build_continuous(tile) != 1 or UI.red_flag:
+                result = TILE.build_continuous(tile)
+                exit_code = _continuous_build_exit_code(result, UI.red_flag)
+                if exit_code == CLI_DEGRADED_EXIT_CODE:
+                    print(
+                        UI.ui_text(
+                            "WARNING: continuous tile build completed as degraded; output was not published.",
+                            "警告: 連続タイルビルドはdegraded状態で完了しました。出力は公開していません。",
+                        )
+                    )
+                    sys.exit(exit_code)
+                if exit_code != 0:
                     print("ERROR: continuous tile build failed.")
-                    sys.exit(1)
+                    sys.exit(exit_code)
                 print("Bon vol!")
             except Exception as e:
                 import traceback

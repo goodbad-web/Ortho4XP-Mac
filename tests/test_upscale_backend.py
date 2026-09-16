@@ -433,7 +433,8 @@ def test_tensorops_direct_dds_uses_pack_chunks_and_no_png(tmp_path, monkeypatch)
     assert result["batch_workers"] == 2
     assert result["batch_chunks"] == 2
     assert result["chunk_size"] == 8
-    assert result["peak_rss_mb"] == 321
+    assert result["rss_after_item_mb"] == 321
+    assert result["peak_rss_mb"] > 0
     assert all(Path(spec["final_path"]).is_file() for spec in specs)
     assert not list(tmp_path.glob("*.png"))
     assert not list((tmp_path / "ortho4xp" / "tmp").glob(".tensorops-dds-*.json"))

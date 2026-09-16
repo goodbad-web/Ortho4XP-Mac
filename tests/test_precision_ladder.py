@@ -50,6 +50,150 @@ def test_quality_gate_requires_exact_match_when_fp16_error_is_zero():
     assert verify_metal.precision_quality_gate(candidate, baseline)["status"] == "FAIL"
 
 
+def test_direct_dds_performance_gate_requires_both_speed_targets():
+    def result(median):
+        return {"status": "PASS", "timing_ms": {"median": median}}
+
+    passing = verify_metal.direct_dds_performance_gate(
+        512,
+        result(4.0),
+        result(8.0),
+        result(3.0),
+    )
+    assert passing["status"] == "PASS"
+    assert passing["candidate_over_baseline_ratio"] == 0.5
+    assert passing["candidate_over_metalfx_ratio"] < 2.0
+
+    failing = verify_metal.direct_dds_performance_gate(
+        2048,
+        result(4.1),
+        result(8.0),
+        result(1.0),
+    )
+    assert failing["status"] == "FAIL"
+    assert failing["checks"]["candidate_faster_than_old_tensorops"] is False
+
+    nonfinite = verify_metal.direct_dds_performance_gate(
+        512,
+        result(float("inf")),
+        result(8.0),
+        result(3.0),
+    )
+    assert nonfinite["status"] == "FAIL"
+    assert nonfinite["reason"] == "median_nonfinite_or_invalid"
+
+
+def test_quality_gate_compares_candidate_against_pre_change_baseline():
+    baseline = {"mae": 10.0, "rmse": 12.0, "psnr_db": 30.0}
+    candidate = {"mae": 10.4, "rmse": 12.4, "psnr_db": 29.8}
+    assert verify_metal.precision_quality_gate(candidate, baseline)["status"] == "PASS"
+
+    regression = {"mae": 11.0, "rmse": 12.4, "psnr_db": 29.8}
+    assert verify_metal.precision_quality_gate(regression, baseline)["status"] == "FAIL"
+
+
+def test_run_measured_reports_child_scoped_rss(tmp_path):
+    helper = tmp_path / "measured-child.py"
+    helper.write_text(
+        "import sys\n"
+        "sys.stdout.write('measured\\n')\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    result, timing = verify_metal.run_measured([sys.executable, str(helper)])
+    assert result.returncode == 0
+    assert result.stdout == "measured\n"
+    if hasattr(verify_metal.os, "wait4"):
+        assert timing["rss_scope"] == "child_wait4"
+        assert timing["peak_rss_mb"] > 0
+
+
+def test_tensorops_baseline_helper_is_required_and_executable(tmp_path):
+    assert (
+        verify_metal.validate_tensorops_baseline_helper(None)
+        == "--compare-tensorops requires --tensorops-baseline-helper"
+    )
+    missing = tmp_path / "missing-helper"
+    assert "does not exist" in verify_metal.validate_tensorops_baseline_helper(missing)
+    helper = tmp_path / "old-ASHelper"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    assert "not executable" in verify_metal.validate_tensorops_baseline_helper(helper)
+    helper.chmod(0o755)
+    assert verify_metal.validate_tensorops_baseline_helper(helper) is None
+
+
+def test_tile_snapshot_is_copied_per_backend_without_canonical_outputs(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "provider.jpg"
+    mask = tmp_path / "mask.png"
+    mesh = tmp_path / "mesh.dsf"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "cached.jpg").write_bytes(b"cache")
+    Image.new("RGB", (4, 3), (20, 40, 60)).save(source, format="JPEG")
+    Image.new("L", (2, 2), 255).save(mask, format="PNG")
+    mesh.write_bytes(b"mesh")
+    manifest = tmp_path / "tile.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "tile": "+35+135",
+                "items": [{"input": str(source), "mask": str(mask), "format": "BC3"}],
+                "mesh": [str(mesh)],
+                "cache": [str(cache)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = verify_metal.prepare_tile_snapshot(manifest, tmp_path / "artifacts")
+
+    assert snapshot["canonical_outputs_written"] is False
+    assert set(snapshot["roles"]) == {"baseline", "candidate", "metalfx_spatial"}
+    copied_inputs = [
+        Path(snapshot["roles"][role]["items"][0]["input"])
+        for role in snapshot["roles"]
+    ]
+    assert all(path.is_file() for path in copied_inputs)
+    assert len({path.read_bytes() for path in copied_inputs}) == 1
+    assert all(
+        str(path).startswith(str(tmp_path / "artifacts")) for path in copied_inputs
+    )
+    assert not (tmp_path / "provider.gpu.tmp.dds").exists()
+
+
+def test_tile_snapshot_requires_canonical_tile_name(tmp_path):
+    manifest = tmp_path / "tile.json"
+    manifest.write_text(
+        json.dumps({"tile": "+34+132", "items": [], "mesh": [], "cache": []}),
+        encoding="utf-8",
+    )
+    try:
+        verify_metal.prepare_tile_snapshot(manifest, tmp_path / "artifacts")
+    except ValueError as error:
+        assert "+35+135" in str(error)
+    else:
+        raise AssertionError("non-canonical tile must be rejected")
+
+
+def test_tile_snapshot_performance_gate_requires_both_speed_targets():
+    def result(median):
+        return {"status": "PASS", "timing_ms": {"median": median}}
+
+    assert verify_metal.tile_snapshot_performance_gate(
+        result(4), result(8), result(2)
+    )["status"] == "PASS"
+    assert verify_metal.tile_snapshot_performance_gate(
+        result(4.1), result(8), result(1)
+    )["status"] == "FAIL"
+    nonfinite = verify_metal.tile_snapshot_performance_gate(
+        result(4), result(float("inf")), result(2)
+    )
+    assert nonfinite["status"] == "FAIL"
+    assert nonfinite["reason"] == "median_nonfinite_or_invalid"
+
+
 def test_precision_ladder_runs_all_stages_in_order(monkeypatch, tmp_path):
     calls = []
 

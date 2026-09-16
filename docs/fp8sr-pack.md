@@ -52,7 +52,7 @@ Utils/mac/ASHelper --tensorops-dds-batch /path/to/tensorops-dds.json
 
 Ortho4XPで`upscale_backend=tensorops`を選んだ場合、macOS 27未満、TensorOps非対応、パック不在/不正、透明入力、GPU実行失敗、非有限値、出力サイズ不正では、まず元画像からMetalFX Spatial、さらにCore Image Lanczosへフォールバックします。通常のタイル処理では、条件を満たす直接JPEGだけをbatch経路へ集約し、ZL18以上でも不透明な直接画像は同じdirect DDS経路を使います。マスク、色補正、結合プロバイダ、非対応providerの前処理が必要な画像は個別経路を使います。FP8の丸め、FP8SR v1/v2 manifest、weight stride、CLI契約は変更しません。旧`upscale_backend=fp8_tensorops`と旧CLIは互換aliasです。
 
-direct DDSのworker数は、画像サイズ別のTensorOps working set、親RSS、物理メモリの70%予算から自動決定されます。`batch_workers`、`memory_budget_mb`、`estimated_worker_mb`、`estimated_total_mb`、`peak_rss_mb`、`tensorops_ms`、`readback_ms`、`dds_ms`を速度・OOM診断に使用します。
+direct DDSのworker数は、画像サイズ別のTensorOps working set、親RSS、DDS一時領域、物理メモリの70%予算から自動決定されます。`batch_workers`、`memory_budget_mb`、`estimated_worker_mb`、`estimated_dds_mb`、`estimated_total_mb`、`peak_rss_mb`、`rss_after_item_mb`、`rss_scope`、`tensorops_ms`、`readback_ms`、`dds_ms`を速度・OOM診断に使用します。検証ランナーの`peak_rss_mb`は`wait4`によるその子プロセス固有のpeakで、Swift側の`rss_after_item_mb`はアイテム終了時点のスナップショットです。
 
 ログには少なくとも次の実行証拠を出します。
 

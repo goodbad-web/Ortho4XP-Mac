@@ -76,11 +76,12 @@ for line in sys.stdin:
 
     client = ASHelperJSONLServer(str(helper))
     try:
-        response = client.convert_batch(
-            [{'id': 'a', 'input': 'a', 'output': 'a.dds', 'format': 'BC3'}],
-            parallelism=99,
-        )
-        assert response['results'][0]['backend'] == '12'
+        for requested, expected in ((0, '1'), (1, '1'), (99, '12')):
+            response = client.convert_batch(
+                [{'id': 'a', 'input': 'a', 'output': 'a.dds', 'format': 'BC3'}],
+                parallelism=requested,
+            )
+            assert response['results'][0]['backend'] == expected
     finally:
         client.close()
 

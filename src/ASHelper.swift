@@ -99,7 +99,9 @@ final class DDSConversionTelemetry {
     var readbackMs = 0.0
     var writeMs = 0.0
     var totalMs = 0.0
-    var peakRssMB = 0.0
+    // This is a point-in-time RSS sample, not the process peak. The verifier
+    // obtains true per-child peak RSS from wait4.
+    var rssAfterItemMB = 0.0
 }
 
 struct MetalFXDirectDDSColor: Codable {
@@ -1618,7 +1620,7 @@ func convertCGImageWithPreprocess(
     defer {
         telemetry?.success = completed
         telemetry?.totalMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
-        telemetry?.peakRssMB = Double(residentMemoryMB())
+        telemetry?.rssAfterItemMB = Double(residentMemoryMB())
     }
     guard format == "BC1" || format == "BC3" else {
         reportError("ASHelper does not support \(format) output. Use nvcompress instead.")
@@ -2594,7 +2596,7 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
         var failedCount = 0
         var tensorOpsDispatchObserved = false
         var fallbackReasons: [String: Int] = [:]
-        var peakRSSMB: UInt64 = 0
+        var maxRSSAfterItemMB: UInt64 = 0
         let started = CFAbsoluteTimeGetCurrent()
 
         for (index, item) in request.items.enumerated() {
@@ -2605,7 +2607,7 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
                     fallbackToCI: request.fallbackToCI ?? true
                 )
             }
-            peakRSSMB = max(peakRSSMB, result.rssMB)
+            maxRSSAfterItemMB = max(maxRSSAfterItemMB, result.rssMB)
             if result.success {
                 successCount += 1
                 tensorOpsDispatchObserved = tensorOpsDispatchObserved || result.tensorOpsDispatchObserved
@@ -2633,7 +2635,7 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
                     + "neural_accelerator_confirmed=false "
                     + "tensorops_ms=\(tensorOpsMS) readback_ms=\(readbackMS) "
                     + "dds_ms=\(ddsMS) total_ms=\(totalMS) "
-                    + "rss_mb=\(result.rssMB)"
+                    + "rss_after_item_mb=\(result.rssMB)"
                     + (result.fallbackReason.map { " fallback_reason=\($0)" } ?? "")
             )
         }
@@ -2659,7 +2661,7 @@ func tensorOpsDirectDDSBatch(requestPath: String) -> Bool {
                 + "batch_success=\(successCount) batch_fallback=\(fallbackCount) "
                 + "batch_failed=\(failedCount) batch_workers=1 batch_chunks=1 chunk_size=\(request.items.count) "
                 + "tensorops_dispatch_observed=\(tensorOpsDispatchObserved) neural_accelerator_confirmed=false "
-                + "peak_rss_mb=\(peakRSSMB) duration_ms="
+                + "rss_after_item_mb=\(maxRSSAfterItemMB) duration_ms="
                 + String(format: "%.2f", (CFAbsoluteTimeGetCurrent() - started) * 1000.0)
                 + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
         )
@@ -3291,10 +3293,9 @@ private final class FP8SRRuntime {
                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
             )
             baseIndex += chunk
-            if baseIndex < elementCount {
-                encodeDispatchBarrier(encoder)
-            }
         }
+        // Chunks write disjoint ranges of the same activation buffer. Only
+        // the consumer after the loop needs visibility of all writes.
         encodeDispatchBarrier(encoder)
     }
 
@@ -3322,10 +3323,9 @@ private final class FP8SRRuntime {
                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
             )
             baseIndex += chunk
-            if baseIndex < elementCount {
-                encodeDispatchBarrier(encoder)
-            }
         }
+        // Chunks write disjoint ranges of the same activation buffer. Only
+        // the consumer after the loop needs visibility of all writes.
         encodeDispatchBarrier(encoder)
     }
 
@@ -4791,7 +4791,7 @@ private func serverSharedConvertTask(
                 "readback_ms": telemetry.readbackMs,
                 "write_ms": telemetry.writeMs,
                 "total_ms": telemetry.totalMs,
-                "peak_rss_mb": telemetry.peakRssMB,
+                "rss_after_item_mb": telemetry.rssAfterItemMB,
             ]
         )
     } catch {
@@ -4887,18 +4887,18 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
                     backend: telemetry.backend,
                     error: ok ? nil : "conversion_failed",
                     extra: [
-                    "decode_ms": telemetry.decodeMs,
-                    "mask_setup_ms": telemetry.maskSetupMs,
-                    "color_setup_ms": telemetry.colorSetupMs,
-                    // Compatibility aliases; see DDSConversionTelemetry.
-                    "mask_ms": telemetry.maskSetupMs,
-                    "color_ms": telemetry.colorSetupMs,
-                    "preprocess_ms": telemetry.preprocessMs,
-                    "compression_ms": telemetry.compressionMs,
-                    "readback_ms": telemetry.readbackMs,
-                    "write_ms": telemetry.writeMs,
+                        "decode_ms": telemetry.decodeMs,
+                        "mask_setup_ms": telemetry.maskSetupMs,
+                        "color_setup_ms": telemetry.colorSetupMs,
+                        // Compatibility aliases; see DDSConversionTelemetry.
+                        "mask_ms": telemetry.maskSetupMs,
+                        "color_ms": telemetry.colorSetupMs,
+                        "preprocess_ms": telemetry.preprocessMs,
+                        "compression_ms": telemetry.compressionMs,
+                        "readback_ms": telemetry.readbackMs,
+                        "write_ms": telemetry.writeMs,
                         "total_ms": telemetry.totalMs,
-                        "peak_rss_mb": telemetry.peakRssMB,
+                        "rss_after_item_mb": telemetry.rssAfterItemMB,
                     ]
                 )
                 resultLock.unlock()
@@ -5321,7 +5321,7 @@ else if args[1] == "--convert-batch-v3" {
     var readbackMs = 0.0
     var writeMs = 0.0
     var totalMs = 0.0
-    var peakRssMB = 0.0
+    var maxRSSAfterItemMB = 0.0
     DispatchQueue.concurrentPerform(iterations: tasks.count) { i in
         semaphore.wait()
         defer { semaphore.signal() }
@@ -5356,7 +5356,7 @@ else if args[1] == "--convert-batch-v3" {
         readbackMs += telemetry.readbackMs
         writeMs += telemetry.writeMs
         totalMs += telemetry.totalMs
-        peakRssMB = max(peakRssMB, telemetry.peakRssMB)
+        maxRSSAfterItemMB = max(maxRSSAfterItemMB, telemetry.rssAfterItemMB)
         telemetryLock.unlock()
         if !ok {
             failureState.recordFailure(
@@ -5385,7 +5385,7 @@ else if args[1] == "--convert-batch-v3" {
             + "readback_ms=\(String(format: "%.2f", readbackMs)) "
             + "write_ms=\(String(format: "%.2f", writeMs)) "
             + "total_item_ms=\(String(format: "%.2f", totalMs)) "
-            + "peak_rss_mb=\(String(format: "%.2f", peakRssMB))"
+            + "rss_after_item_mb=\(String(format: "%.2f", maxRSSAfterItemMB))"
     )
     if failureState.hasFailure() {
         failureState.reportFailures()
