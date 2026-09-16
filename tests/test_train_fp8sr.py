@@ -161,13 +161,14 @@ def test_record_contains_timing_and_gpu_evidence_fields():
                 "traces": ["/tmp/perf.atrc"],
                 "overviews": ["/tmp/perf.overview.json"],
             },
+            "profile": {"path": "/tmp/neural-profile.jsonl"},
             "tensorops_dispatch_observed": True,
         },
     )
     assert record["timing_ms"]["median"] == 1.0
     assert record["timing_ms"]["p95"] == 2.0
     assert record["tensorops_dispatch_observed"] is True
-    assert len(record["gpu_evidence_paths"]) == 4
+    assert len(record["gpu_evidence_paths"]) == 5
     assert record["neural_accelerator_confirmed"] is False
 
 

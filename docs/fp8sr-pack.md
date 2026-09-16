@@ -51,7 +51,7 @@ tensorops_dispatch=ready dtype=MetalFloat8E4M3 activation=Float16 accumulation=F
 tensorops_dispatch=completed dtype=MetalFloat8E4M3 activation=Float16 accumulation=Float16 output=...
 ```
 
-これはTensorOps dispatchの証拠であり、Neural Acceleratorの実使用を意味しません。Neural Acceleratorの最終確認はXcode GPU traceで別途行います。
+これはTensorOps dispatchの証拠であり、Neural Acceleratorの実使用を単独では意味しません。`--gpu-tools`を指定した検証では、GPU traceを`gpudebug profile run`で再プロファイルし、Neural Accelerator utilizationカウンタが0より大きい場合だけ`neural_accelerator_confirmed=true`として記録します。profile非対応時は`SKIP`とし、手動確認ではXcode GPU traceのNeural Acceleratorカウンタを使用します。
 
 速度・画質の検証は次で実行できます。`--fp8-pack`を省略すると一時ディレクトリへ決定的な小型パックを生成します。
 

@@ -790,6 +790,9 @@ def _record(
         debug = gpu_tools.get("debug", {})
         if debug.get("path"):
             evidence_paths.append(str(debug["path"]))
+        profile = gpu_tools.get("profile", {})
+        if profile.get("path"):
+            evidence_paths.append(str(profile["path"]))
         performance = gpu_tools.get("metalperftrace", {})
         for key in ("traces", "overviews"):
             evidence_paths.extend(str(path) for path in performance.get(key, []))

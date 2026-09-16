@@ -387,6 +387,9 @@ def execution_record(
         debug = gpu_tools.get("debug", {})
         if debug.get("path"):
             evidence_paths.append(str(debug["path"]))
+        profile = gpu_tools.get("profile", {})
+        if profile.get("path"):
+            evidence_paths.append(str(profile["path"]))
         for key in ("traces", "overviews"):
             evidence_paths.extend(
                 str(path)
@@ -396,7 +399,9 @@ def execution_record(
         record["tensorops_dispatch_observed"] = bool(
             gpu_tools.get("tensorops_dispatch_observed", False)
         )
-        record["neural_accelerator_confirmed"] = False
+        record["neural_accelerator_confirmed"] = bool(
+            gpu_tools.get("neural_accelerator_confirmed", False)
+        )
     if "exit_code" not in record:
         record["exit_code"] = 0 if status.startswith("PASS") else None
     return record
@@ -588,6 +593,45 @@ def _tool_available(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def _neural_accelerator_counters(output: str) -> dict[str, str]:
+    """Extract Neural Accelerator counters from gpudebug JSON-lines output."""
+    wanted = {
+        "neural_accelerator_limiter",
+        "neural_accelerator_utilization",
+    }
+    counters: dict[str, str] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            name = value.get("name")
+            if name in wanted:
+                for item in value.get("values", []):
+                    if isinstance(item, dict) and item.get("type") == "string":
+                        counters[name] = str(item.get("value", ""))
+                        break
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for line in output.splitlines():
+        try:
+            visit(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return counters
+
+
+def _percentage_value(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value.strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
 def run_gpu_tool_verification(
     helper: Path,
     pack: Path,
@@ -608,8 +652,10 @@ def run_gpu_tool_verification(
 
     capture_path = artifact_dir / "tensorops.gputrace"
     debug_dir = artifact_dir / "gpudebug"
+    profile_dir = artifact_dir / "gpudebug-profile"
     perf_dir = artifact_dir / "metalperftrace"
     debug_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.mkdir(parents=True, exist_ok=True)
     perf_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["MTL_CAPTURE_ENABLED"] = "1"
@@ -636,6 +682,7 @@ def run_gpu_tool_verification(
     )
     capture: dict[str, Any] = {"status": "SKIP(capture_unavailable)"}
     debug: dict[str, Any] = {"status": "SKIP(capture_unavailable)"}
+    profile: dict[str, Any] = {"status": "SKIP(profile_not_run)"}
     try:
         # ASHelper creates the Metal device immediately and then waits in its
         # capture-only path. Give gpucapture a process that already owns that
@@ -734,6 +781,54 @@ def run_gpu_tool_verification(
             except subprocess.TimeoutExpired:
                 process.kill()
 
+    if capture.get("status") == "PASS" and debug.get("status") == "PASS":
+        profile_result = subprocess.run(
+            [
+                "gpudebug",
+                "--oneshot",
+                "--quiet",
+                "--json",
+                "--timeout",
+                "180",
+                "--gputrace",
+                str(capture_path),
+                "--output",
+                str(profile_dir),
+                "-c",
+                "profile run --gpu-state high --exec serial --embed",
+                "-c",
+                "profile load 0",
+                "-c",
+                "go performance/timeline/counters/neural_accelerator",
+                "-c",
+                "list",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=240,
+        )
+        profile_text = profile_result.stdout or ""
+        profile_path = profile_dir / "neural_accelerator_profile.jsonl"
+        profile_path.write_text(profile_text, encoding="utf-8")
+        counters = _neural_accelerator_counters(profile_text)
+        utilization = _percentage_value(
+            counters.get("neural_accelerator_utilization")
+        )
+        limiter = _percentage_value(counters.get("neural_accelerator_limiter"))
+        confirmed = utilization is not None and utilization > 0.0
+        profile = {
+            "status": "PASS" if confirmed else "SKIP(neural_counter_unavailable)",
+            "exit_code": profile_result.returncode,
+            "path": str(profile_path),
+            "counters": counters,
+            "neural_accelerator_utilization_percent": utilization,
+            "neural_accelerator_limiter_percent": limiter,
+            "neural_accelerator_confirmed": confirmed,
+            "diagnostic": profile_text.strip(),
+        }
+
     elapsed_seconds = max(5, int(math.ceil(time.perf_counter() - started)) + 2)
     perf_collect = subprocess.run(
         [
@@ -783,9 +878,12 @@ def run_gpu_tool_verification(
         "status": "PASS" if tensorops_observed else "SKIP(gpu_evidence_incomplete)",
         "capture": capture,
         "debug": debug,
+        "profile": profile,
         "metalperftrace": perf,
         "tensorops_dispatch_observed": tensorops_observed,
-        "neural_accelerator_confirmed": False,
+        "neural_accelerator_confirmed": bool(
+            profile.get("neural_accelerator_confirmed", False)
+        ),
     }
 
 

@@ -86,7 +86,7 @@ FP16/FP4/INT2の決定的パックは次のように生成できる。FP8SR v1�
 .venv/bin/python tools/fp8sr_pack.py --create-fixture /private/tmp/int2sr --dtype Int2
 ```
 
-`--gpu-tools`を指定した場合だけ、`gpucapture`で`.gputrace`を作成し、`gpudebug --oneshot --json`でcompute dispatchを確認し、`metalperftrace collect/overview`の成果物を保存する。ツール不在、capturable process不在、Metal layerの記録なしは理由付き`SKIP`となる。TensorOps dispatchの存在はNeural Accelerator使用の証明ではない。
+`--gpu-tools`を指定した場合だけ、`gpucapture`で`.gputrace`を作成し、`gpudebug --oneshot --json`でcompute dispatchを確認する。さらにM5対応GPUでは`gpudebug profile run --gpu-state high --exec serial`で性能カウンタを収集し、Neural Accelerator utilizationが0より大きい場合だけ`neural_accelerator_confirmed=true`としてprofile証跡を保存する。`metalperftrace collect/overview`の成果物も保存する。ツール不在、capturable process不在、Metal layerの記録なし、profile非対応は理由付き`SKIP`となる。TensorOps dispatchの存在だけではNeural Accelerator使用の証明にならない。
 
 この検証はMetalデバイス、Core ImageのMetalコンテキスト、ASHelperの直接変換、`--convert-batch-v3` の64件並列変換、DDSのヘッダ・Mip数・マスク透明度、色補正の作用、DDS書き込み失敗時の終了コードを確認する。`--keep-artifacts` を省略すると、成功時の生成物は終了時に削除される。失敗時は調査用に生成物を残し、出力された `kept_artifacts` を確認できる。Metal対応ホストでも実行プロセスのサンドボックスからデバイスが見えない場合があり、その場合は `metal_host_supported=true` と表示されるため、ホストのターミナルなど隔離されていないCLIから再実行する。MetalデバイスがないMacではCPU/fallbackの確認だけを行い、GPU固有の判定はスキップする。実データのタイル生成・GUI操作は既存の手動確認範囲であり、このランナーには含めない。
 
@@ -125,6 +125,6 @@ Utils/mac/ASHelper --tensorops-upscale-batch \
   /private/tmp/ortho4xp-fp8-fixture/batch-output.png
 ```
 
-`tensorops_dispatch=ready`はTensorOpsパイプライン初期化、`tensorops_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。Neural Acceleratorの確認はGPU traceで別途行う。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認とGPU traceの確認は未実行として分けて報告する。
+`tensorops_dispatch=ready`はTensorOpsパイプライン初期化、`tensorops_dispatch=completed`は画像出力までの完了を示す。これはGPU dispatchの実行証拠であり、Neural Acceleratorの使用証明ではない。`--gpu-tools`のprofile結果、またはXcode GPU traceのNeural Acceleratorカウンタで別途確認する。現行のXcode環境で`xcrun metal`がMetal Toolchain不足を報告する場合、Swift側のランタイムコンパイル確認とGPU traceの確認は未実行として分けて報告する。
 
 構文確認、ビルド、限定的なスクリプト実行だけでは、実際のProvider応答、長時間のタイル生成、GUI操作、利用者データへの影響まで保証しない。未実行の範囲を最終報告に明記する。

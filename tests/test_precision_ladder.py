@@ -108,3 +108,22 @@ def test_execution_record_keeps_canonical_backend_and_gpu_evidence(tmp_path):
     assert saved["backend"] == "coreml"
     assert saved["role"] == "reference_only"
     assert saved["neural_accelerator_confirmed"] is False
+
+
+def test_neural_accelerator_counters_are_parsed_and_recorded(tmp_path):
+    output = """{"children":[{"name":"neural_accelerator_utilization","values":[{"type":"string","value":"8.80%"}]},{"name":"neural_accelerator_limiter","values":[{"type":"string","value":"9.19%"}]}]}\n"""
+    counters = verify_metal._neural_accelerator_counters(output)
+    assert counters == {
+        "neural_accelerator_utilization": "8.80%",
+        "neural_accelerator_limiter": "9.19%",
+    }
+    record = verify_metal.execution_record(
+        backend="tensorops",
+        role="candidate",
+        status="PASS",
+        gpu_tools={
+            "tensorops_dispatch_observed": True,
+            "neural_accelerator_confirmed": True,
+        },
+    )
+    assert record["neural_accelerator_confirmed"] is True
