@@ -3938,6 +3938,33 @@ def _build_all(tile, include_overlays=True):
                 best_candidate["attempt"]
             ),
         )
+        if best_candidate["attempt"] > 0 and not tile.grouped:
+            try:
+                removed_textures = remove_unwanted_textures(tile)
+                if removed_textures:
+                    UI.vprint(
+                        1,
+                        UI.ui_text(
+                            "[Auto-Reduce] Removed {} unreferenced generated texture(s).".format(
+                                len(removed_textures)
+                            ),
+                            "[自動削減] 未参照の生成テクスチャを{}個整理しました。".format(
+                                len(removed_textures)
+                            ),
+                        ),
+                    )
+            except Exception as error:
+                UI.logprint(
+                    "WARNING: Could not remove unreferenced reduced-attempt textures:",
+                    repr(error),
+                )
+                UI.vprint(
+                    1,
+                    UI.ui_text(
+                        "WARNING: Could not remove unreferenced reduced-attempt textures; keeping the valid tile.",
+                        "警告: 自動削減後の未参照テクスチャを整理できないため、有効なタイルを保持します。",
+                    ),
+                )
         try:
             transaction.cleanup()
         except Exception as error:
@@ -4568,19 +4595,47 @@ def build_tile_list(
 
 ################################################################################
 def remove_unwanted_textures(tile):
-    texture_list = []
-    for f in os.listdir(os.path.join(tile.build_dir, "terrain")):
-        if f[-4:] != ".ter":
+    """Remove generated DDS files not referenced by the tile's terrain files.
+
+    Grouped builds share terrain/textures between tiles, so callers must not
+    prune those outputs as if they belonged exclusively to one tile.
+    """
+    if getattr(tile, "grouped", False):
+        return []
+
+    terrain_dir = os.path.join(tile.build_dir, "terrain")
+    texture_dir = os.path.join(tile.build_dir, "textures")
+    referenced_textures = set()
+    if os.path.isdir(terrain_dir):
+        for dir_path, _, names in os.walk(terrain_dir):
+            for name in names:
+                if not name.endswith(".ter"):
+                    continue
+                base_name = name[:-4]
+                for suffix in (
+                    "_water_overlay",
+                    "_sea_overlay",
+                    "_water",
+                    "_sea",
+                    "_overlay",
+                ):
+                    if base_name.endswith(suffix):
+                        base_name = base_name[: -len(suffix)]
+                        break
+                referenced_textures.add(base_name + ".dds")
+
+    removed_textures = []
+    if not os.path.isdir(texture_dir):
+        return removed_textures
+    for name in os.listdir(texture_dir):
+        if not _is_generated_dds_name(name):
             continue
-        # Extract base texture name by removing suffixes
-        base_name = f[:-4].replace("_water", "").replace("_sea", "").replace("_overlay", "")
-        texture_list.append(base_name + ".dds")
-    for f in os.listdir(os.path.join(tile.build_dir, "textures")):
-        if not _is_generated_dds_name(f):
+        if name in referenced_textures:
             continue
-        if f not in texture_list:
-            print("Removing obsolete texture", f)
-            try:
-                os.remove(os.path.join(tile.build_dir, "textures", f))
-            except OSError:
-                pass
+        path = os.path.join(texture_dir, name)
+        try:
+            os.remove(path)
+            removed_textures.append(path)
+        except OSError:
+            pass
+    return removed_textures

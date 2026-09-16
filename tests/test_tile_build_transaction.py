@@ -59,6 +59,18 @@ def _write_outputs(tile, label):
     )
 
 
+def _write_level_output(tile, level, include_terrain=True, label="candidate"):
+    build_dir = Path(tile.build_dir)
+    (build_dir / "terrain").mkdir(parents=True, exist_ok=True)
+    (build_dir / "textures").mkdir(parents=True, exist_ok=True)
+    texture_name = "100_200_BI{}.dds".format(level)
+    (build_dir / "textures" / texture_name).write_text(label, encoding="utf-8")
+    if include_terrain:
+        (build_dir / "terrain" / texture_name.replace(".dds", ".ter")).write_text(
+            label, encoding="utf-8"
+        )
+
+
 def test_transaction_restores_outputs_and_preserves_unmanaged_files(
     tmp_path, monkeypatch
 ):
@@ -298,6 +310,45 @@ def test_grouped_transaction_carries_shared_assets_into_candidate(
     transaction.cleanup()
 
 
+def test_remove_unwanted_textures_walks_terrain_and_preserves_unmanaged_files(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_level_output(tile, 18)
+    _write_level_output(tile, 19, include_terrain=False)
+    nested_terrain_dir = Path(tile.build_dir) / "terrain" / "nested"
+    nested_terrain_dir.mkdir()
+    (Path(tile.build_dir) / "terrain" / "100_200_BI18.ter").rename(
+        nested_terrain_dir / "100_200_BI18.ter"
+    )
+    (Path(tile.build_dir) / "textures" / "sentinel.dds").write_text(
+        "keep", encoding="utf-8"
+    )
+    cache_file = tmp_path / "Orthophotos" / "100_200_BI19.jpg"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text("keep", encoding="utf-8")
+
+    removed = TILE.remove_unwanted_textures(tile)
+
+    assert removed == [str(Path(tile.build_dir) / "textures" / "100_200_BI19.dds")]
+    assert (Path(tile.build_dir) / "textures" / "100_200_BI18.dds").exists()
+    assert not (Path(tile.build_dir) / "textures" / "100_200_BI19.dds").exists()
+    assert (Path(tile.build_dir) / "textures" / "sentinel.dds").exists()
+    assert cache_file.exists()
+
+
+def test_grouped_remove_unwanted_textures_preserves_shared_outputs(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    tile.grouped = True
+    _write_level_output(tile, 18)
+    _write_level_output(tile, 19, include_terrain=False)
+
+    assert TILE.remove_unwanted_textures(tile) == []
+    assert (Path(tile.build_dir) / "textures" / "100_200_BI19.dds").exists()
+
+
 def test_build_all_runs_at_most_two_attempts_and_saves_selected_settings(
     tmp_path, monkeypatch
 ):
@@ -334,6 +385,68 @@ def test_build_all_runs_at_most_two_attempts_and_saves_selected_settings(
     assert (Path(tile.build_dir) / "Data+01+002.mesh").read_text(encoding="utf-8") == "reduced"
     assert "50000" in (Path(tile.build_dir) / "selected.cfg").read_text(encoding="utf-8")
     assert not (Path(tile.build_dir) / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
+def test_selected_reduced_attempt_removes_old_unreferenced_textures(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    attempts = []
+
+    def fake_pipeline(current_tile):
+        attempt = len(attempts)
+        attempts.append(attempt)
+        if attempt == 0:
+            _write_level_output(current_tile, 19, label="baseline")
+        else:
+            old_terrain = Path(current_tile.build_dir) / "terrain" / "100_200_BI19.ter"
+            old_terrain.unlink()
+            _write_level_output(current_tile, 18, label="reduced")
+        current_tile.last_dsf_metrics = {
+            "point_count": 80 if attempt else 120,
+            "budget_exceeded": attempt == 0,
+            "structurally_valid": True,
+        }
+        return 1
+
+    tile.write_to_config = lambda: 1
+    monkeypatch.setattr(TILE, "_run_pipeline_once", fake_pipeline)
+    monkeypatch.setattr(TILE.UI, "red_flag", False)
+
+    assert TILE._build_all(tile, include_overlays=False) == 1
+    assert attempts == [0, 1]
+    assert (Path(tile.build_dir) / "textures" / "100_200_BI18.dds").exists()
+    assert not (Path(tile.build_dir) / "textures" / "100_200_BI19.dds").exists()
+
+
+def test_failed_reduced_attempt_does_not_prune_baseline_textures(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    attempts = []
+
+    def fake_pipeline(current_tile):
+        attempt = len(attempts)
+        attempts.append(attempt)
+        if attempt == 0:
+            _write_level_output(current_tile, 19, label="baseline")
+            current_tile.last_dsf_metrics = {
+                "point_count": 120,
+                "budget_exceeded": True,
+                "structurally_valid": True,
+            }
+            return 1
+        _write_level_output(current_tile, 18, label="failed")
+        return 0
+
+    tile.write_to_config = lambda: 1
+    monkeypatch.setattr(TILE, "_run_pipeline_once", fake_pipeline)
+    monkeypatch.setattr(TILE.UI, "red_flag", False)
+
+    assert TILE._build_all(tile, include_overlays=False) == 1
+    assert attempts == [0, 1]
+    assert (Path(tile.build_dir) / "textures" / "100_200_BI19.dds").exists()
+    assert not (Path(tile.build_dir) / "textures" / "100_200_BI18.dds").exists()
 
 
 def test_failed_reduced_attempt_keeps_baseline_as_one_consistent_state(
