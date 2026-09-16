@@ -1580,9 +1580,25 @@ def _build_tile(tile, persist_config=True):
         remove_unwanted_textures(tile)
     try:
         import O4_RAMDisk_Utils
-        O4_RAMDisk_Utils.flush_tile_imagery(tile.lat, tile.lon)
+        flush_result = O4_RAMDisk_Utils.flush_tile_imagery(tile.lat, tile.lon)
+        if flush_result is False:
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: RAM disk imagery flush failed; RAM data was retained.",
+                    "エラー: RAMディスクの画像flushに失敗したため、RAMデータを保持しました。",
+                ),
+            )
+            return 0
     except Exception as e:
-        UI.vprint(2, f"[RAMDisk] Warning: Failed to flush tile imagery: {e}")
+        UI.vprint(
+            0,
+            UI.ui_text(
+                f"ERROR: RAM disk imagery flush failed: {e}",
+                f"エラー: RAMディスクの画像flushに失敗しました: {e}",
+            ),
+        )
+        return 0
     UI.timings_and_bottom_line(timer)
     UI.logprint(
         "Step 3 for tile lat=", tile.lat, ", lon=", tile.lon, ": normal exit."

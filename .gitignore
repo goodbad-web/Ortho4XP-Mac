@@ -19,4 +19,6 @@ Tiles/
 **/*.bak
 **/*.swp
 .last_gui_params.txt
+.Ortho4XP_ramdisk_state.json
+.Ortho4XP_ramdisk.lock
 **/.DS_Store

@@ -37,20 +37,48 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, sig_handler)
         
     import O4_RAMDisk_Utils
-    # 1. Recover any orphaned symbolic links from a previous crash/abrupt termination
-    O4_RAMDisk_Utils.recover_orphaned_symlinks()
-    
-    use_ram_disk = getattr(CFG.UI, 'use_ram_disk', False)
-    use_ram_disk_for_orthophotos = getattr(CFG.UI, 'use_ram_disk_for_orthophotos', False)
-    if use_ram_disk:
-        use_ram_disk = O4_RAMDisk_Utils.mount_ram_disk(
-            size_gb=getattr(CFG.UI, 'ram_disk_size_gb', 4),
-            use_orthophotos=use_ram_disk_for_orthophotos
-        )
-        if not use_ram_disk:
-            print("[Ortho4XP] RAM disk setup failed. Continuing without RAM disk.")
-        
+    use_ram_disk = False
+    ram_disk_requested = getattr(CFG.UI, "use_ram_disk", False)
+    use_ram_disk_for_orthophotos = getattr(
+        CFG.UI, "use_ram_disk_for_orthophotos", False
+    )
     try:
+        # Recover only state previously recorded by this project. An
+        # unowned volume or symlink is a conflict and must not be touched.
+        try:
+            O4_RAMDisk_Utils.recover_orphaned_symlinks()
+        except O4_RAMDisk_Utils.RamDiskError as error:
+            print(
+                UI.ui_text(
+                    f"[Ortho4XP] RAM disk recovery failed: {error}",
+                    f"[Ortho4XP] RAMディスクの復旧に失敗しました: {error}",
+                )
+            )
+            sys.exit(1)
+
+        if ram_disk_requested:
+            try:
+                ram_disk_mounted = O4_RAMDisk_Utils.mount_ram_disk(
+                    size_gb=getattr(CFG.UI, "ram_disk_size_gb", 4),
+                    use_orthophotos=use_ram_disk_for_orthophotos,
+                )
+            except O4_RAMDisk_Utils.RamDiskError as error:
+                print(
+                    UI.ui_text(
+                        f"[Ortho4XP] RAM disk setup conflict: {error}",
+                        f"[Ortho4XP] RAMディスク設定が競合しました: {error}",
+                    )
+                )
+                sys.exit(1)
+            use_ram_disk = bool(ram_disk_mounted)
+            if not use_ram_disk:
+                print(
+                    UI.ui_text(
+                        "[Ortho4XP] RAM disk setup failed. Continuing without RAM disk.",
+                        "[Ortho4XP] RAMディスク設定に失敗したため、RAMなしで続行します。",
+                    )
+                )
+
         for directory in (FNAMES.Preview_dir, FNAMES.Provider_dir, FNAMES.Extent_dir, FNAMES.Filter_dir, FNAMES.OSM_dir,
                           FNAMES.Mask_dir,FNAMES.Imagery_dir,FNAMES.Elevation_dir,FNAMES.Geotiff_dir,FNAMES.Patch_dir,
                           FNAMES.Tile_dir,FNAMES.Tmp_dir):
@@ -124,6 +152,16 @@ if __name__ == '__main__':
                 sys.exit(1)
     finally:
         if use_ram_disk:
-            O4_RAMDisk_Utils.unmount_ram_disk(use_orthophotos=use_ram_disk_for_orthophotos)
+            cleanup_ok = O4_RAMDisk_Utils.unmount_ram_disk(
+                use_orthophotos=use_ram_disk_for_orthophotos
+            )
+            if not cleanup_ok and sys.exc_info()[0] is None:
+                print(
+                    UI.ui_text(
+                        "[Ortho4XP] RAM disk cleanup failed; state was retained for recovery.",
+                        "[Ortho4XP] RAMディスクのcleanupに失敗したため、復旧用に状態を保持しました。",
+                    )
+                )
+                sys.exit(1)
  
         

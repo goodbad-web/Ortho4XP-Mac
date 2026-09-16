@@ -18,6 +18,8 @@ import requests
 import queue
 import random
 import importlib.util
+import tempfile
+import uuid
 from math import ceil, log, tan, pi, floor
 import numpy
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
@@ -1771,6 +1773,28 @@ def build_texture_from_bbox_and_size(t_bbox, t_epsg, t_size, provider):
 ################################################################################
 
 ################################################################################
+def _save_image_atomically(image, file_path, **save_kwargs):
+    """Save an image without exposing a partially written final file."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix="." + os.path.basename(file_path) + ".",
+        suffix=f".{os.getpid()}.{uuid.uuid4().hex}.tmp",
+        dir=os.path.dirname(file_path),
+    )
+    os.close(fd)
+    try:
+        image.save(temporary_path, **save_kwargs)
+        if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) == 0:
+            raise OSError("image save produced an empty file")
+        os.replace(temporary_path, file_path)
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
 def download_jpeg_ortho(
     file_dir,
     file_name,
@@ -1821,15 +1845,24 @@ def download_jpeg_ortho(
     os.makedirs(file_dir, exist_ok=True)
     try:
         if super_resol_factor == 1:
-            big_image.save(os.path.join(file_dir, file_name))
+            _save_image_atomically(
+                big_image,
+                os.path.join(file_dir, file_name),
+                format="JPEG",
+            )
         else:
-            big_image.resize(
+            resized_image = big_image.resize(
                 (
                     int(width / super_resol_factor),
                     int(height / super_resol_factor),
                 ),
                 Image.BICUBIC,
-            ).save(os.path.join(file_dir, file_name))
+            )
+            _save_image_atomically(
+                resized_image,
+                os.path.join(file_dir, file_name),
+                format="JPEG",
+            )
     except Exception as e:
         UI.lvprint(
             0,
@@ -1902,7 +1935,12 @@ def download_jpeg_ortho(
                         high_quality_img = cropped.resize(
                             (4096, 4096), Image.BICUBIC
                         )
-                        high_quality_img.save(file_path, "JPEG", quality=90)
+                        _save_image_atomically(
+                            high_quality_img,
+                            file_path,
+                            format="JPEG",
+                            quality=90,
+                        )
                         UI.vprint(
                             1,
                             f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",

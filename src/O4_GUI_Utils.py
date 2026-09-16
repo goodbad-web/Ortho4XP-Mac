@@ -963,7 +963,7 @@ class Ortho4XP_GUI(tk.Tk):
                 )
         return 1 if all_found else 0
 
-    def exit_prg(self):
+    def _save_gui_params(self):
         try:
             f = open(
                 os.path.join(FNAMES.Ortho4XP_dir, ".last_gui_params.txt"), "w"
@@ -982,11 +982,47 @@ class Ortho4XP_GUI(tk.Tk):
             f.close()
         except:
             pass
-        self.after_cancel(self.callback_pgrb)
-        self.after_cancel(self.callback_status)
-        self.after_cancel(self.callback_console)
+
+    def _finish_exit(self):
+        worker = getattr(self, "working_thread", None)
+        if worker is not None and worker.is_alive():
+            self.status_var.set(
+                _ui_text(
+                    "Stopping the current process before exit...",
+                    "終了前に現在の処理が停止するまでお待ちください...",
+                )
+            )
+            self._exit_poll_id = self.after(100, self._finish_exit)
+            return
+        if worker is not None:
+            worker.join(timeout=0)
+        for callback_name in ("callback_pgrb", "callback_status", "callback_console"):
+            callback = getattr(self, callback_name, None)
+            if callback is not None:
+                try:
+                    self.after_cancel(callback)
+                except Exception:
+                    pass
         sys.stdout = self.stdout_orig
         self.destroy()
+
+    def exit_prg(self):
+        if getattr(self, "_exit_requested", False):
+            return
+        self._save_gui_params()
+        worker = getattr(self, "working_thread", None)
+        if worker is not None and worker.is_alive():
+            self._exit_requested = True
+            UI.red_flag = True
+            self.status_var.set(
+                _ui_text(
+                    "Stop requested. Waiting for the current process before exit...",
+                    "停止を要求しました。終了前に現在の処理の完了を待っています...",
+                )
+            )
+            self._exit_poll_id = self.after(100, self._finish_exit)
+            return
+        self._finish_exit()
 
 ################################################################################
 class Ortho4XP_Custom_ZL(tk.Toplevel):
@@ -2133,12 +2169,29 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
                 UI.vprint(3, e)
         if self.v_["Jpeg imagery"].get():
             try:
-                shutil.rmtree(
-                    os.path.join(
-                        FNAMES.Imagery_dir,
-                        FNAMES.long_latlon(self.active_lat, self.active_lon),
-                    )
+                import O4_RAMDisk_Utils
+
+                removed_from_ram = O4_RAMDisk_Utils.remove_tile_imagery(
+                    self.active_lat, self.active_lon
                 )
+                if not removed_from_ram:
+                    if os.path.islink(FNAMES.Imagery_dir):
+                        UI.vprint(
+                            0,
+                            _ui_text(
+                                "Jpeg imagery deletion was refused because RAM disk ownership is unknown.",
+                                "RAMディスクの所有状態を確認できないため、JPEG画像の削除を拒否しました。",
+                            ),
+                        )
+                    else:
+                        shutil.rmtree(
+                            os.path.join(
+                                FNAMES.Imagery_dir,
+                                FNAMES.long_latlon(self.active_lat, self.active_lon),
+                            )
+                        )
+            except O4_RAMDisk_Utils.RamDiskError as e:
+                UI.vprint(0, f"[RAMDisk] Jpeg imagery deletion refused: {e}")
             except Exception as e:
                 UI.vprint(3, e)
         if self.v_["Tile (whole)"].get() and not self.grouped:
