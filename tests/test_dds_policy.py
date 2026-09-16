@@ -3,12 +3,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from PIL import Image
+
 
 SRC_ROOT = Path(__file__).parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import O4_Config_Utils as CFG  # noqa: E402
+import O4_DSF_Utils as DSF  # noqa: E402
 import O4_Imagery_Utils as IMG  # noqa: E402
 import O4_Tile_Utils as TILE  # noqa: E402
 
@@ -44,6 +47,19 @@ def test_auto_format_selects_the_smallest_xplane_compatible_bc_format():
     assert IMG.resolve_dds_format("AUTO", has_alpha=True) == "BC3"
     assert IMG.resolve_dds_format("BC1", has_alpha=True) == "BC3"
     assert IMG.resolve_dds_format("BC3", has_alpha=False) == "BC3"
+
+
+def test_masked_xp11_contract_uses_the_actual_mask_alpha():
+    tile = SimpleNamespace(imprint_masks_to_dds=True, dds_format="AUTO")
+    partial_mask = Image.new("L", (4, 4), color=255)
+    partial_mask.putpixel((0, 0), 0)
+    opaque_mask = Image.new("L", (4, 4), color=255)
+
+    assert DSF._masked_dds_requires_alpha(tile, partial_mask)
+    assert not DSF._masked_dds_requires_alpha(tile, opaque_mask)
+
+    tile.dds_format = "BC1"
+    assert DSF._masked_dds_requires_alpha(tile, opaque_mask)
 
 
 def test_upscale_scope_only_targets_explicit_airport_texture_keys():

@@ -95,6 +95,111 @@ def test_transaction_restores_outputs_and_preserves_unmanaged_files(
     assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
 
 
+def test_standalone_transaction_keeps_inputs_visible_and_restores_in_place_writes(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_outputs(tile, "initial")
+    build_dir = Path(tile.build_dir)
+    transaction = TILE._BuildTransaction(tile, preserve_inputs=True)
+
+    assert (build_dir / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    (build_dir / "terrain" / "100_200_BI16_initial.ter").write_text(
+        "candidate", encoding="utf-8"
+    )
+    dds_tmp = build_dir / "textures" / "100_200_BI16.dds.tmp"
+    dds_tmp.write_text(
+        "candidate", encoding="utf-8"
+    )
+    dds_tmp.replace(build_dir / "textures" / "100_200_BI16.dds")
+    (build_dir / "textures" / "300_400_BI16.dds").write_text(
+        "new", encoding="utf-8"
+    )
+
+    transaction.restore_snapshot("initial")
+    transaction._write_marker("restored", None, None)
+    transaction.cleanup()
+
+    assert (
+        build_dir / "terrain" / "100_200_BI16_initial.ter"
+    ).read_text(encoding="utf-8") == "initial"
+    assert (build_dir / "textures" / "100_200_BI16.dds").read_text(
+        encoding="utf-8"
+    ) == "initial"
+    assert not (build_dir / "textures" / "300_400_BI16.dds").exists()
+    assert (build_dir / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
+def test_standalone_build_restores_outputs_when_step_three_fails(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_outputs(tile, "initial")
+    build_dir = Path(tile.build_dir)
+
+    monkeypatch.setattr(TILE.UI, "is_building_all", False)
+    monkeypatch.setattr(TILE.UI, "is_working", 0)
+    monkeypatch.setattr(TILE.UI, "initialize_build_log", lambda *args: None)
+    monkeypatch.setattr(TILE.UI, "flush_build_log", lambda *args: None)
+    monkeypatch.setattr(TILE.UI, "exit_message_and_bottom_line", lambda *args: None)
+
+    def failed_build(current_tile, persist_config=True):
+        current_dir = Path(current_tile.build_dir)
+        (current_dir / "terrain" / "100_200_BI16_initial.ter").write_text(
+            "candidate", encoding="utf-8"
+        )
+        dds_tmp = current_dir / "textures" / "100_200_BI16.dds.tmp"
+        dds_tmp.write_text(
+            "candidate", encoding="utf-8"
+        )
+        dds_tmp.replace(current_dir / "textures" / "100_200_BI16.dds")
+        (current_dir / "textures" / "300_400_BI16.dds").write_text(
+            "new", encoding="utf-8"
+        )
+        return 0
+
+    monkeypatch.setattr(TILE, "_build_tile", failed_build)
+
+    assert TILE.build_tile(tile) == 0
+    assert (
+        build_dir / "terrain" / "100_200_BI16_initial.ter"
+    ).read_text(encoding="utf-8") == "initial"
+    assert (build_dir / "textures" / "100_200_BI16.dds").read_text(
+        encoding="utf-8"
+    ) == "initial"
+    assert not (build_dir / "textures" / "300_400_BI16.dds").exists()
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
+def test_standalone_build_commits_outputs_after_step_three_succeeds(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_outputs(tile, "initial")
+    build_dir = Path(tile.build_dir)
+
+    monkeypatch.setattr(TILE.UI, "is_building_all", False)
+    monkeypatch.setattr(TILE.UI, "is_working", 0)
+    monkeypatch.setattr(TILE.UI, "initialize_build_log", lambda *args: None)
+    monkeypatch.setattr(TILE.UI, "flush_build_log", lambda *args: None)
+
+    def successful_build(current_tile, persist_config=True):
+        current_dir = Path(current_tile.build_dir)
+        (current_dir / "terrain" / "100_200_BI16_initial.ter").write_text(
+            "candidate", encoding="utf-8"
+        )
+        return 1
+
+    monkeypatch.setattr(TILE, "_build_tile", successful_build)
+
+    assert TILE.build_tile(tile) == 1
+    assert (
+        build_dir / "terrain" / "100_200_BI16_initial.ter"
+    ).read_text(encoding="utf-8") == "candidate"
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
 def test_recovery_marker_restores_best_snapshot_after_interruption(
     tmp_path, monkeypatch
 ):

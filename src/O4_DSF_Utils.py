@@ -49,6 +49,31 @@ def _texture_contract_matches(tile, texture_attributes, has_alpha):
     )
     return valid
 
+
+def _masked_dds_requires_alpha(tile, mask_im):
+    """Return the alpha contract produced by the current mask policy.
+
+    Overlay classification controls the terrain type, not whether
+    ``convert_texture`` imprints a mask into the DDS. Keep those decisions
+    separate so XP11 + bathy masked textures are checked against their actual
+    BC3 output. Explicit BC1 retains the historical mask promotion to BC3.
+    """
+    if not getattr(tile, "imprint_masks_to_dds", False):
+        return False
+    if mask_im is None or mask_im is False:
+        return False
+
+    configured_format = str(getattr(tile, "dds_format", "BC3")).strip().upper()
+    if configured_format == "BC1":
+        return True
+    try:
+        return mask_im.convert("L").getextrema()[0] < 255
+    except Exception:
+        # A mask that cannot be inspected must not allow a potentially
+        # alpha-bearing DDS to be incorrectly reused.
+        return True
+
+
 ################################################################################
 def float2qquad(x):
     if x >= 1:
@@ -963,7 +988,9 @@ def _build_dsf(tile, download_queue):
                         rebuild = True
                     else:
                         rebuild = not _texture_contract_matches(
-                            tile, texture_attributes, has_alpha=not is_overlay
+                            tile,
+                            texture_attributes,
+                            has_alpha=_masked_dds_requires_alpha(tile, mask_im),
                         )
                         # Maybe masks were updated after target_tex was created.
                         target_mask = _mask_name_for_texture(

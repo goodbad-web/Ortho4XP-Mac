@@ -83,10 +83,11 @@ class _BuildTransaction:
     and therefore do not duplicate multi-gigabyte DDS assets.
     """
 
-    def __init__(self, tile):
+    def __init__(self, tile, preserve_inputs=False):
         self.build_dir = os.path.abspath(tile.build_dir)
         self.mask_dir = os.path.abspath(FNAMES.mask_dir(tile.lat, tile.lon))
         self.grouped = bool(getattr(tile, "grouped", False))
+        self.preserve_inputs = bool(preserve_inputs)
         self.parent_dir = os.path.dirname(self.build_dir) or os.curdir
         os.makedirs(self.build_dir, exist_ok=True)
         os.makedirs(self.parent_dir, exist_ok=True)
@@ -98,9 +99,22 @@ class _BuildTransaction:
         )
         self.tile_lat = int(tile.lat)
         self.tile_lon = int(tile.lon)
-        self._write_marker("active", None, None)
-        self._move_current_to("initial")
-        self._write_marker("active", None, None)
+        try:
+            if self.preserve_inputs:
+                # A standalone Step 3 still needs the existing mesh, masks,
+                # and reusable DDS files visible at their canonical paths.
+                # Hardlinks provide a rollback snapshot without duplicating
+                # multi-gigabyte texture payloads.
+                self._link_current_to("initial")
+                self._write_marker("active", None, None)
+            else:
+                self._write_marker("active", None, None)
+                self._move_current_to("initial")
+                self._write_marker("active", None, None)
+        except Exception:
+            if self.preserve_inputs:
+                shutil.rmtree(self.root, ignore_errors=True)
+            raise
 
     def _write_marker(
         self,
@@ -116,6 +130,7 @@ class _BuildTransaction:
             "build_dir": self.build_dir,
             "mask_dir": self.mask_dir,
             "grouped": self.grouped,
+            "preserve_inputs": self.preserve_inputs,
             "lat": self.tile_lat,
             "lon": self.tile_lon,
             "best_snapshot": best_snapshot,
@@ -197,6 +212,29 @@ class _BuildTransaction:
 
     def _current_output_paths(self):
         return self._tile_output_paths() + self._mask_output_paths()
+
+    def _link_current_to(self, snapshot_name):
+        """Snapshot current files while leaving standalone inputs visible."""
+        snapshot_root = os.path.join(self.root, snapshot_name)
+        for kind, source_path in self._current_output_paths():
+            source_root = self.mask_dir if kind == "mask" else self.build_dir
+            relative_path = os.path.relpath(source_path, source_root)
+            destination_path = os.path.join(
+                snapshot_root, kind, relative_path
+            )
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            if source_path.lower().endswith(".dds"):
+                # DDS conversion activates output with os.replace(), so a
+                # hardlink preserves the old multi-gigabyte payload without a
+                # second copy. The build directory and its sibling snapshot
+                # are deliberately on the same filesystem.
+                os.link(source_path, destination_path)
+            else:
+                # Terrain, mesh, and mask files can be opened in-place by
+                # legacy code; a hardlink would let those writes corrupt the
+                # rollback snapshot. These files are small enough to copy,
+                # and mask files may live on another filesystem.
+                shutil.copy2(source_path, destination_path)
 
     def _move_current_to(self, snapshot_name):
         snapshot_root = os.path.join(self.root, snapshot_name)
@@ -317,6 +355,7 @@ def _recover_build_transaction(tile):
         transaction.build_dir = build_dir
         transaction.mask_dir = mask_dir
         transaction.grouped = bool(marker.get("grouped", False))
+        transaction.preserve_inputs = bool(marker.get("preserve_inputs", False))
         transaction.parent_dir = os.path.abspath(parent_dir)
         transaction.root = root
         transaction.marker_path = marker_path
@@ -328,6 +367,10 @@ def _recover_build_transaction(tile):
         best_settings = marker.get("best_settings")
         best_config = marker.get("best_config")
         target_snapshot = marker.get("target_snapshot")
+
+        if state in ("complete", "restored"):
+            transaction.cleanup()
+            return True
 
         if state == "discarding":
             target_snapshot = target_snapshot or best_snapshot or "initial"
@@ -676,14 +719,91 @@ def download_textures(tile, download_queue, convert_queue):
     return 1
 
 ################################################################################
+def _finish_standalone_build_transaction(transaction, succeeded):
+    """Commit or restore the output snapshot for a standalone Step 3 run."""
+    if transaction is None:
+        return
+    if succeeded:
+        try:
+            # Mark completion before cleanup so an interruption during
+            # cleanup cannot make recovery discard a valid new tile.
+            transaction._write_marker("complete", None, None)
+            transaction.cleanup()
+        except Exception as error:
+            UI.logprint(
+                "WARNING: Could not remove standalone tile transaction staging:",
+                repr(error),
+            )
+            UI.vprint(
+                1,
+                "WARNING: Standalone tile transaction staging remains for recovery:",
+                error,
+            )
+        return
+
+    try:
+        transaction._write_marker("discarding", None, None, "initial")
+        transaction.discard_current("before-restore")
+        transaction._write_marker("restoring", None, None, "initial")
+        transaction.restore_snapshot_files("initial")
+        # The initial hardlink snapshot has been consumed by the restore. A
+        # later recovery must only clean the staging directory, not restore it
+        # a second time over the already-restored canonical files.
+        transaction._write_marker("restored", None, None)
+        transaction.cleanup()
+    except Exception as error:
+        UI.logprint(
+            "ERROR: Could not restore the previous standalone tile state:",
+            repr(error),
+        )
+        UI.vprint(
+            0,
+            UI.ui_text(
+                "ERROR: Could not restore the previous tile state safely: {}".format(
+                    error
+                ),
+                "エラー: 以前のタイル状態を安全に復元できません: {}".format(error),
+            ),
+        )
+
+
 def build_tile(tile, persist_config=True):
+    standalone_transaction = None
     if not UI.is_building_all:
         UI.initialize_build_log(tile.build_dir, tile)
+        if not _recover_build_transaction(tile):
+            UI.exit_message_and_bottom_line(
+                UI.ui_text(
+                    "ERROR: The previous tile build could not be recovered.",
+                    "エラー: 前回のタイルビルドを復元できませんでした。",
+                )
+            )
+            return 0
+        try:
+            standalone_transaction = _BuildTransaction(
+                tile, preserve_inputs=True
+            )
+        except Exception as error:
+            UI.logprint(
+                "ERROR: Could not start standalone tile transaction:",
+                repr(error),
+            )
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Could not start a safe tile build: {}".format(error),
+                    "エラー: 安全なタイルビルドを開始できません: {}".format(error),
+                ),
+            )
+            return 0
     result = 0
     try:
         result = _build_tile(tile, persist_config=persist_config)
         return result
     finally:
+        _finish_standalone_build_transaction(
+            standalone_transaction, bool(result)
+        )
         # A DSF can be fully written before a later imagery/download stage
         # fails.  Never leave that unactivated artifact behind: the next run
         # must either rebuild it or activate it atomically.
@@ -762,7 +882,7 @@ def _build_tile(tile, persist_config=True):
             if os.path.isdir(terrain_dir):
                 for dir_path, _, names in os.walk(terrain_dir):
                     for name in names:
-                        if not name.endswith(".ter"):
+                        if not _is_generated_terrain_name(name):
                             continue
                         try:
                             os.remove(os.path.join(dir_path, name))
