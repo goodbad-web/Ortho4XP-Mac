@@ -18,6 +18,7 @@ import O4_Overlay_Utils as OVL
 import O4_Mesh_Utils as MESH
 import O4_Bathymetry as BATHY
 import O4_DSF_Budget as DSF_BUDGET
+import O4_Imagery_Utils as IMG
 
 quad_init_level = 3
 quad_capacity_high = 50000
@@ -25,6 +26,28 @@ quad_capacity_low = 35000
 
 # For Laminar test suite
 use_test_texture = False
+
+
+def _texture_contract_matches(tile, texture_attributes, has_alpha):
+    """Check an existing DDS against the current output policy."""
+    til_x_left, til_y_top, zoomlevel, provider_code = texture_attributes
+    expected_dimensions = IMG.expected_texture_dimensions(
+        tile, til_x_left, til_y_top, zoomlevel, provider_code
+    )
+    configured_format = getattr(tile, "dds_format", "BC3")
+    expected_format = IMG.resolve_dds_format(configured_format, has_alpha)
+    target_path = os.path.join(
+        tile.build_dir,
+        "textures",
+        FNAMES.dds_file_name_from_attributes(*texture_attributes),
+    )
+    valid, _ = IMG.validate_dds_file(
+        target_path,
+        expected_format=expected_format,
+        expected_dimensions=expected_dimensions,
+        require_mipmaps=True,
+    )
+    return valid
 
 ################################################################################
 def float2qquad(x):
@@ -185,6 +208,7 @@ def zone_list_to_ortho_dico(tile):
     masks_im = Image.new("L", (4096, 4096), "black")
     masks_draw = ImageDraw.Draw(masks_im)
     airport_array = numpy.zeros((4096, 4096), dtype=numpy.bool_)
+    airport_highres_texture_keys = set()
     if tile.cover_airports_with_highres in ("True", "ICAO"):
         UI.vprint(1, "-> Checking airport locations for upgraded zoomlevel.")
         try:
@@ -291,7 +315,10 @@ def zone_list_to_ortho_dico(tile):
             y0 = int(max(0, y - step_y / 2))
             y1 = int(min(4095, y + step_y / 2))
             
-            if airport_array[y0 : y1 + 1, x0 : x1 + 1].any():
+            airport_upgrade = bool(
+                airport_array[y0 : y1 + 1, x0 : x1 + 1].any()
+            )
+            if airport_upgrade:
                 zoomlevel = max(zoomlevel, tile.cover_zl)
                 
             til_x_text = 16 * (
@@ -306,6 +333,10 @@ def zone_list_to_ortho_dico(tile):
                 zoomlevel,
                 provider_code,
             )
+            if airport_upgrade:
+                airport_highres_texture_keys.add(
+                    (til_x_text, til_y_text, zoomlevel, str(provider_code))
+                )
     if tile.cover_airports_with_highres == "Existing":
         # what we find in the texture folder of the existing tile
         for f in sorted(os.listdir(os.path.join(tile.build_dir, "textures"))):
@@ -332,7 +363,11 @@ def zone_list_to_ortho_dico(tile):
                             zoomlevel,
                             provider_code,
                         )
+                        airport_highres_texture_keys.add(
+                            (til_x_text, til_y_text, zoomlevel, str(provider_code))
+                        )
 
+    tile.airport_highres_texture_keys = frozenset(airport_highres_texture_keys)
     return dico_customzl
 ################################################################################
 
@@ -927,26 +962,18 @@ def _build_dsf(tile, download_queue):
                     if not os.path.isfile(target_tex):
                         rebuild = True
                     else:
-                        target_tex_size = os.path.getsize(target_tex)
-                        if _imprint_masks_to_dds:
-                            # Maybe target_tex was a DXT1, we need DXT5
-                            if target_tex_size < 20000000:
+                        rebuild = not _texture_contract_matches(
+                            tile, texture_attributes, has_alpha=not is_overlay
+                        )
+                        # Maybe masks were updated after target_tex was created.
+                        target_mask = _mask_name_for_texture(
+                            tile, *texture_attributes
+                        )
+                        if os.path.isfile(target_mask):
+                            mask_last_modified = os.path.getmtime(target_mask)
+                            tex_last_modified = os.path.getmtime(target_tex)
+                            if tex_last_modified < mask_last_modified:
                                 rebuild = True
-                            # Maybe masks were updated after target_tex was created
-                            target_mask = _mask_name_for_texture(
-                                tile, *texture_attributes
-                            )
-                            if os.path.isfile(target_mask):
-                                mask_last_modified = os.path.getmtime(target_mask)
-                                tex_last_modified = os.path.getmtime(target_tex)
-                                if tex_last_modified < mask_last_modified:
-                                    rebuild = True
-                        else:
-                            # maybe target_tex was a DXT5, it should ne a DXT1
-                            if target_tex_size > 20000000:
-                                rebuild = True
-                            else:
-                                print(target_tex_size)
 
                     if rebuild or not _imprint_masks_to_dds:
                         mask_im.save(
@@ -1125,8 +1152,9 @@ def _build_dsf(tile, download_queue):
                 rebuild = False
                 if (not os.path.isfile(target_tex)):
                     rebuild = True
-                # Force rebuild for high-res tiles to apply recent logic changes
-                if int(texture_attributes[2]) >= 18:
+                elif not _texture_contract_matches(
+                    tile, texture_attributes, has_alpha=False
+                ):
                     rebuild = True
                 if (rebuild):
                     download_queue.put(texture_attributes)

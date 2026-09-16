@@ -69,61 +69,270 @@ final class BatchFailureState {
 let metalSource = """
 #include <metal_stdlib>
 using namespace metal;
-kernel void compressTexture(texture2d<float, access::read> input [[texture(0)]], device uchar *output [[buffer(0)]], constant uint &formatMode [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
-    uint2 pos = gid * 4; if (pos.x >= input.get_width() || pos.y >= input.get_height()) return;
-    float3 minC = float3(1.0); float3 maxC = float3(0.0); float minA = 1.0; float maxA = 0.0;
-    for (uint y = 0; y < 4; y++) { for (uint x = 0; x < 4; x++) {
-        uint2 readPos = min(pos + uint2(x, y), uint2(input.get_width() - 1, input.get_height() - 1));
-        float4 color = input.read(readPos);
-        minC = min(minC, color.rgb); maxC = max(maxC, color.rgb); minA = min(minA, color.a); maxA = max(maxA, color.a);
-    }}
+struct ColorBlockResult {
+    ushort c0;
+    ushort c1;
+    uint indices;
+    float error;
+};
+
+struct AlphaBlockResult {
+    uchar a0;
+    uchar a1;
+    ulong indices;
+    float error;
+};
+
+float perceptualError(float3 a, float3 b) {
+    float3 d = a - b;
+    return d.r * d.r * 0.2126 + d.g * d.g * 0.7152 + d.b * d.b * 0.0722;
+}
+
+ushort pack565(float3 color) {
+    color = clamp(color, 0.0, 1.0);
+    return ((ushort)(color.r * 31.0) << 11)
+        | ((ushort)(color.g * 63.0) << 5)
+        | (ushort)(color.b * 31.0);
+}
+
+float3 unpack565(ushort value) {
+    return float3(
+        float((value >> 11) & 31) / 31.0,
+        float((value >> 5) & 63) / 63.0,
+        float(value & 31) / 31.0
+    );
+}
+
+void buildColorPalette(ushort c0, ushort c1, thread float3 palette[4]) {
+    float3 p0 = unpack565(c0);
+    float3 p1 = unpack565(c1);
+    palette[0] = p0;
+    palette[1] = p1;
+    palette[2] = (2.0 * p0 + p1) / 3.0;
+    palette[3] = (p0 + 2.0 * p1) / 3.0;
+}
+
+ColorBlockResult evaluateColor(
+    thread float3 pixels[16],
+    float3 initial0,
+    float3 initial1
+) {
+    float3 endpoint0 = initial0;
+    float3 endpoint1 = initial1;
+
+    for (uint iteration = 0; iteration < 8; iteration++) {
+        ushort c0 = pack565(endpoint0);
+        ushort c1 = pack565(endpoint1);
+        if (c0 <= c1) {
+            if (c0 < c1) {
+                ushort swapped = c0;
+                c0 = c1;
+                c1 = swapped;
+            } else if (c0 < 65535) c0 += 1;
+            else if (c1 > 0) c1 -= 1;
+        }
+        float3 palette[4];
+        buildColorPalette(c0, c1, palette);
+        uint indices = 0;
+        float aa = 0.0; float ab = 0.0; float bb = 0.0;
+        float3 ad = float3(0.0); float3 bd = float3(0.0);
+        for (uint i = 0; i < 16; i++) {
+            uint index = 0;
+            float best = perceptualError(pixels[i], palette[0]);
+            for (uint candidate = 1; candidate < 4; candidate++) {
+                float error = perceptualError(pixels[i], palette[candidate]);
+                if (error < best) { best = error; index = candidate; }
+            }
+            indices |= index << (i * 2);
+            float a = 1.0 - float(index) / 3.0;
+            float b = float(index) / 3.0;
+            aa += a * a; ab += a * b; bb += b * b;
+            ad += pixels[i] * a; bd += pixels[i] * b;
+        }
+        float determinant = aa * bb - ab * ab;
+        if (abs(determinant) > 0.000001) {
+            endpoint0 = clamp((ad * bb - bd * ab) / determinant, 0.0, 1.0);
+            endpoint1 = clamp((bd * aa - ad * ab) / determinant, 0.0, 1.0);
+        }
+    }
+
+    ushort finalC0 = pack565(endpoint0);
+    ushort finalC1 = pack565(endpoint1);
+    if (finalC0 <= finalC1) {
+        if (finalC0 < finalC1) {
+            ushort swapped = finalC0;
+            finalC0 = finalC1;
+            finalC1 = swapped;
+        } else if (finalC0 < 65535) finalC0 += 1;
+        else if (finalC1 > 0) finalC1 -= 1;
+    }
+    float3 palette[4];
+    buildColorPalette(finalC0, finalC1, palette);
+    uint finalIndices = 0;
+    float error = 0.0;
+    for (uint i = 0; i < 16; i++) {
+        uint index = 0;
+        float best = perceptualError(pixels[i], palette[0]);
+        for (uint candidate = 1; candidate < 4; candidate++) {
+            float candidateError = perceptualError(pixels[i], palette[candidate]);
+            if (candidateError < best) {
+                best = candidateError;
+                index = candidate;
+            }
+        }
+        finalIndices |= index << (i * 2);
+        error += best;
+    }
+    return ColorBlockResult{finalC0, finalC1, finalIndices, error};
+}
+
+void buildAlphaPalette(uchar a0, uchar a1, thread float palette[8]) {
+    palette[0] = float(a0);
+    palette[1] = float(a1);
+    if (a0 > a1) {
+        for (uint i = 1; i <= 6; i++) {
+            palette[i + 1] = (float(7 - i) * float(a0) + float(i) * float(a1)) / 7.0;
+        }
+    } else {
+        for (uint i = 1; i <= 4; i++) {
+            palette[i + 1] = (float(5 - i) * float(a0) + float(i) * float(a1)) / 5.0;
+        }
+        palette[6] = 0.0;
+        palette[7] = 255.0;
+    }
+}
+
+AlphaBlockResult evaluateAlpha(thread float values[16], uchar a0, uchar a1) {
+    float palette[8];
+    buildAlphaPalette(a0, a1, palette);
+    ulong indices = 0;
+    float error = 0.0;
+    for (uint i = 0; i < 16; i++) {
+        uint index = 0;
+        float best = abs(values[i] - palette[0]);
+        for (uint candidate = 1; candidate < 8; candidate++) {
+            float distance = abs(values[i] - palette[candidate]);
+            if (distance < best) { best = distance; index = candidate; }
+        }
+        indices |= (ulong(index) << (i * 3));
+        error += best * best;
+    }
+    return AlphaBlockResult{a0, a1, indices, error};
+}
+
+bool isBetterAlpha(AlphaBlockResult candidate, AlphaBlockResult current) {
+    return candidate.error < current.error
+        || (candidate.error == current.error && candidate.a0 < current.a0)
+        || (candidate.error == current.error && candidate.a0 == current.a0 && candidate.a1 < current.a1);
+}
+
+AlphaBlockResult optimizeAlpha(thread float values[16]) {
+    uchar candidates[18];
+    uint candidateCount = 0;
+    for (uint i = 0; i < 16; i++) {
+        uchar value = (uchar)clamp(values[i], 0.0, 255.0);
+        bool exists = false;
+        for (uint j = 0; j < candidateCount; j++) if (candidates[j] == value) exists = true;
+        if (!exists && candidateCount < 18) candidates[candidateCount++] = value;
+    }
+    uint sourceCandidateCount = candidateCount;
+    if (sourceCandidateCount == 1) {
+        uchar value = candidates[0];
+        return evaluateAlpha(values, 0, value == 0 ? 255 : value);
+    }
+    if (sourceCandidateCount == 2) {
+        uchar low = min(candidates[0], candidates[1]);
+        uchar high = max(candidates[0], candidates[1]);
+        AlphaBlockResult best = evaluateAlpha(values, low, high);
+        if (high == 255 && low != 0) {
+            AlphaBlockResult alternate = evaluateAlpha(values, 0, low);
+            if (isBetterAlpha(alternate, best)) best = alternate;
+        }
+        return best;
+    }
+    for (uint extra = 0; extra < 2; extra++) {
+        uchar value = extra == 0 ? 0 : 255;
+        bool exists = false;
+        for (uint j = 0; j < candidateCount; j++) if (candidates[j] == value) exists = true;
+        if (!exists && candidateCount < 18) candidates[candidateCount++] = value;
+    }
+
+    AlphaBlockResult best = AlphaBlockResult{0, 1, 0, INFINITY};
+    for (uint i = 0; i < candidateCount; i++) {
+        for (uint j = 0; j < candidateCount; j++) {
+            if (candidates[i] == candidates[j]) continue;
+            AlphaBlockResult current = evaluateAlpha(values, candidates[i], candidates[j]);
+            if (isBetterAlpha(current, best)) {
+                best = current;
+            }
+        }
+    }
+    return best;
+}
+
+kernel void compressTexture(
+    texture2d<float, access::read> input [[texture(0)]],
+    device uchar *output [[buffer(0)]],
+    constant uint &formatMode [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 pos = gid * 4;
+    if (pos.x >= input.get_width() || pos.y >= input.get_height()) return;
+    thread float3 pixels[16];
+    thread float alpha[16];
+    for (uint i = 0; i < 16; i++) {
+        uint2 readPos = min(pos + uint2(i % 4, i / 4), uint2(input.get_width() - 1, input.get_height() - 1));
+        float4 value = input.read(readPos);
+        pixels[i] = value.rgb;
+        alpha[i] = value.a * 255.0;
+    }
+
     uint blocksPerRow = (input.get_width() + 3) / 4;
     uint offset = (gid.y * blocksPerRow + gid.x) * (formatMode == 0 ? 8 : 16);
     if (formatMode >= 1) {
-        output[offset] = (uchar)(maxA * 255.0); output[offset + 1] = (uchar)(minA * 255.0);
-        uint64_t aIndices = 0;
-        float a0 = maxA;
-        float a1 = minA;
-        float step = (a0 - a1) / 7.0;
-        for (int i = 0; i < 16; i++) {
-            uint2 readPos = min(pos + uint2(i % 4, i / 4), uint2(input.get_width() - 1, input.get_height() - 1));
-            float a = input.read(readPos).a;
-            uint index = 0;
-            if (a0 > a1) {
-                float minDist = abs(a - a0);
-                for (uint j = 1; j <= 6; j++) {
-                    float val = a0 - float(j) * step;
-                    float dist = abs(a - val);
-                    if (dist < minDist) { minDist = dist; index = j + 1; }
-                }
-                if (abs(a - a1) < minDist) { index = 1; }
-            }
-            aIndices |= ((uint64_t)index << (i * 3));
-        }
-        for (int i = 0; i < 6; i++) output[offset + 2 + i] = (uchar)((aIndices >> (i * 8)) & 0xFF);
+        AlphaBlockResult alphaBlock = optimizeAlpha(alpha);
+        output[offset] = alphaBlock.a0;
+        output[offset + 1] = alphaBlock.a1;
+        for (uint i = 0; i < 6; i++) output[offset + 2 + i] = (uchar)((alphaBlock.indices >> (i * 8)) & 0xFF);
         offset += 8;
     }
-    ushort c0 = ((ushort)(maxC.r * 31.0) << 11) | ((ushort)(maxC.g * 63.0) << 5) | (ushort)(maxC.b * 31.0);
-    ushort c1 = ((ushort)(minC.r * 31.0) << 11) | ((ushort)(minC.g * 63.0) << 5) | (ushort)(minC.b * 31.0);
-    output[offset] = c0 & 0xFF; output[offset + 1] = c0 >> 8; output[offset + 2] = c1 & 0xFF; output[offset + 3] = c1 >> 8;
-    uint32_t indices = 0;
-    float3 c2 = (2.0 * maxC + minC) / 3.0;
-    float3 c3 = (maxC + 2.0 * minC) / 3.0;
-    for (int i = 0; i < 16; i++) {
-        uint2 readPos = min(pos + uint2(i % 4, i / 4), uint2(input.get_width() - 1, input.get_height() - 1));
-        float3 pixel = input.read(readPos).rgb;
-        float3 diff0 = pixel - maxC; float d0 = dot(diff0, diff0);
-        float3 diff1 = pixel - minC; float d1 = dot(diff1, diff1);
-        float3 diff2 = pixel - c2;   float d2 = dot(diff2, diff2);
-        float3 diff3 = pixel - c3;   float d3 = dot(diff3, diff3);
-        uint index = 0;
-        float minDist = d0;
-        if (d1 < minDist) { minDist = d1; index = 1; }
-        if (d2 < minDist) { minDist = d2; index = 2; }
-        if (d3 < minDist) { minDist = d3; index = 3; }
-        indices |= (index << (i * 2));
+
+    float3 mean = float3(0.0);
+    for (uint i = 0; i < 16; i++) mean += pixels[i];
+    mean /= 16.0;
+    float3 axes[4] = {
+        float3(1.0, 0.0, 0.0),
+        float3(0.0, 1.0, 0.0),
+        float3(0.0, 0.0, 1.0),
+        normalize(float3(0.2126, 0.7152, 0.0722))
+    };
+    ColorBlockResult best = ColorBlockResult{0, 1, 0, INFINITY};
+    for (uint axisIndex = 0; axisIndex < 4; axisIndex++) {
+        float3 axis = axes[axisIndex];
+        float minProjection = INFINITY;
+        float maxProjection = -INFINITY;
+        float3 minPixel = pixels[0];
+        float3 maxPixel = pixels[0];
+        for (uint i = 0; i < 16; i++) {
+            float projection = dot(pixels[i], axis);
+            if (projection < minProjection) { minProjection = projection; minPixel = pixels[i]; }
+            if (projection > maxProjection) { maxProjection = projection; maxPixel = pixels[i]; }
+        }
+        ColorBlockResult current = evaluateColor(pixels, maxPixel, minPixel);
+        if (current.error < best.error
+            || (current.error == best.error && current.c0 < best.c0)
+            || (current.error == best.error && current.c0 == best.c0 && current.c1 < best.c1)) {
+            best = current;
+        }
     }
-    output[offset + 4] = indices & 0xFF; output[offset + 5] = (indices >> 8) & 0xFF; output[offset + 6] = (indices >> 16) & 0xFF; output[offset + 7] = (indices >> 24) & 0xFF;
+    output[offset] = best.c0 & 0xFF;
+    output[offset + 1] = best.c0 >> 8;
+    output[offset + 2] = best.c1 & 0xFF;
+    output[offset + 3] = best.c1 >> 8;
+    output[offset + 4] = best.indices & 0xFF;
+    output[offset + 5] = (best.indices >> 8) & 0xFF;
+    output[offset + 6] = (best.indices >> 16) & 0xFF;
+    output[offset + 7] = (best.indices >> 24) & 0xFF;
 }
 """
 
@@ -447,6 +656,467 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
     ctx?.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h)); return raw
 }
 
+func cgImageFromRGBA(_ input: [UInt8], width: Int, height: Int) -> CGImage? {
+    var raw = input
+    guard let context = CGContext(
+        data: &raw,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    return context.makeImage()
+}
+
+func cpuPreprocessedImage(
+    sourceImage: CGImage,
+    maskPath: String,
+    r: Double,
+    g: Double,
+    b: Double,
+    contrast: Double,
+    brightness: Double,
+    saturation: Double
+) -> CGImage? {
+    let width = sourceImage.width
+    let height = sourceImage.height
+    var output = getRawRGBA(cgImage: sourceImage)
+    var maskRaw: [UInt8]? = nil
+    var maskWidth = 0
+    var maskHeight = 0
+    var maskHasExplicitAlpha = false
+
+    if !maskPath.isEmpty && maskPath != "none" {
+        let maskURL = URL(fileURLWithPath: maskPath)
+        guard let maskSource = CGImageSourceCreateWithURL(maskURL as CFURL, nil),
+              let maskImage = CGImageSourceCreateImageAtIndex(maskSource, 0, nil),
+              let hasExplicitAlpha = imageHasExplicitAlpha(at: maskURL) else {
+            return nil
+        }
+        maskRaw = getRawRGBA(cgImage: maskImage)
+        maskWidth = maskImage.width
+        maskHeight = maskImage.height
+        maskHasExplicitAlpha = hasExplicitAlpha
+    }
+
+    func clampedUnit(_ value: Double) -> Double {
+        min(1.0, max(0.0, value))
+    }
+
+    for y in 0..<height {
+        for x in 0..<width {
+            let offset = (y * width + x) * 4
+            let alphaBeforeMask = Double(output[offset + 3]) / 255.0
+            var alpha = alphaBeforeMask
+            if let maskRaw, maskWidth > 0, maskHeight > 0 {
+                let maskX = min(maskWidth - 1, x * maskWidth / width)
+                let maskY = min(maskHeight - 1, y * maskHeight / height)
+                let maskOffset = (maskY * maskWidth + maskX) * 4
+                let maskValue: Double
+                if maskHasExplicitAlpha {
+                    maskValue = Double(maskRaw[maskOffset + 3]) / 255.0
+                } else {
+                    maskValue = (
+                        0.2126 * Double(maskRaw[maskOffset])
+                        + 0.7152 * Double(maskRaw[maskOffset + 1])
+                        + 0.0722 * Double(maskRaw[maskOffset + 2])
+                    ) / 255.0
+                }
+                alpha *= clampedUnit(maskValue)
+            }
+
+            // getRawRGBA returns premultiplied RGB. Unpremultiply before
+            // applying color controls, then restore premultiplication.
+            let unpremultiply = alphaBeforeMask > 0.000001
+                ? 1.0 / alphaBeforeMask
+                : 0.0
+            var red = Double(output[offset]) / 255.0 * unpremultiply
+            var green = Double(output[offset + 1]) / 255.0 * unpremultiply
+            var blue = Double(output[offset + 2]) / 255.0 * unpremultiply
+
+            red *= r
+            green *= g
+            blue *= b
+            if contrast != 1.0 {
+                red = (red - 0.5) * contrast + 0.5
+                green = (green - 0.5) * contrast + 0.5
+                blue = (blue - 0.5) * contrast + 0.5
+            }
+            if brightness != 0.0 {
+                red += brightness
+                green += brightness
+                blue += brightness
+            }
+            if saturation != 1.0 {
+                let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                red = luminance + (red - luminance) * saturation
+                green = luminance + (green - luminance) * saturation
+                blue = luminance + (blue - luminance) * saturation
+            }
+
+            let premultiply = clampedUnit(alpha)
+            output[offset] = UInt8(clampedUnit(red) * premultiply * 255.0)
+            output[offset + 1] = UInt8(clampedUnit(green) * premultiply * 255.0)
+            output[offset + 2] = UInt8(clampedUnit(blue) * premultiply * 255.0)
+            output[offset + 3] = UInt8(premultiply * 255.0)
+        }
+    }
+    return cgImageFromRGBA(output, width: width, height: height)
+}
+
+struct CPUColorBlockResult {
+    let c0: UInt16
+    let c1: UInt16
+    let indices: UInt32
+    let error: Double
+}
+
+struct CPUAlphaBlockResult {
+    let a0: UInt8
+    let a1: UInt8
+    let indices: UInt64
+    let error: Double
+}
+
+func clampUnit(_ value: Double) -> Double {
+    min(1.0, max(0.0, value))
+}
+
+func normalizeVector(_ value: SIMD3<Double>) -> SIMD3<Double> {
+    let length = sqrt(value.x * value.x + value.y * value.y + value.z * value.z)
+    return length > 0.0000001 ? value / length : SIMD3<Double>(1.0, 0.0, 0.0)
+}
+
+func pack565(_ color: SIMD3<Double>) -> UInt16 {
+    let r = UInt16(clampUnit(color.x) * 31.0)
+    let g = UInt16(clampUnit(color.y) * 63.0)
+    let b = UInt16(clampUnit(color.z) * 31.0)
+    return (r << 11) | (g << 5) | b
+}
+
+func canonical565(_ first: UInt16, _ second: UInt16) -> (UInt16, UInt16) {
+    if first > second { return (first, second) }
+    if first < second { return (second, first) }
+    if first < UInt16.max { return (first + 1, second) }
+    if second > 0 { return (first, second - 1) }
+    return (UInt16.max, 0)
+}
+
+func unpack565(_ value: UInt16) -> SIMD3<Double> {
+    SIMD3<Double>(
+        Double((value >> 11) & 31) / 31.0,
+        Double((value >> 5) & 63) / 63.0,
+        Double(value & 31) / 31.0
+    )
+}
+
+func colorPalette565(_ c0: UInt16, _ c1: UInt16) -> [SIMD3<Double>] {
+    let p0 = unpack565(c0)
+    let p1 = unpack565(c1)
+    return [
+        p0,
+        p1,
+        (p0 * 2.0 + p1) / 3.0,
+        (p0 + p1 * 2.0) / 3.0,
+    ]
+}
+
+func perceptualColorError(_ lhs: SIMD3<Double>, _ rhs: SIMD3<Double>) -> Double {
+    let delta = lhs - rhs
+    return delta.x * delta.x * 0.2126
+        + delta.y * delta.y * 0.7152
+        + delta.z * delta.z * 0.0722
+}
+
+func assignColorIndices(
+    _ pixels: [SIMD3<Double>],
+    _ palette: [SIMD3<Double>]
+) -> (UInt32, Double) {
+    var indices: UInt32 = 0
+    var error = 0.0
+    for (pixelIndex, pixel) in pixels.enumerated() {
+        var bestIndex: UInt32 = 0
+        var bestError = perceptualColorError(pixel, palette[0])
+        for candidate in 1..<palette.count {
+            let candidateError = perceptualColorError(pixel, palette[candidate])
+            if candidateError < bestError {
+                bestError = candidateError
+                bestIndex = UInt32(candidate)
+            }
+        }
+        indices |= bestIndex << UInt32(pixelIndex * 2)
+        error += bestError
+    }
+    return (indices, error)
+}
+
+func refitColorEndpoints(
+    _ pixels: [SIMD3<Double>],
+    _ indices: UInt32
+) -> (SIMD3<Double>, SIMD3<Double>)? {
+    var aa = 0.0
+    var ab = 0.0
+    var bb = 0.0
+    var ad = SIMD3<Double>(repeating: 0.0)
+    var bd = SIMD3<Double>(repeating: 0.0)
+    for (index, pixel) in pixels.enumerated() {
+        let paletteIndex = Int((indices >> UInt32(index * 2)) & 3)
+        let a = 1.0 - Double(paletteIndex) / 3.0
+        let b = Double(paletteIndex) / 3.0
+        aa += a * a
+        ab += a * b
+        bb += b * b
+        ad += pixel * a
+        bd += pixel * b
+    }
+    let determinant = aa * bb - ab * ab
+    guard abs(determinant) > 0.000001 else { return nil }
+    let endpoint0 = (ad * bb - bd * ab) / determinant
+    let endpoint1 = (bd * aa - ad * ab) / determinant
+    return (
+        SIMD3<Double>(
+            clampUnit(endpoint0.x),
+            clampUnit(endpoint0.y),
+            clampUnit(endpoint0.z)
+        ),
+        SIMD3<Double>(
+            clampUnit(endpoint1.x),
+            clampUnit(endpoint1.y),
+            clampUnit(endpoint1.z)
+        )
+    )
+}
+
+func encodeColorBlock(_ pixels: [SIMD3<Double>]) -> CPUColorBlockResult {
+    let axes = [
+        SIMD3<Double>(1.0, 0.0, 0.0),
+        SIMD3<Double>(0.0, 1.0, 0.0),
+        SIMD3<Double>(0.0, 0.0, 1.0),
+        normalizeVector(SIMD3<Double>(0.2126, 0.7152, 0.0722)),
+    ]
+    var best = CPUColorBlockResult(c0: 0, c1: 1, indices: 0, error: Double.infinity)
+    for axis in axes {
+        var lowProjection = Double.infinity
+        var highProjection = -Double.infinity
+        var lowPixel = pixels[0]
+        var highPixel = pixels[0]
+        for pixel in pixels {
+            let projection = pixel.x * axis.x + pixel.y * axis.y + pixel.z * axis.z
+            if projection < lowProjection { lowProjection = projection; lowPixel = pixel }
+            if projection > highProjection { highProjection = projection; highPixel = pixel }
+        }
+        var endpoint0 = highPixel
+        var endpoint1 = lowPixel
+        for _ in 0..<8 {
+            let packed = canonical565(pack565(endpoint0), pack565(endpoint1))
+            let assigned = assignColorIndices(pixels, colorPalette565(packed.0, packed.1))
+            if let refit = refitColorEndpoints(pixels, assigned.0) {
+                endpoint0 = refit.0
+                endpoint1 = refit.1
+            }
+        }
+        let packed = canonical565(pack565(endpoint0), pack565(endpoint1))
+        let assigned = assignColorIndices(pixels, colorPalette565(packed.0, packed.1))
+        let result = CPUColorBlockResult(
+            c0: packed.0,
+            c1: packed.1,
+            indices: assigned.0,
+            error: assigned.1
+        )
+        if result.error < best.error
+            || (result.error == best.error && result.c0 < best.c0)
+            || (result.error == best.error && result.c0 == best.c0 && result.c1 < best.c1) {
+            best = result
+        }
+    }
+    return best
+}
+
+func alphaPalette(_ a0: UInt8, _ a1: UInt8) -> [Double] {
+    let first = Double(a0)
+    let second = Double(a1)
+    if a0 > a1 {
+        return [
+            first, second,
+            (6.0 * first + second) / 7.0,
+            (5.0 * first + 2.0 * second) / 7.0,
+            (4.0 * first + 3.0 * second) / 7.0,
+            (3.0 * first + 4.0 * second) / 7.0,
+            (2.0 * first + 5.0 * second) / 7.0,
+            (first + 6.0 * second) / 7.0,
+        ]
+    }
+    return [
+        first, second,
+        (4.0 * first + second) / 5.0,
+        (3.0 * first + 2.0 * second) / 5.0,
+        (2.0 * first + 3.0 * second) / 5.0,
+        (first + 4.0 * second) / 5.0,
+        0.0, 255.0,
+    ]
+}
+
+func evaluateAlphaBlock(_ values: [Double], _ a0: UInt8, _ a1: UInt8) -> CPUAlphaBlockResult {
+    let palette = alphaPalette(a0, a1)
+    var indices: UInt64 = 0
+    var error = 0.0
+    for (pixelIndex, value) in values.enumerated() {
+        var bestIndex: UInt64 = 0
+        var bestError = abs(value - palette[0])
+        for candidate in 1..<palette.count {
+            let candidateError = abs(value - palette[candidate])
+            if candidateError < bestError {
+                bestError = candidateError
+                bestIndex = UInt64(candidate)
+            }
+        }
+        indices |= bestIndex << UInt64(pixelIndex * 3)
+        error += bestError * bestError
+    }
+    return CPUAlphaBlockResult(a0: a0, a1: a1, indices: indices, error: error)
+}
+
+func isBetterAlphaBlock(_ candidate: CPUAlphaBlockResult, than current: CPUAlphaBlockResult) -> Bool {
+    candidate.error < current.error
+        || (candidate.error == current.error && candidate.a0 < current.a0)
+        || (
+            candidate.error == current.error
+            && candidate.a0 == current.a0
+            && candidate.a1 < current.a1
+        )
+}
+
+func encodeAlphaBlock(_ values: [Double]) -> CPUAlphaBlockResult {
+    var sourceCandidates: [UInt8] = []
+    for value in values {
+        let clamped = UInt8(min(255.0, max(0.0, value)))
+        if !sourceCandidates.contains(clamped) {
+            sourceCandidates.append(clamped)
+        }
+    }
+
+    // Most terrain masks contain large constant or binary 4x4 regions.  Those
+    // cases can be represented exactly by their endpoint values and avoid an
+    // otherwise quadratic search over the 18-value candidate set.
+    if sourceCandidates.count == 1 {
+        let value = sourceCandidates[0]
+        return evaluateAlphaBlock(values, 0, value == 0 ? 255 : value)
+    }
+    if sourceCandidates.count == 2 {
+        let low = min(sourceCandidates[0], sourceCandidates[1])
+        let high = max(sourceCandidates[0], sourceCandidates[1])
+        var best = evaluateAlphaBlock(values, low, high)
+        if high == 255 && low != 0 {
+            let alternate = evaluateAlphaBlock(values, 0, low)
+            if isBetterAlphaBlock(alternate, than: best) {
+                best = alternate
+            }
+        }
+        return best
+    }
+
+    // Keep the same first-seen candidate order as the Metal implementation.
+    // The final tie-break is deterministic, but matching enumeration order
+    // also keeps floating-point ties consistent across GPU and CPU paths.
+    var candidates = sourceCandidates
+    for value in [UInt8(0), UInt8(255)] where !candidates.contains(value) {
+        candidates.append(value)
+    }
+    var best = CPUAlphaBlockResult(a0: 0, a1: 1, indices: 0, error: Double.infinity)
+    for first in candidates {
+        for second in candidates where first != second {
+            let result = evaluateAlphaBlock(values, first, second)
+            if isBetterAlphaBlock(result, than: best) {
+                best = result
+            }
+        }
+    }
+    return best
+}
+
+func encodeRawBCImage(_ raw: [UInt8], width: Int, height: Int, mode: UInt32) -> Data {
+    let blocksWide = (width + 3) / 4
+    let blocksHigh = (height + 3) / 4
+    var output = Data()
+    for blockY in 0..<blocksHigh {
+        for blockX in 0..<blocksWide {
+            var colors: [SIMD3<Double>] = []
+            var alphas: [Double] = []
+            for pixelIndex in 0..<16 {
+                let x = min(width - 1, blockX * 4 + pixelIndex % 4)
+                let y = min(height - 1, blockY * 4 + pixelIndex / 4)
+                let offset = (y * width + x) * 4
+                colors.append(SIMD3<Double>(
+                    Double(raw[offset]) / 255.0,
+                    Double(raw[offset + 1]) / 255.0,
+                    Double(raw[offset + 2]) / 255.0
+                ))
+                alphas.append(Double(raw[offset + 3]))
+            }
+            if mode >= 1 {
+                let alpha = encodeAlphaBlock(alphas)
+                var block = [UInt8](repeating: 0, count: 8)
+                block[0] = alpha.a0
+                block[1] = alpha.a1
+                for byteIndex in 0..<6 {
+                    block[byteIndex + 2] = UInt8((alpha.indices >> UInt64(byteIndex * 8)) & 0xff)
+                }
+                output.append(contentsOf: block)
+            }
+            let color = encodeColorBlock(colors)
+            var block = [UInt8](repeating: 0, count: 8)
+            block[0] = UInt8(color.c0 & 0xff)
+            block[1] = UInt8(color.c0 >> 8)
+            block[2] = UInt8(color.c1 & 0xff)
+            block[3] = UInt8(color.c1 >> 8)
+            block[4] = UInt8(color.indices & 0xff)
+            block[5] = UInt8((color.indices >> 8) & 0xff)
+            block[6] = UInt8((color.indices >> 16) & 0xff)
+            block[7] = UInt8((color.indices >> 24) & 0xff)
+            output.append(contentsOf: block)
+        }
+    }
+    return output
+}
+
+func resizeCGImage(_ image: CGImage, width: Int, height: Int) -> CGImage? {
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()
+}
+
+func compressImageWithCPUMipmaps(_ image: CGImage, mode: UInt32) -> Data? {
+    var current = image
+    var output = Data()
+    while true {
+        output.append(encodeRawBCImage(
+            getRawRGBA(cgImage: current),
+            width: current.width,
+            height: current.height,
+            mode: mode
+        ))
+        if current.width == 1 && current.height == 1 { break }
+        let nextWidth = max(1, current.width / 2)
+        let nextHeight = max(1, current.height / 2)
+        guard let next = resizeCGImage(current, width: nextWidth, height: nextHeight) else {
+            return nil
+        }
+        current = next
+    }
+    return output
+}
+
 func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Bool) -> Data? {
     guard let comp = MetalCompressor.shared else { return nil }
     let dev = comp.dev
@@ -541,92 +1211,34 @@ func compressWithPreprocessedCIImage(finalCI: CIImage, mode: UInt32, useGPU: Boo
     return outData
 }
 
-func appendCPUCompressedDDS(finalCI: CIImage, bounds: CGRect, mode: UInt32, out: inout Data) -> Bool {
-    let ctx = CIContext(options: [.useSoftwareRenderer: false])
-    guard let cgImage = ctx.createCGImage(finalCI, from: bounds) else { return false }
-    let raw = getRawRGBA(cgImage: cgImage)
-    let w = Int(bounds.width)
-    let h = Int(bounds.height)
-    let bW = (w + 3) / 4
-    let bH = (h + 3) / 4
-    var dds = Data()
-    for by in 0..<bH {
-        for bx in 0..<bW {
-            if mode >= 1 {
-                var minA: UInt8 = 255
-                var maxA: UInt8 = 0
-                for i in 0..<16 {
-                    let a = raw[(min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4 + 3]
-                    minA = min(minA, a)
-                    maxA = max(maxA, a)
-                }
-                var ab = [UInt8](repeating: 0, count: 8)
-                ab[0] = maxA
-                ab[1] = minA
-                var ai: UInt64 = 0
-                let a0 = Double(maxA)
-                let a1 = Double(minA)
-                let step = (a0 - a1) / 7.0
-                for i in 0..<16 {
-                    let a = Double(raw[(min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4 + 3])
-                    var index: UInt64 = 0
-                    if a0 > a1 {
-                        var minDist = abs(a - a0)
-                        for j in 1...6 {
-                            let val = a0 - Double(j) * step
-                            let dist = abs(a - val)
-                            if dist < minDist { minDist = dist; index = UInt64(j + 1) }
-                        }
-                        if abs(a - a1) < minDist { index = 1 }
-                    }
-                    ai |= (index << (i * 3))
-                }
-                for i in 0..<6 { ab[i + 2] = UInt8((ai >> (i * 8)) & 0xFF) }
-                dds.append(contentsOf: ab)
-            }
-
-            var minC = (r: 255, g: 255, b: 255)
-            var maxC = (r: 0, g: 0, b: 0)
-            for i in 0..<16 {
-                let o = (min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4
-                let r = Int(raw[o]), g = Int(raw[o + 1]), b = Int(raw[o + 2])
-                if (r + g + b) < (minC.r + minC.g + minC.b) { minC = (r, g, b) }
-                if (r + g + b) > (maxC.r + maxC.g + maxC.b) { maxC = (r, g, b) }
-            }
-            let c0 = UInt16(((UInt32(maxC.r) >> 3) << 11) | ((UInt32(maxC.g) >> 2) << 5) | (UInt32(maxC.b) >> 3))
-            let c1 = UInt16(((UInt32(minC.r) >> 3) << 11) | ((UInt32(minC.g) >> 2) << 5) | (UInt32(minC.b) >> 3))
-            let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
-            let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
-            let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
-            let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
-            var blk = [UInt8](repeating: 0, count: 8)
-            blk[0] = UInt8(c0 & 0xFF)
-            blk[1] = UInt8(c0 >> 8)
-            blk[2] = UInt8(c1 & 0xFF)
-            blk[3] = UInt8(c1 >> 8)
-            var idx: UInt32 = 0
-            for i in 0..<16 {
-                let o = (min(by * 4 + i / 4, h - 1) * w + min(bx * 4 + i % 4, w - 1)) * 4
-                let r = Double(raw[o]), g = Double(raw[o + 1]), b = Double(raw[o + 2])
-                let d0 = (r - r0) * (r - r0) + (g - g0) * (g - g0) + (b - b0) * (b - b0)
-                let d1 = (r - r1) * (r - r1) + (g - g1) * (g - g1) + (b - b1) * (b - b1)
-                let d2 = (r - r2) * (r - r2) + (g - g2) * (g - g2) + (b - b2) * (b - b2)
-                let d3 = (r - r3) * (r - r3) + (g - g3) * (g - g3) + (b - b3) * (b - b3)
-                var index: UInt32 = 0
-                var minDist = d0
-                if d1 < minDist { minDist = d1; index = 1 }
-                if d2 < minDist { minDist = d2; index = 2 }
-                if d3 < minDist { minDist = d3; index = 3 }
-                idx |= (index << (i * 2))
-            }
-            blk[4] = UInt8(idx & 0xFF)
-            blk[5] = UInt8((idx >> 8) & 0xFF)
-            blk[6] = UInt8((idx >> 16) & 0xFF)
-            blk[7] = UInt8((idx >> 24) & 0xFF)
-            dds.append(contentsOf: blk)
+func appendCPUCompressedDDS(
+    finalCI: CIImage,
+    bounds: CGRect,
+    mode: UInt32,
+    out: inout Data,
+    sourceImage: CGImage? = nil
+) -> Bool {
+    // Batch conversion can be deliberately forced onto the CPU when Metal is
+    // unavailable or when the GPU path fails.  A GPU-only CIContext would
+    // make that fallback fail before the CPU BC encoder is reached.
+    let ctx = CIContext(options: nil)
+    let cgImage: CGImage?
+    if let sourceImage {
+        cgImage = sourceImage
+    } else {
+        cgImage = ctx.createCGImage(finalCI, from: bounds)
+        if cgImage == nil {
+            reportError(
+                "ASHelper: CPU Core Image rendering failed for extent "
+                + "\(bounds.origin.x),\(bounds.origin.y) \(bounds.width)x\(bounds.height)."
+            )
         }
     }
-    out.append(dds)
+    guard let cgImage else { return false }
+    guard let compressed = compressImageWithCPUMipmaps(cgImage, mode: mode) else {
+        return false
+    }
+    out.append(compressed)
     return true
 }
 
@@ -711,10 +1323,14 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
         fail("ASHelper does not support BC7 output. Use nvcompress instead.")
     }
     let jpegURL = URL(fileURLWithPath: jpegPath)
-    guard let srcCI = CIImage(contentsOf: jpegURL) else {
+    guard let source = CGImageSourceCreateWithURL(jpegURL as CFURL, nil),
+          let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         reportError("ASHelper: Failed to load source image '\(jpegPath)'.")
         return false
     }
+    // Construct CIImage from the decoded CGImage.  This keeps the CPU batch
+    // fallback independent of Image I/O provider-backed CIImage rendering.
+    let srcCI = CIImage(cgImage: sourceImage)
     var finalCI = srcCI
     
     // 1. Blend mask if present (via in-memory Mask Cache)
@@ -728,8 +1344,10 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
         } else {
             maskCacheLock.unlock()
             if FileManager.default.fileExists(atPath: maskPath),
-               let loaded = CIImage(contentsOf: maskURL),
+               let maskSource = CGImageSourceCreateWithURL(maskURL as CFURL, nil),
+               let maskCGImage = CGImageSourceCreateImageAtIndex(maskSource, 0, nil),
                let hasExplicitAlpha = imageHasExplicitAlpha(at: maskURL) {
+                let loaded = CIImage(cgImage: maskCGImage)
                 let entry = CachedMask(image: loaded, hasExplicitAlpha: hasExplicitAlpha)
                 maskCacheLock.lock()
                 maskCache[maskPath] = entry
@@ -836,7 +1454,7 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
     
     let mipCount = UInt32(floor(log2(Double(max(w, h)))) + 1)
     let sz = UInt32(((w + 3) / 4) * ((h + 3) / 4) * (formatCode == 0 ? 8 : 16))
-    var hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
+    let hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
     var out = hdr.toData()
     if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
     var compressed = false
@@ -845,10 +1463,29 @@ func convertWithPreprocess(jpegPath: String, maskPath: String, r: Double, g: Dou
         compressed = true
     }
     if !compressed {
-        hdr.mipmapCount = 1
-        out = hdr.toData()
-        if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-        if !appendCPUCompressedDDS(finalCI: finalCI, bounds: bounds, mode: formatCode, out: &out) {
+        let canUseDecodedSourceDirectly =
+            (maskPath == "none" || maskPath.isEmpty)
+            && r == 1.0 && g == 1.0 && b == 1.0
+            && contrast == 1.0 && brightness == 0.0 && saturation == 1.0
+        let cpuImage = canUseDecodedSourceDirectly
+            ? sourceImage
+            : cpuPreprocessedImage(
+                sourceImage: sourceImage,
+                maskPath: maskPath,
+                r: r,
+                g: g,
+                b: b,
+                contrast: contrast,
+                brightness: brightness,
+                saturation: saturation
+            )
+        if !appendCPUCompressedDDS(
+            finalCI: finalCI,
+            bounds: bounds,
+            mode: formatCode,
+            out: &out,
+            sourceImage: cpuImage
+        ) {
             reportError("ASHelper: Failed to compress image '\(jpegPath)'.")
             return false
         }
@@ -1891,88 +2528,43 @@ func fp8TensorOpsUpscale(inputPath: String, outputPath: String, packPath: String
 }
 
 func convert(inputPath: String, outputPath: String, format: String, useGPU: Bool) -> Bool {
-    guard format != "BC7" else {
-        fail("ASHelper does not support BC7 output. Use nvcompress instead.")
+    guard format == "BC1" || format == "BC3" else {
+        fail("ASHelper supports BC1/BC3 output. Use nvcompress for BC7 output.")
     }
     let url = URL(fileURLWithPath: inputPath)
-    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-          let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         reportError("ASHelper: Failed to load source image '\(inputPath)'.")
         return false
     }
-    let w = img.width; let h = img.height; let isBC7 = (format == "BC7"); let isBC3 = (format == "BC3")
-    let formatCode: UInt32 = isBC7 ? 2 : (isBC3 ? 1 : 0)
-    let mipCount = UInt32(floor(log2(Double(max(w, h)))) + 1)
-    let sz = UInt32(((w + 3) / 4) * ((h + 3) / 4) * (formatCode == 0 ? 8 : 16))
-    var hdr = DDSHeader(height: UInt32(h), width: UInt32(w), pitchOrLinearSize: sz, mipmapCount: mipCount, fourCC: isBC7 ? 0x30315844 : (isBC3 ? 0x35545844 : 0x31545844))
-    var out = hdr.toData()
-    if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-
-    var compressed = false
-    if useGPU, let gData = compressWithMipmaps(cgImage: img, mode: formatCode) {
-        out.append(gData)
-        compressed = true
+    let width = image.width
+    let height = image.height
+    let mode: UInt32 = format == "BC3" ? 1 : 0
+    let mipCount = UInt32(floor(log2(Double(max(width, height)))) + 1)
+    let topLevelSize = UInt32(
+        ((width + 3) / 4) * ((height + 3) / 4) * (mode == 0 ? 8 : 16)
+    )
+    let header = DDSHeader(
+        height: UInt32(height),
+        width: UInt32(width),
+        pitchOrLinearSize: topLevelSize,
+        mipmapCount: mipCount,
+        fourCC: mode == 0 ? 0x31545844 : 0x35545844
+    )
+    var output = header.toData()
+    let payload: Data?
+    if useGPU {
+        payload = compressWithMipmaps(cgImage: image, mode: mode)
+            ?? compressImageWithCPUMipmaps(image, mode: mode)
+    } else {
+        payload = compressImageWithCPUMipmaps(image, mode: mode)
     }
-    if !compressed {
-        hdr.mipmapCount = 1
-        out = hdr.toData()
-        if isBC7 { out.append(DDSHeaderDX10(dxgiFormat: 98).toData()) }
-        let raw = getRawRGBA(cgImage: img)
-        var dds = Data()
-        let bW = (w+3)/4
-        let bH = (h+3)/4
-        for by in 0..<bH { for bx in 0..<bW {
-            if formatCode >= 1 {
-                var minA: UInt8 = 255; var maxA: UInt8 = 0
-                for i in 0..<16 { let a = raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3]; minA=min(minA,a); maxA=max(maxA,a) }
-                var ab=[UInt8](repeating:0,count:8); ab[0]=maxA; ab[1]=minA; var ai:UInt64=0
-                let a0 = Double(maxA); let a1 = Double(minA); let step = (a0 - a1) / 7.0
-                for i in 0..<16 {
-                    let a = Double(raw[(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4+3])
-                    var index: UInt64 = 0
-                    if a0 > a1 {
-                        var minDist = abs(a - a0)
-                        for j in 1...6 {
-                            let val = a0 - Double(j) * step
-                            let dist = abs(a - val)
-                            if dist < minDist { minDist = dist; index = UInt64(j + 1) }
-                        }
-                        if abs(a - a1) < minDist { index = 1 }
-                    }
-                    ai |= (index << (i * 3))
-                }
-                for i in 0..<6 { ab[i+2] = UInt8((ai >> (i * 8)) & 0xFF) }; dds.append(contentsOf: ab)
-            }
-            var minC=(r:255,g:255,b:255); var maxC=(r:0,g:0,b:0)
-            for i in 0..<16 { let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4; let r=Int(raw[o]),g=Int(raw[o+1]),b=Int(raw[o+2]); if (r+g+b)<(minC.r+minC.g+minC.b){minC=(r,g,b)}; if (r+g+b)>(maxC.r+maxC.g+maxC.b){maxC=(r,g,b)} }
-            let c0=UInt16(((UInt32(maxC.r)>>3)<<11)|((UInt32(maxC.g)>>2)<<5)|(UInt32(maxC.b)>>3))
-            let c1=UInt16(((UInt32(minC.r)>>3)<<11)|((UInt32(minC.g)>>2)<<5)|(UInt32(minC.b)>>3))
-
-            let r0 = Double(maxC.r), g0 = Double(maxC.g), b0 = Double(maxC.b)
-            let r1 = Double(minC.r), g1 = Double(minC.g), b1 = Double(minC.b)
-            let r2 = (2.0 * r0 + r1) / 3.0, g2 = (2.0 * g0 + g1) / 3.0, b2 = (2.0 * b0 + b1) / 3.0
-            let r3 = (r0 + 2.0 * r1) / 3.0, g3 = (g0 + 2.0 * g1) / 3.0, b3 = (b0 + 2.0 * b1) / 3.0
-
-            var blk=[UInt8](repeating:0,count:8); blk[0]=UInt8(c0&0xFF); blk[1]=UInt8(c0>>8); blk[2]=UInt8(c1&0xFF); blk[3]=UInt8(c1>>8); var idx:UInt32=0
-            for i in 0..<16 {
-                let o=(min(by*4+i/4,h-1)*w+min(bx*4+i%4,w-1))*4
-                let r=Double(raw[o]), g=Double(raw[o+1]), b=Double(raw[o+2])
-                let d0 = (r-r0)*(r-r0) + (g-g0)*(g-g0) + (b-b0)*(b-b0)
-                let d1 = (r-r1)*(r-r1) + (g-g1)*(g-g1) + (b-b1)*(b-b1)
-                let d2 = (r-r2)*(r-r2) + (g-g2)*(g-g2) + (b-b2)*(b-b2)
-                let d3 = (r-r3)*(r-r3) + (g-g3)*(g-g3) + (b-b3)*(b-b3)
-                var index: UInt32 = 0
-                var minDist = d0
-                if d1 < minDist { minDist = d1; index = 1 }
-                if d2 < minDist { minDist = d2; index = 2 }
-                if d3 < minDist { minDist = d3; index = 3 }
-                idx |= (index << (i * 2))
-            }
-            blk[4]=UInt8(idx&0xFF); blk[5]=UInt8((idx>>8)&0xFF); blk[6]=UInt8((idx>>16)&0xFF); blk[7]=UInt8((idx>>24)&0xFF); dds.append(contentsOf: blk)
-        }}
-        out.append(dds)
+    guard let payload else {
+        reportError("ASHelper: Failed to compress image '\(inputPath)'.")
+        return false
     }
-    return writeDDS(out, to: outputPath)
+    output.append(payload)
+    return writeDDS(output, to: outputPath)
 }
 
 let args = ProcessInfo.processInfo.arguments

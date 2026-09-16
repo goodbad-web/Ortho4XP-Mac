@@ -77,10 +77,74 @@ request_headers_generic = {
 use_magick = False
 use_texture_converter = False
 as_helper_cmd = None
+upscale_scope = "all"
+
+UPSCALE_SCOPES = ("none", "all", "airport")
+
+
+def normalize_upscale_scope(value):
+    """Normalize the scope of optional 2x upscaling.
+
+    The default is ``all`` to preserve the historical behavior when older
+    tile configuration files do not contain the new key.
+    """
+    aliases = {
+        "airport_only": "airport",
+        "airports": "airport",
+        "all_textures": "all",
+    }
+    normalized = aliases.get(str(value).strip().lower(), str(value).strip().lower())
+    return normalized if normalized in UPSCALE_SCOPES else "all"
+
+
+def resolve_dds_format(dds_format, has_alpha):
+    """Resolve a configured DDS format to the concrete BC format.
+
+    AUTO is deliberately resolved after all image preparation, so an RGBA
+    source whose alpha channel is fully opaque can still use BC1.  Explicit
+    BC1 remains safe for masked inputs by promoting them to BC3, preserving
+    the existing compatibility behavior.
+    """
+    normalized = str(dds_format).strip().upper()
+    if normalized == "AUTO":
+        return "BC3" if has_alpha else "BC1"
+    if normalized == "BC1" and has_alpha:
+        return "BC3"
+    return normalized
+
+
+def should_upscale_texture(tile, til_x_left, til_y_top, zoomlevel, provider_code):
+    """Return whether this concrete texture is eligible for 2x upscaling."""
+    backend = normalize_upscale_backend(
+        getattr(tile, "upscale_backend", globals().get("upscale_backend", "none"))
+    )
+    if backend == "none":
+        return False
+    scope = normalize_upscale_scope(
+        getattr(tile, "upscale_scope", globals().get("upscale_scope", "all"))
+    )
+    if scope == "none":
+        return False
+    if scope == "all":
+        return True
+    airport_keys = getattr(tile, "airport_highres_texture_keys", ())
+    key = (int(til_x_left), int(til_y_top), int(zoomlevel), str(provider_code))
+    return key in airport_keys
+
+
+def expected_texture_dimensions(tile, til_x_left, til_y_top, zoomlevel, provider_code):
+    """Return the expected final DDS dimensions for a texture key."""
+    source_size = 4096
+    if should_upscale_texture(tile, til_x_left, til_y_top, zoomlevel, provider_code):
+        source_size *= 2
+    return source_size, source_size
 
 
 def dds_format_support_error(dds_converter, dds_format):
-    if dds_format == "BC7" and dds_converter != "nvcompress":
+    normalized = str(dds_format).strip().upper()
+    if normalized not in ("AUTO", "BC1", "BC3", "BC7"):
+        return f"Unsupported DDS format: {dds_format}"
+    if normalized == "BC7" and dds_converter != "nvcompress":
         return (
             "BC7 DDS output is only supported with nvcompress; "
             f"{dds_converter} cannot be used."
@@ -130,8 +194,10 @@ def validate_dds_file(
         max_mipmaps = max(width, height).bit_length()
         if mipmaps > max_mipmaps:
             return False, f"DDS mip count {mipmaps} exceeds {max_mipmaps}"
-        if require_mipmaps and mipmaps <= 1:
-            return False, "DDS output has no generated mipmaps"
+        if require_mipmaps and mipmaps != max_mipmaps:
+            return False, (
+                f"DDS output mip count is {mipmaps}, expected full chain {max_mipmaps}"
+            )
         if struct.unpack_from("<I", header, 76)[0] != 32:
             return False, "DDS pixel-format header size is invalid"
 
@@ -190,6 +256,23 @@ def validate_dds_file(
     except (OSError, struct.error, ValueError) as error:
         return False, f"could not validate DDS: {error}"
     return True, None
+
+
+def read_dds_dimensions(path):
+    """Return validated DDS dimensions for terrain metadata synchronization."""
+    valid, error = validate_dds_file(path, require_mipmaps=True)
+    if not valid:
+        raise ValueError(error)
+    with open(path, "rb") as stream:
+        header = stream.read(20)
+    if len(header) < 20 or header[:4] != b"DDS ":
+        raise ValueError("DDS magic/header is missing")
+    height, width = struct.unpack_from("<II", header, 12)
+    if width != height:
+        raise ValueError(
+            f"DDS dimensions must be square for LOAD_CENTER: {(width, height)}"
+        )
+    return int(width), int(height)
 
 if "dar" in sys.platform:
     # 1. Try native 'magick' (Apple Silicon optimization)
@@ -2574,7 +2657,7 @@ def _prepare_combined_layer(
 ################################################################################
 # Support for multiprocessing initialization
 def init_worker(config_data):
-    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd, upscale_backend, fp8_model_path
+    global use_magick, use_texture_converter, dds_convert_cmd, gdal_transl_cmd, gdalwarp_cmd, as_helper_cmd, upscale_backend, upscale_scope, fp8_model_path
     global providers_dict, local_combined_providers_dict, color_filters_dict, extents_dict
     global is_worker_process
     
@@ -2593,9 +2676,11 @@ def init_worker(config_data):
     UI.verbosity = config_data['verbosity']
     UI.cleaning_level = config_data['cleaning_level']
     upscale_backend = normalize_upscale_backend(config_data.get('upscale_backend', 'none'))
+    upscale_scope = normalize_upscale_scope(config_data.get('upscale_scope', 'all'))
     fp8_model_path = config_data.get('fp8_model_path', globals().get('fp8_model_path', ''))
     UI.dds_converter = config_data.get('dds_converter', getattr(UI, 'dds_converter', 'nvcompress'))
     UI.dds_format = config_data.get('dds_format', getattr(UI, 'dds_format', 'BC3'))
+    UI.upscale_scope = upscale_scope
     UI.use_gpu_acceleration = config_data.get('use_gpu_acceleration', getattr(UI, 'use_gpu_acceleration', True))
     UI.use_gpu_for_color_filters = config_data.get(
         'use_gpu_for_color_filters', getattr(UI, 'use_gpu_for_color_filters', False)
@@ -2939,7 +3024,9 @@ def convert_texture(
         or not jpeg_ready
     )
     upscale_backend = current_upscale_backend()
-    use_upscale = upscale_backend != "none"
+    use_upscale = should_upscale_texture(
+        tile, til_x_left, til_y_top, zoomlevel, provider_code
+    )
     is_worker = globals().get('is_worker_process', False)
     direct_color_filter_supported = True
     if not is_combined and provider_code in providers_dict:
@@ -2959,6 +3046,7 @@ def convert_texture(
         getattr(UI, "defer_fp8_batch", False)
         and is_worker
         and upscale_backend == "tensorops"
+        and use_upscale
         and not is_combined
         and type == "dds"
         and direct_color_filter_supported
@@ -3108,31 +3196,38 @@ def convert_texture(
             cleanup_conversion_temp_files()
             return 0
 
+        source_has_non_opaque_alpha = _image_has_non_opaque_alpha(file_to_convert)
+        target_fmt = resolve_dds_format(
+            dds_format,
+            source_has_non_opaque_alpha
+            if str(dds_format).strip().upper() == "AUTO"
+            else (dxt5 or source_has_non_opaque_alpha),
+        )
+
         if dds_converter == "TextureConverter" and "dar" in sys.platform:
             # Native Apple Silicon conversion via ASHelper
             executable = os.path.join(UI.Ortho4XP_dir, "Utils", "mac", "ASHelper")
-            target_fmt = dds_format if (not dxt5 or dds_format == "BC7") else "BC3"
             conv_cmd = [executable, "--convert", file_to_convert, dds_tmp_file_path, target_fmt]
             if getattr(UI, 'use_gpu_acceleration', True):
                 conv_cmd.append("--gpu")
             UI.vprint(2, f"      ASHelper: Converting texture to DDS ({target_fmt})")
         elif dds_converter == "magick":
             # ImageMagick fallback
-            fmt = dds_format.lower() if dds_format != "BC7" else "dxt5" 
+            fmt = target_fmt.lower() if target_fmt != "BC7" else "dxt5"
             conv_cmd = [
                 "magick",
                 file_to_convert,
                 "-define", f"dds:compression={fmt}",
                 "-define", "dds:cluster-fit=true",
-                "-define", "dds:mipmaps=13",
+                "-define", f"dds:mipmaps={max(expected_dds_dimensions).bit_length()}",
                 dds_tmp_file_path
             ]
             UI.vprint(2, f"      ImageMagick: Converting texture to DDS ({fmt.upper()})")
         else: # Default: nvcompress (uses globally defined dds_convert_cmd)
             dds_tool = dds_convert_cmd
-            if dds_format == "BC7":
+            if target_fmt == "BC7":
                 fmt = "-bc7"
-            elif dds_format == "BC3":
+            elif target_fmt == "BC3":
                 fmt = "-bc3"
             else:
                 fmt = "-bc1"
@@ -3154,7 +3249,9 @@ def convert_texture(
             if retcode == 0:
                 dds_valid, dds_error = validate_dds_file(
                     dds_tmp_file_path,
+                    expected_format=target_fmt,
                     expected_dimensions=expected_dds_dimensions,
+                    require_mipmaps=True,
                 )
                 if dds_valid:
                     try:

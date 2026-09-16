@@ -551,6 +551,72 @@ def _activate_dsf(dsf_tmp_path, dsf_path):
         raise
 
 
+def _sync_terrain_load_centers(tile):
+    """Synchronize generated terrain metadata with the final DDS headers."""
+    terrain_dir = os.path.join(tile.build_dir, "terrain")
+    if not os.path.isdir(terrain_dir):
+        raise FileNotFoundError(terrain_dir)
+
+    staged = []
+    try:
+        for dir_path, _, names in os.walk(terrain_dir):
+            for name in names:
+                if not _is_generated_terrain_name(name):
+                    continue
+                terrain_path = os.path.join(dir_path, name)
+                with open(terrain_path, "r", encoding="utf-8") as stream:
+                    lines = stream.readlines()
+
+                base_texture = None
+                load_center_index = None
+                for index, line in enumerate(lines):
+                    stripped = line.strip()
+                    if stripped.startswith("BASE_TEX_NOWRAP "):
+                        base_texture = stripped.split(None, 1)[1]
+                    elif stripped.startswith("LOAD_CENTER "):
+                        load_center_index = index
+
+                if not base_texture:
+                    raise ValueError(
+                        f"Generated terrain has no BASE_TEX_NOWRAP: {terrain_path}"
+                    )
+                if load_center_index is None:
+                    raise ValueError(
+                        f"Generated terrain has no LOAD_CENTER: {terrain_path}"
+                    )
+
+                dds_path = os.path.normpath(
+                    os.path.join(os.path.dirname(terrain_path), base_texture)
+                )
+                width, height = IMG.read_dds_dimensions(dds_path)
+                tokens = lines[load_center_index].split()
+                if len(tokens) != 5:
+                    raise ValueError(
+                        f"Invalid LOAD_CENTER in generated terrain: {terrain_path}"
+                    )
+                tokens[-1] = str(width)
+                lines[load_center_index] = " ".join(tokens) + "\n"
+
+                temporary_path = terrain_path + ".tmp"
+                with open(temporary_path, "w", encoding="utf-8") as stream:
+                    stream.writelines(lines)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                staged.append((temporary_path, terrain_path))
+
+        for temporary_path, terrain_path in staged:
+            os.replace(temporary_path, terrain_path)
+    except Exception:
+        for temporary_path, _ in staged:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+        raise
+
+    return len(staged)
+
+
 def _resolve_gpu_batch_mask(tile, til_x_left, til_y_top, zoomlevel, provider_code, png_file_name):
     """Return an exact or materialized mask path for an ASHelper batch task."""
     possible_mask_path = os.path.join(
@@ -779,6 +845,9 @@ def _build_tile(tile, persist_config=True):
             requested_upscale_backend = IMG.normalize_upscale_backend(
                 getattr(tile, 'upscale_backend', 'none')
             )
+            requested_upscale_scope = IMG.normalize_upscale_scope(
+                getattr(tile, 'upscale_scope', 'all')
+            )
             metal_available = (
                 _ashelper_metal_available(as_helper)
                 if gpu_converter_requested
@@ -815,6 +884,7 @@ def _build_tile(tile, persist_config=True):
                 'verbosity': UI.verbosity,
                 'cleaning_level': UI.cleaning_level,
                 'upscale_backend': requested_upscale_backend,
+                'upscale_scope': requested_upscale_scope,
                 'fp8_model_path': getattr(tile, 'fp8_model_path', getattr(IMG, 'fp8_model_path', '')),
                 'dds_converter': getattr(tile, 'dds_converter', dds_converter),
                 'dds_format': getattr(tile, 'dds_format', dds_format),
@@ -834,8 +904,12 @@ def _build_tile(tile, persist_config=True):
                 return IMG.can_defer_gpu_batch(provider_code)
 
             def can_defer_to_tensorops_batch(item):
-                item_tile, _, _, item_zoomlevel, provider_code = item
+                item_tile, item_x, item_y, item_zoomlevel, provider_code = item
                 if int(item_zoomlevel) >= 18:
+                    return False
+                if not IMG.should_upscale_texture(
+                    item_tile, item_x, item_y, item_zoomlevel, provider_code
+                ):
                     return False
                 if provider_code not in IMG.providers_dict:
                     return False
@@ -1035,6 +1109,12 @@ def _build_tile(tile, persist_config=True):
                     upscale_backend = IMG.normalize_upscale_backend(
                         getattr(tile, "upscale_backend", "none")
                     )
+                    upscale_enabled = IMG.should_upscale_texture(
+                        tile, til_x_left, til_y_top, zoomlevel, provider_code
+                    )
+                    effective_upscale_backend = (
+                        upscale_backend if upscale_enabled else "none"
+                    )
                     metalfx_upscaled_tmp = os.path.join(
                         UI.Ortho4XP_dir,
                         "tmp",
@@ -1056,9 +1136,9 @@ def _build_tile(tile, persist_config=True):
                     )
                     upscale_candidates = (
                         [ci_lanczos_upscaled_tmp]
-                        if upscale_backend == "ci_lanczos"
+                        if effective_upscale_backend == "ci_lanczos"
                         else [tensorops_upscaled_tmp, ci_lanczos_upscaled_tmp]
-                        if upscale_backend == "tensorops"
+                        if effective_upscale_backend == "tensorops"
                         else [metalfx_upscaled_tmp, ci_lanczos_upscaled_tmp]
                     )
                     tmp_png = os.path.join(UI.Ortho4XP_dir, "tmp", png_file_name)
@@ -1070,7 +1150,7 @@ def _build_tile(tile, persist_config=True):
                     else:
                         jpeg_path = None
                     
-                    if upscale_backend != "none" and any(
+                    if effective_upscale_backend != "none" and any(
                         os.path.exists(path) for path in upscale_candidates
                     ):
                         input_path = next(
@@ -1091,7 +1171,7 @@ def _build_tile(tile, persist_config=True):
                     prepared_input_paths[item_index] = input_path
                     
                     fp8_batch_input = (
-                        upscale_backend == "tensorops"
+                        effective_upscale_backend == "tensorops"
                         and input_path == tensorops_upscaled_tmp
                     )
                     mask_input = input_path == jpeg_path or fp8_batch_input
@@ -1162,16 +1242,19 @@ def _build_tile(tile, persist_config=True):
                                 s_val = color_filter[1]
                                 saturation = 1.0 + (s_val / 100.0)
                     
-                    has_alpha = (mask_path != "none")
-                    if not has_alpha and input_path != jpeg_path:
+                    has_alpha = False
+                    if mask_path != "none":
                         try:
-                            with Image.open(input_path) as im:
-                                if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
-                                    has_alpha = True
+                            with Image.open(mask_path) as mask_image:
+                                has_alpha = (
+                                    mask_image.convert("L").getextrema()[0] < 255
+                                )
                         except:
                             pass
+                    if not has_alpha and input_path != jpeg_path:
+                        has_alpha = IMG._image_has_non_opaque_alpha(input_path)
                     
-                    target_fmt = dds_format if (not has_alpha or dds_format == "BC7") else "BC3"
+                    target_fmt = IMG.resolve_dds_format(dds_format, has_alpha)
                     batch_tmp_path = out_file_path + ".gpu.tmp.dds"
                     try:
                         os.remove(batch_tmp_path)
@@ -1309,6 +1392,18 @@ def _build_tile(tile, persist_config=True):
         return 0
     if UI.red_flag:
         UI.exit_message_and_bottom_line()
+        return 0
+    try:
+        synced_terrain_count = _sync_terrain_load_centers(tile)
+        UI.vprint(
+            1,
+            " *Synchronized LOAD_CENTER metadata for",
+            synced_terrain_count,
+            "terrain files.",
+        )
+    except Exception as error:
+        UI.vprint(0, "ERROR: Could not synchronize terrain DDS metadata:", error)
+        UI.exit_message_and_bottom_line("ERROR: Terrain metadata synchronization failed.")
         return 0
     UI.vprint(1, " *Activating DSF file.")
     dsf_file_name = os.path.join(
