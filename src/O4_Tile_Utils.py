@@ -1231,6 +1231,7 @@ def _build_tile(tile, persist_config=True):
                     batch_tasks = len(metalfx_batch_outputs)
                     batch_success = 0
                     batch_fallback = 0
+                    batch_fallback_reasons = {}
                     # Keep argv bounded for large tiles while preserving one
                     # ASHelper runtime per chunk (device/queue/CIContext are
                     # reused for every image in that process).
@@ -1262,6 +1263,16 @@ def _build_tile(tile, persist_config=True):
                                         batch_fallback += int(
                                             "effective_backend=ci_lanczos" in line
                                         )
+                                        fields = dict(
+                                            field.split("=", 1)
+                                            for field in line.split()
+                                            if "=" in field
+                                        )
+                                        reason = fields.get("fallback_reason")
+                                        if reason:
+                                            batch_fallback_reasons[reason] = (
+                                                batch_fallback_reasons.get(reason, 0) + 1
+                                            )
                             if batch_result.returncode != 0:
                                 metalfx_batch_error = (
                                     f"ASHelper returned {batch_result.returncode}"
@@ -1285,7 +1296,16 @@ def _build_tile(tile, persist_config=True):
                         1,
                         "   MetalFX batch summary: "
                         f"batch_tasks={batch_tasks} batch_success={batch_success} "
-                        f"batch_fallback={batch_fallback} duration_ms={duration_ms:.2f}",
+                        f"batch_fallback={batch_fallback} duration_ms={duration_ms:.2f}"
+                        + (
+                            " fallback_reasons="
+                            + ",".join(
+                                f"{reason}:{count}"
+                                for reason, count in sorted(batch_fallback_reasons.items())
+                            )
+                            if batch_fallback_reasons
+                            else ""
+                        ),
                     )
 
                 if metalfx_batch_error is not None:

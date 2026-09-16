@@ -673,9 +673,40 @@ func getRawRGBA(cgImage: CGImage) -> [UInt8] {
     ctx?.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h)); return raw
 }
 
+func unpremultiplyRGBA(_ raw: inout [UInt8]) {
+    guard raw.count >= 4 else { return }
+    for offset in stride(from: 0, to: raw.count - 3, by: 4) {
+        let alpha = Int(raw[offset + 3])
+        guard alpha > 0, alpha < 255 else {
+            if alpha == 0 {
+                raw[offset] = 0
+                raw[offset + 1] = 0
+                raw[offset + 2] = 0
+            }
+            continue
+        }
+        raw[offset] = UInt8(min(255, (Int(raw[offset]) * 255 + alpha / 2) / alpha))
+        raw[offset + 1] = UInt8(min(255, (Int(raw[offset + 1]) * 255 + alpha / 2) / alpha))
+        raw[offset + 2] = UInt8(min(255, (Int(raw[offset + 2]) * 255 + alpha / 2) / alpha))
+    }
+}
+
+func premultiplyRGBA(_ raw: inout [UInt8]) {
+    guard raw.count >= 4 else { return }
+    for offset in stride(from: 0, to: raw.count - 3, by: 4) {
+        let alpha = Int(raw[offset + 3])
+        guard alpha < 255 else { continue }
+        raw[offset] = UInt8((Int(raw[offset]) * alpha + 127) / 255)
+        raw[offset + 1] = UInt8((Int(raw[offset + 1]) * alpha + 127) / 255)
+        raw[offset + 2] = UInt8((Int(raw[offset + 2]) * alpha + 127) / 255)
+    }
+}
+
 // MetalFX consumes an opaque RGB image in this path.  Keep a separate
 // unassociated-alpha conversion for RGBA inputs so transparent RGB values are
 // not darkened by Core Graphics premultiplication before they reach MetalFX.
+// CGContext does not accept CGImageAlphaInfo.last with a DeviceRGB color
+// space. Render into a valid premultiplied buffer, then restore straight RGB.
 func getRawRGBAUnassociated(cgImage: CGImage) -> [UInt8]? {
     let width = cgImage.width
     let height = cgImage.height
@@ -684,7 +715,6 @@ func getRawRGBAUnassociated(cgImage: CGImage) -> [UInt8]? {
         return nil
     }
     var raw = [UInt8](repeating: 0, count: byteCount)
-    let bitmapInfo = CGImageByteOrderInfo.order32Big.rawValue | CGImageAlphaInfo.last.rawValue
     guard let context = CGContext(
         data: &raw,
         width: width,
@@ -692,9 +722,10 @@ func getRawRGBAUnassociated(cgImage: CGImage) -> [UInt8]? {
         bitsPerComponent: 8,
         bytesPerRow: width * 4,
         space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: bitmapInfo
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
     ) else { return nil }
     context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    unpremultiplyRGBA(&raw)
     return raw
 }
 
@@ -716,18 +747,9 @@ func cgImageFromRGBAUnassociated(_ input: [UInt8], width: Int, height: Int) -> C
     guard width > 0, height > 0,
           let byteCount = try? checkedMultiply(width, height, 4, label: "rgba_bytes"),
           input.count == byteCount else { return nil }
-    var raw = input
-    let bitmapInfo = CGImageByteOrderInfo.order32Big.rawValue | CGImageAlphaInfo.last.rawValue
-    guard let context = CGContext(
-        data: &raw,
-        width: width,
-        height: height,
-        bitsPerComponent: 8,
-        bytesPerRow: width * 4,
-        space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: bitmapInfo
-    ) else { return nil }
-    return context.makeImage()
+    var premultiplied = input
+    premultiplyRGBA(&premultiplied)
+    return cgImageFromRGBA(premultiplied, width: width, height: height)
 }
 
 func writePNG(_ raw: [UInt8], width: Int, height: Int, outputPath: String) -> Bool {
@@ -1932,6 +1954,7 @@ func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
     var allSuccessful = true
     var successCount = 0
     var fallbackCount = 0
+    var fallbackReasons: [String: Int] = [:]
     let started = CFAbsoluteTimeGetCurrent()
     for (index, pair) in pairs.enumerated() {
         let itemStarted = CFAbsoluteTimeGetCurrent()
@@ -1947,6 +1970,9 @@ func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
         } else {
             allSuccessful = false
         }
+        if let reason = result.reason {
+            fallbackReasons[reason, default: 0] += 1
+        }
         let duration = (CFAbsoluteTimeGetCurrent() - itemStarted) * 1000.0
         print(
             "metalfx_batch_item=\(index + 1)/\(pairs.count) "
@@ -1957,10 +1983,14 @@ func metalFXSpatialUpscaleBatch(pairs: [(String, String)]) -> Bool {
         )
     }
     let duration = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
+    let reasonSummary = fallbackReasons.keys.sorted().map {
+        "\($0):\(fallbackReasons[$0] ?? 0)"
+    }.joined(separator: ",")
     print(
         "backend=metalfx_spatial effective_backend=metalfx_spatial dispatch=batch "
             + "batch_tasks=\(pairs.count) batch_success=\(successCount) "
             + "batch_fallback=\(fallbackCount) duration_ms=\(String(format: "%.2f", duration))"
+            + (reasonSummary.isEmpty ? "" : " fallback_reasons=\(reasonSummary)")
     )
     return allSuccessful
 }
