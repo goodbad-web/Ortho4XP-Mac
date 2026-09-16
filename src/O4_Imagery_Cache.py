@@ -106,6 +106,18 @@ def image_file_is_ready(path):
         return False
 
 
+def image_file_is_valid(path):
+    """Validate an existing image without deleting or restoring it."""
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+
 def find_cache_path(file_dir, til_x_left, til_y_top, zoomlevel, provider_code):
     """Return the first valid WebP/JPEG candidate, in that order."""
     for path in cache_paths(
@@ -143,6 +155,8 @@ def _atomic_save(image, file_path, image_format, quality=None):
         save_kwargs = {"format": image_format}
         if image_format == "WEBP":
             save_kwargs.update(quality=int(quality), method=6)
+        elif image_format == "JPEG" and quality is not None:
+            save_kwargs["quality"] = int(quality)
         save_image.save(temporary_path, **save_kwargs)
         if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) == 0:
             raise OSError("image save produced an empty file")
@@ -163,7 +177,7 @@ def save_cache_image(image, file_path, cache_format, quality=None):
         image,
         file_path,
         "WEBP" if normalized == "webp" else "JPEG",
-        parsed_quality,
+        parsed_quality if normalized == "webp" else quality,
     )
 
 
@@ -237,10 +251,7 @@ def _matches_filters(path, root, tiles, providers, zoomlevels):
             return False
     if zoomlevels:
         zoom_tokens = {str(int(z)) for z in zoomlevels}
-        if not re.search(
-            r"(?:" + "|".join(zoom_tokens) + r")$",
-            stem,
-        ) and not any(
+        if not any(
             part.rsplit("_", 1)[-1] in zoom_tokens
             for part in Path(relative).parts[:-1]
         ):
@@ -320,6 +331,10 @@ def _gate_result(jpeg_path, webp_path, metrics):
     }
 
 
+def _cancel_requested(cancel_event):
+    return cancel_event is not None and cancel_event.is_set()
+
+
 def _base_result(jpeg_path):
     webp_path = jpeg_path.with_suffix(".webp")
     return {
@@ -338,10 +353,13 @@ def _base_result(jpeg_path):
     }
 
 
-def _convert_one(jpeg_path, quality, force, dry_run):
+def _convert_one(jpeg_path, quality, force, dry_run, cancel_event=None):
     result = _base_result(jpeg_path)
     webp_path = jpeg_path.with_suffix(".webp")
-    if not force and image_file_is_ready(str(webp_path)):
+    if _cancel_requested(cancel_event):
+        result.update(status="cancelled", reason="cancel_requested")
+        return result
+    if not force and image_file_is_valid(str(webp_path)):
         result.update(status="skipped_existing", reason="valid_webp_exists")
         return result
     temporary_path = None
@@ -353,18 +371,29 @@ def _convert_one(jpeg_path, quality, force, dry_run):
                 prefix="." + webp_path.name + ".", suffix=".tmp", dir=webp_path.parent
             )
             os.close(fd)
+            if _cancel_requested(cancel_event):
+                result.update(status="cancelled", reason="cancel_requested")
+                return result
             source_image.save(
                 temporary_path, format="WEBP", quality=int(quality), method=6
             )
+        if _cancel_requested(cancel_event):
+            result.update(status="cancelled", reason="cancel_requested")
+            return result
         if not image_file_is_ready(temporary_path):
             raise OSError("generated WebP could not be decoded")
         gate = _gate_result(jpeg_path, Path(temporary_path), _comparison_metrics(jpeg_path, temporary_path))
         result.update({key: value for key, value in gate.items() if key != "accepted"})
-        if not gate["accepted"]:
+        if _cancel_requested(cancel_event):
+            result.update(status="cancelled", reason="cancel_requested")
+        elif not gate["accepted"]:
             result.update(status="rejected", reason=gate["reason"])
         elif dry_run:
             result.update(status="would_convert", reason="verified_dry_run")
         else:
+            if _cancel_requested(cancel_event):
+                result.update(status="cancelled", reason="cancel_requested")
+                return result
             os.replace(temporary_path, webp_path)
             temporary_path = None
             if not image_file_is_ready(str(webp_path)):
@@ -381,11 +410,14 @@ def _convert_one(jpeg_path, quality, force, dry_run):
     return result
 
 
-def _cleanup_one(jpeg_path, apply, confirmed):
+def _cleanup_one(jpeg_path, apply, confirmed, cancel_event=None):
     result = _base_result(jpeg_path)
     webp_path = jpeg_path.with_suffix(".webp")
     try:
-        if not image_file_is_ready(str(webp_path)):
+        if _cancel_requested(cancel_event):
+            result.update(status="cancelled", reason="cancel_requested")
+            return result
+        if not image_file_is_valid(str(webp_path)):
             result.update(status="kept", reason="webp_missing_or_invalid")
             return result
         gate = _gate_result(jpeg_path, webp_path, _comparison_metrics(jpeg_path, webp_path))
@@ -397,12 +429,18 @@ def _cleanup_one(jpeg_path, apply, confirmed):
             result.update(status="would_cleanup", reason="verified_dry_run")
             return result
         # Revalidate immediately before the destructive operation.
-        if not image_file_is_ready(str(webp_path)):
+        if _cancel_requested(cancel_event):
+            result.update(status="cancelled", reason="cancel_requested")
+            return result
+        if not image_file_is_valid(str(webp_path)):
             result.update(status="kept", reason="webp_changed_before_cleanup")
             return result
         recheck = _gate_result(jpeg_path, webp_path, _comparison_metrics(jpeg_path, webp_path))
         if not recheck["accepted"]:
             result.update(status="kept", reason="revalidation_failed")
+            return result
+        if _cancel_requested(cancel_event):
+            result.update(status="cancelled", reason="cancel_requested")
             return result
         os.remove(jpeg_path)
         result.update(status="cleaned", reason="verified_and_removed")
@@ -452,11 +490,22 @@ def _run_parallel(paths, worker, workers, progress):
     return results
 
 
-def _report(mode, paths, results, dry_run, extra=None, report_path=None):
+def _report(
+    mode,
+    paths,
+    results,
+    dry_run,
+    extra=None,
+    report_path=None,
+    cancelled=False,
+):
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "dry_run": bool(dry_run),
+        "cancelled": bool(
+            cancelled or any(result.get("status") == "cancelled" for result in results)
+        ),
         "files_considered": len(paths),
         "files": results,
     }
@@ -480,6 +529,7 @@ def migrate_cache(
     confirmed=False,
     progress=None,
     report_path=None,
+    cancel_event=None,
 ):
     """Run conversion or cleanup and return the JSON-serializable report."""
     for selector in tiles:
@@ -494,7 +544,9 @@ def migrate_cache(
         _, parsed_quality = validate_cache_settings("webp", quality)
         results = _run_parallel(
             paths,
-            lambda path: _convert_one(path, parsed_quality, force, dry_run),
+            lambda path: _convert_one(
+                path, parsed_quality, force, dry_run, cancel_event
+            ),
             workers,
             progress,
         )
@@ -513,12 +565,13 @@ def migrate_cache(
                 },
             },
             report_path,
+            cancelled=_cancel_requested(cancel_event),
         )
     if mode == "cleanup":
         actual_apply = bool(apply and confirmed and not dry_run)
         results = _run_parallel(
             paths,
-            lambda path: _cleanup_one(path, actual_apply, confirmed),
+            lambda path: _cleanup_one(path, actual_apply, confirmed, cancel_event),
             workers,
             progress,
         )
@@ -529,5 +582,6 @@ def migrate_cache(
             not actual_apply,
             {"apply": actual_apply, "confirmation": bool(confirmed)},
             report_path,
+            cancelled=_cancel_requested(cancel_event),
         )
     raise ValueError(f"unsupported cache migration mode: {mode}")

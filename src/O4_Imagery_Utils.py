@@ -123,14 +123,14 @@ def find_imagery_cache_path(
     )
 
 
-def save_imagery_cache_image(image, file_path):
+def save_imagery_cache_image(image, file_path, jpeg_quality=None):
     """Save a cache image using the format encoded by its destination path."""
     extension = os.path.splitext(file_path)[1].lower().lstrip(".")
     if extension == "webp":
         _, quality = validate_imagery_cache_settings("webp", imagery_cache_quality)
         CACHE.save_cache_image(image, file_path, "webp", quality)
     else:
-        CACHE.save_cache_image(image, file_path, "jpg", None)
+        CACHE.save_cache_image(image, file_path, "jpg", jpeg_quality)
 
 
 def prepare_image_for_external_input(source_path):
@@ -2003,7 +2003,9 @@ def download_jpeg_ortho(
                         high_quality_img = cropped.resize(
                             (4096, 4096), Image.BICUBIC
                         )
-                        save_imagery_cache_image(high_quality_img, file_path)
+                        save_imagery_cache_image(
+                            high_quality_img, file_path, jpeg_quality=90
+                        )
                         UI.vprint(
                             1,
                             f"   [Quality Check] Rebuilt {file_name} from {parent_file_name}.",

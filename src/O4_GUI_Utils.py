@@ -51,6 +51,28 @@ def _ui_text(english, japanese):
     )
     return japanese if language.lower().startswith("ja") else english
 
+
+_IMAGERY_CACHE_ERROR_TRANSLATIONS = {
+    "Tile is required.": "タイルは必須です。",
+    "Workers must be at least 1.": "ワーカー数は1以上にしてください。",
+    "imagery_cache_format must be jpg or webp":
+        "imagery_cache_format は jpg または webp を指定してください。",
+    "imagery_cache_quality is required when imagery_cache_format=webp":
+        "画像キャッシュ形式がWebPの場合、品質の指定が必要です。",
+    "imagery_cache_quality must be an integer from 80 to 100":
+        "画像キャッシュ品質は80〜100の整数で指定してください。",
+    "Pillow WebP support is unavailable":
+        "PillowのWebP対応が利用できません。",
+}
+
+
+def _imagery_cache_error_text(error):
+    english = str(error)
+    return _ui_text(
+        english,
+        _IMAGERY_CACHE_ERROR_TRANSLATIONS.get(english, english),
+    )
+
 ################################################################################
 class Ortho4XP_GUI(tk.Tk):
 
@@ -803,6 +825,24 @@ class Ortho4XP_GUI(tk.Tk):
             return 1
 
     def set_red_flag(self):
+        cache_window = getattr(self, "imagery_cache_window", None)
+        cache_running = bool(
+            cache_window is not None and getattr(cache_window, "running", False)
+        )
+        if cache_running:
+            cache_window.request_cancel()
+        worker = getattr(self, "working_thread", None)
+        worker_running = worker is not None and worker.is_alive()
+        if worker_running:
+            UI.red_flag = True
+        if cache_running or worker_running:
+            self.status_var.set(
+                _ui_text(
+                    "Stop requested. Waiting for the current process to stop...",
+                    "停止を要求しました。現在の処理が停止するまでお待ちください...",
+                )
+            )
+            return
         UI.red_flag = True
         self.status_var.set(
             _ui_text(
@@ -1000,7 +1040,15 @@ class Ortho4XP_GUI(tk.Tk):
 
     def _finish_exit(self):
         worker = getattr(self, "working_thread", None)
-        if worker is not None and worker.is_alive():
+        cache_window = getattr(self, "imagery_cache_window", None)
+        cache_worker = (
+            getattr(cache_window, "worker_thread", None)
+            if cache_window is not None
+            else None
+        )
+        if (worker is not None and worker.is_alive()) or (
+            cache_worker is not None and cache_worker.is_alive()
+        ):
             self.status_var.set(
                 _ui_text(
                     "Stopping the current process before exit...",
@@ -1026,9 +1074,25 @@ class Ortho4XP_GUI(tk.Tk):
             return
         self._save_gui_params()
         worker = getattr(self, "working_thread", None)
+        cache_window = getattr(self, "imagery_cache_window", None)
+        cache_running = bool(
+            cache_window is not None and getattr(cache_window, "running", False)
+        )
+        if cache_running:
+            cache_window.request_cancel()
         if worker is not None and worker.is_alive():
-            self._exit_requested = True
             UI.red_flag = True
+        cache_worker = (
+            getattr(cache_window, "worker_thread", None)
+            if cache_window is not None
+            else None
+        )
+        if (
+            (worker is not None and worker.is_alive())
+            or cache_running
+            or (cache_worker is not None and cache_worker.is_alive())
+        ):
+            self._exit_requested = True
             self.status_var.set(
                 _ui_text(
                     "Stop requested. Waiting for the current process before exit...",
@@ -1723,6 +1787,9 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
         self.rowconfigure(6, weight=1)
         self.result_queue = queue.Queue()
         self.running = False
+        self.cancel_event = None
+        self.worker_thread = None
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
         try:
             lat, lon = parent.get_lat_lon(check=False)
@@ -1775,11 +1842,19 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
             command=self.start_cleanup_apply,
         )
         self.apply_button.pack(side=LEFT, padx=3)
-        ttk.Button(
+        self.cancel_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Cancel", "キャンセル"),
+            command=self.request_cancel,
+            state="disabled",
+        )
+        self.cancel_button.pack(side=LEFT, padx=3)
+        self.close_button = ttk.Button(
             button_frame,
             text=_ui_text("Close", "閉じる"),
-            command=self.destroy,
-        ).pack(side=RIGHT, padx=3)
+            command=self._close,
+        )
+        self.close_button.pack(side=RIGHT, padx=3)
 
         ttk.Label(self, textvariable=self.status_var).grid(
             row=6, column=0, columnspan=2, padx=6, pady=(0, 4), sticky=W
@@ -1815,6 +1890,39 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
     def _set_buttons(self, state):
         for button in (self.convert_button, self.cleanup_button, self.apply_button):
             button.configure(state=state)
+        self.cancel_button.configure(
+            state="normal" if state == "disabled" else "disabled"
+        )
+
+    def request_cancel(self):
+        if not self.running:
+            return
+        already_requested = (
+            self.cancel_event is not None and self.cancel_event.is_set()
+        )
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        if already_requested:
+            return
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set(
+            _ui_text(
+                "Stop requested; waiting for current file...",
+                "停止を要求しました。現在のファイルの完了を待っています...",
+            )
+        )
+        self._append_output(
+            _ui_text(
+                "Cancellation requested.",
+                "キャンセルを要求しました。",
+            )
+        )
+
+    def _close(self):
+        if self.running:
+            self.request_cancel()
+            return
+        self.destroy()
 
     def _start(self, mode, apply=False, confirmed=False):
         if self.running:
@@ -1828,11 +1936,15 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
             from tkinter import messagebox
 
             messagebox.showerror(
-                _ui_text("Cache migration", "キャッシュ移行"), str(error), parent=self
+                _ui_text("Cache migration", "キャッシュ移行"),
+                _imagery_cache_error_text(error),
+                parent=self,
             )
             return
 
         self.running = True
+        cancel_event = threading.Event()
+        self.cancel_event = cancel_event
         self._set_buttons("disabled")
         self.progress.configure(value=0, maximum=1)
         self.status_var.set(
@@ -1855,12 +1967,14 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
                     apply=apply,
                     confirmed=confirmed,
                     progress=progress_callback,
+                    cancel_event=cancel_event,
                 )
                 self.result_queue.put(("done", report))
             except Exception as error:
-                self.result_queue.put(("error", str(error)))
+                self.result_queue.put(("error", _imagery_cache_error_text(error)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
         self.after(100, self._poll_results)
 
     def _poll_results(self):
@@ -1885,14 +1999,17 @@ class Ortho4XP_Imagery_Cache(tk.Toplevel):
                     report = event[1]
                     self.running = False
                     self._set_buttons("normal")
-                    self.status_var.set(
-                        _ui_text("Completed", "完了")
-                    )
+                    self.cancel_event = None
+                    if report.get("cancelled"):
+                        self.status_var.set(_ui_text("Cancelled", "キャンセルしました"))
+                    else:
+                        self.status_var.set(_ui_text("Completed", "完了"))
                     self._append_output("JSON report: {}".format(report["report_path"]))
                     return
                 elif event[0] == "error":
                     self.running = False
                     self._set_buttons("normal")
+                    self.cancel_event = None
                     self.status_var.set(_ui_text("Failed", "失敗"))
                     self._append_output("ERROR: " + event[1])
                     return

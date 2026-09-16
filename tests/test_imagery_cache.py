@@ -1,6 +1,7 @@
 import json
 import struct
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +59,12 @@ def test_webp_priority_jpeg_fallback_and_corrupt_webp(tmp_path):
     assert not webp_path.exists()
 
 
+def test_zoom_filter_matches_cache_directory_exactly(tmp_path):
+    _directory, jpeg_path = _cache_fixture(tmp_path)
+    assert CACHE.iter_jpeg_cache_files(tmp_path, zoomlevels=[6]) == []
+    assert CACHE.iter_jpeg_cache_files(tmp_path, zoomlevels=[16]) == [jpeg_path]
+
+
 def test_migration_scope_filters_provider_and_zoomlevel(tmp_path):
     _directory, jpeg_path = _cache_fixture(tmp_path)
     assert CACHE.iter_jpeg_cache_files(
@@ -69,6 +76,83 @@ def test_migration_scope_filters_provider_and_zoomlevel(tmp_path):
     assert CACHE.iter_jpeg_cache_files(
         tmp_path, tiles=["+34+132"], zoomlevels=[15]
     ) == []
+
+
+def test_convert_dry_run_keeps_invalid_existing_webp(tmp_path):
+    _directory, jpeg_path = _cache_fixture(tmp_path)
+    webp_path = jpeg_path.with_suffix(".webp")
+    webp_path.write_bytes(b"broken")
+
+    result = CACHE._convert_one(jpeg_path, quality=95, force=False, dry_run=True)
+
+    assert result["status"] == "would_convert"
+    assert webp_path.read_bytes() == b"broken"
+
+
+def test_cancelled_conversion_does_not_write_webp(tmp_path):
+    _directory, jpeg_path = _cache_fixture(tmp_path)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    report = CACHE.migrate_cache(
+        mode="convert",
+        root=tmp_path,
+        tiles=["+34+132"],
+        quality=95,
+        workers=1,
+        cancel_event=cancel_event,
+        report_path=tmp_path / "cancelled-convert.json",
+    )
+
+    assert report["cancelled"] is True
+    assert report["files"][0]["status"] == "cancelled"
+    assert jpeg_path.exists()
+    assert not jpeg_path.with_suffix(".webp").exists()
+
+
+def test_cancellation_stops_remaining_conversion_work(tmp_path, monkeypatch):
+    directory, _jpeg_path = _cache_fixture(tmp_path)
+    for index in (1, 2):
+        Image.new("RGB", (512, 512), (80 + index, 140, 200)).save(
+            directory / f"{index}_0_BI16.jpg", format="JPEG", quality=100
+        )
+    cancel_event = threading.Event()
+    first_path = sorted(directory.glob("*.jpg"))[0]
+
+    def fake_convert(path, _quality, _force, _dry_run, event):
+        result = CACHE._base_result(path)
+        if path != first_path:
+            event.wait(timeout=1)
+            result.update(status="cancelled", reason="cancel_requested")
+        else:
+            result.update(status="converted", reason="fake")
+        return result
+
+    monkeypatch.setattr(CACHE, "_convert_one", fake_convert)
+
+    def progress(done, _total, _result):
+        if done == 1:
+            cancel_event.set()
+
+    report = CACHE.migrate_cache(
+        mode="convert",
+        root=tmp_path,
+        tiles=["+34+132"],
+        quality=95,
+        workers=1,
+        cancel_event=cancel_event,
+        progress=progress,
+        report_path=tmp_path / "cancelled-remaining.json",
+    )
+
+    statuses = [result["status"] for result in report["files"]]
+    assert report["cancelled"] is True
+    assert statuses.count("cancelled") == 2
+    assert all(
+        not path.with_suffix(".webp").exists()
+        for path in directory.glob("*.jpg")
+        if path.name != "0_0_BI16.jpg"
+    )
 
 
 def test_migration_gates_atomic_result_and_rerun_skip(tmp_path):
@@ -164,6 +248,58 @@ def test_cleanup_requires_apply_and_revalidation(tmp_path):
     assert applied["files"][0]["status"] == "cleaned"
     assert not jpeg_path.exists()
     assert webp_path.exists()
+
+
+def test_cleanup_dry_run_keeps_invalid_webp(tmp_path):
+    _directory, jpeg_path = _cache_fixture(tmp_path)
+    webp_path = jpeg_path.with_suffix(".webp")
+    webp_path.write_bytes(b"broken")
+
+    report = CACHE.migrate_cache(
+        mode="cleanup",
+        root=tmp_path,
+        tiles=["+34+132"],
+        workers=1,
+        report_path=tmp_path / "cleanup-invalid.json",
+    )
+
+    assert report["files"][0]["status"] == "kept"
+    assert jpeg_path.exists()
+    assert webp_path.read_bytes() == b"broken"
+
+
+def test_cancelled_cleanup_does_not_remove_jpeg(tmp_path):
+    _directory, jpeg_path = _cache_fixture(tmp_path)
+    webp_path = jpeg_path.with_suffix(".webp")
+    Image.open(jpeg_path).save(webp_path, format="WEBP", quality=95)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    result = CACHE._cleanup_one(
+        jpeg_path,
+        apply=True,
+        confirmed=True,
+        cancel_event=cancel_event,
+    )
+
+    assert result["status"] == "cancelled"
+    assert jpeg_path.exists()
+    assert webp_path.exists()
+
+
+def test_jpeg_quality_argument_is_preserved(tmp_path):
+    noisy = numpy.random.default_rng(11).integers(
+        0, 256, (256, 256, 3), dtype=numpy.uint8
+    )
+    image = Image.fromarray(noisy)
+    quality_75 = tmp_path / "quality-75.jpg"
+    quality_90 = tmp_path / "quality-90.jpg"
+
+    CACHE.save_cache_image(image, quality_75, "jpg", 75)
+    CACHE.save_cache_image(image, quality_90, "jpg", 90)
+
+    with Image.open(quality_75) as lower, Image.open(quality_90) as higher:
+        assert lower.quantization != higher.quantization
 
 
 def test_webp_is_normalized_to_temporary_png(tmp_path):

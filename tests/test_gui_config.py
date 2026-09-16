@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 
@@ -37,3 +38,34 @@ def test_tile_from_interface_does_not_override_current_settings_from_saved_cfg(t
     gui.custom_build_dir = _Value(str(tmp_path))
 
     assert gui.tile_from_interface() is tile
+
+
+def test_cache_dialog_cancel_sets_cooperative_cancel_event():
+    class _Button:
+        def __init__(self):
+            self.states = []
+
+        def configure(self, **kwargs):
+            self.states.append(kwargs)
+
+    class _Status:
+        def __init__(self):
+            self.values = []
+
+        def set(self, value):
+            self.values.append(value)
+
+    dialog = GUI.Ortho4XP_Imagery_Cache.__new__(GUI.Ortho4XP_Imagery_Cache)
+    dialog.running = True
+    dialog.cancel_event = threading.Event()
+    dialog.cancel_button = _Button()
+    dialog.status_var = _Status()
+    output = []
+    dialog._append_output = output.append
+
+    dialog.request_cancel()
+
+    assert dialog.cancel_event.is_set()
+    assert dialog.cancel_button.states[-1] == {"state": "disabled"}
+    assert dialog.status_var.values
+    assert output
