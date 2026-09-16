@@ -833,6 +833,19 @@ class Tile:
                 val = globals().get(var, cfg_vars[var]["default"])
             setattr(self, var, val)
 
+    def __getstate__(self):
+        """Exclude process-local runtime handles from spawn worker state.
+
+        Tile instances are part of the historical ``convert_texture`` task
+        payload.  Metrics and the resident ASHelper client belong to the
+        parent tile process and contain locks, threads, and subprocess pipes;
+        none of them is needed by an image conversion worker.
+        """
+        state = self.__dict__.copy()
+        state.pop("_performance_metrics", None)
+        state.pop("_ashelper_jsonl_server", None)
+        return state
+
     def make_dirs(self):
         if os.path.isdir(self.build_dir):
             if not os.access(self.build_dir, os.W_OK):

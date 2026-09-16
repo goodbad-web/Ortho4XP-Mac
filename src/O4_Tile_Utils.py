@@ -704,10 +704,16 @@ def _start_ashelper_jsonl_server(tile, metrics=None):
     use_gpu = bool(
         getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
     )
+    streaming_requested = bool(
+        getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
+    )
+    dds_converter = getattr(
+        tile, "dds_converter", getattr(UI, "dds_converter", "nvcompress")
+    )
     wants_server = bool(
         use_gpu
         and (
-            getattr(tile, "enable_streaming_conversion", enable_streaming_conversion)
+            (streaming_requested and dds_converter == "TextureConverter")
             or getattr(tile, "use_gpu_for_masks", False)
             or getattr(tile, "use_gpu_for_dem_smoothing", False)
         )
@@ -3597,6 +3603,30 @@ def _host_gpu_semaphore(enabled):
                 pass
 
 
+def _parallel_tile_stage_uses_gpu(tile, stage_name):
+    """Return whether one parallel-tile stage can own the host GPU."""
+    if stage_name == "vector data":
+        # Airport DEM smoothing is invoked while vector data is assembled.
+        return bool(getattr(tile, "use_gpu_for_dem_smoothing", False))
+    if stage_name == "water masks":
+        return bool(
+            getattr(tile, "use_gpu_for_masks", False)
+            or getattr(tile, "use_gpu_for_dem_smoothing", False)
+        )
+    if stage_name != "imagery/DSF":
+        return False
+    if not getattr(tile, "use_gpu_acceleration", False):
+        return False
+    dds_converter = getattr(tile, "dds_converter", "nvcompress")
+    upscale_backend = IMG.normalize_upscale_backend(
+        getattr(tile, "upscale_backend", "none")
+    )
+    return bool(
+        dds_converter == "TextureConverter"
+        or upscale_backend in ("metalfx_spatial", "tensorops")
+    )
+
+
 def _parallel_tile_worker(payload):
     """Build one tile in a spawn-isolated process for opt-in batch mode."""
     try:
@@ -3634,20 +3664,17 @@ def _parallel_tile_worker(payload):
                 )
             )
 
-        uses_gpu = bool(
-            getattr(tile, "use_gpu_acceleration", False)
-            or getattr(tile, "use_gpu_for_masks", False)
-            or getattr(tile, "use_gpu_for_dem_smoothing", False)
-            or getattr(tile, "enable_streaming_conversion", False)
-        )
-        with _host_gpu_semaphore(uses_gpu):
-            for stage_name, stage in stages:
+        for stage_name, stage in stages:
+            stage_context = _host_gpu_semaphore(
+                _parallel_tile_stage_uses_gpu(tile, stage_name)
+            )
+            with stage_context:
                 try:
                     succeeded = bool(stage(tile))
                 except Exception as error:
                     return lat, lon, False, "{}: {}".format(stage_name, error)
-                if not succeeded or worker_ui.red_flag:
-                    return lat, lon, False, "{} failed".format(stage_name)
+            if not succeeded or worker_ui.red_flag:
+                return lat, lon, False, "{} failed".format(stage_name)
         return lat, lon, True, None
     except Exception as error:
         return int(payload.get("lat", 0)), int(payload.get("lon", 0)), False, str(error)

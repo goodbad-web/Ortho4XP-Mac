@@ -49,6 +49,7 @@ def _resident_mask_blur(server, img_array, kernel):
                     "height": int(height),
                     "stride": int(source.strides[0]),
                     "kernel": [float(value) for value in kernel],
+                    "border_mode": "reflect101",
                 }
             ],
         )
@@ -576,24 +577,38 @@ def blur_mask(img_array, tile, sea_level):
         # convolution with a hat function (using cv2.sepFilter2D for extreme speedup)
         kernel = numpy.array(list(range(1, blur_width)) + [blur_width] + list(range(blur_width - 1, 0, -1)), dtype=numpy.float32)
         kernel = kernel / (blur_width ** 2)
-        use_gpu = getattr(tile, "use_gpu_for_masks", False)
-        resident_gpu_result = _resident_mask_blur(
-            getattr(tile, "_ashelper_jsonl_server", None),
-            img_array,
-            kernel,
-        )
-        if resident_gpu_result is not None:
-            b_img_array = resident_gpu_result
-        elif use_gpu:
+        use_gpu = bool(getattr(tile, "use_gpu_for_masks", False))
+        b_img_array = None
+        if use_gpu:
+            resident_gpu_result = _resident_mask_blur(
+                getattr(tile, "_ashelper_jsonl_server", None),
+                img_array,
+                kernel,
+            )
+            if resident_gpu_result is not None:
+                b_img_array = resident_gpu_result
+        if b_img_array is None and use_gpu:
             try:
                 gpu_img = cv2.UMat(img_array)
-                gpu_blurred = cv2.sepFilter2D(gpu_img, -1, kernel, kernel)
+                gpu_blurred = cv2.sepFilter2D(
+                    gpu_img,
+                    -1,
+                    kernel,
+                    kernel,
+                    borderType=cv2.BORDER_REFLECT_101,
+                )
                 b_img_array = gpu_blurred.get()
             except Exception as e:
                 UI.vprint(2, f"GPU mask blur fallback due to error: {str(e)}")
                 use_gpu = False
-        if not use_gpu:
-            b_img_array = cv2.sepFilter2D(img_array, -1, kernel, kernel)
+        if b_img_array is None:
+            b_img_array = cv2.sepFilter2D(
+                img_array,
+                -1,
+                kernel,
+                kernel,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
         b_img_array = 2 * numpy.minimum(b_img_array, 127)
         b_img_array = b_img_array.astype(numpy.uint8)
     # Rocks mode

@@ -1,5 +1,7 @@
 import json
+import pickle
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -81,3 +83,43 @@ for line in sys.stdin:
     assert second_error.value.restarted is False
     assert client.gpu_disabled is True
     client.close()
+
+
+def test_jsonl_server_timeout_uses_failure_policy(tmp_path):
+    helper = tmp_path / "hung_ashelper"
+    _write_helper(
+        helper,
+        """
+import sys
+
+for _line in sys.stdin:
+    pass
+""",
+    )
+
+    client = ASHelperJSONLServer(
+        str(helper),
+        max_restarts=0,
+        response_timeout_s=0.05,
+    )
+    try:
+        with pytest.raises(ASHelperServerCrashed) as error:
+            client.convert_batch([])
+        assert error.value.restarted is False
+        assert "timed out" in str(error.value)
+        assert client.gpu_disabled is True
+    finally:
+        client.close()
+
+
+def test_tile_runtime_handles_are_not_sent_to_spawn_workers():
+    from O4_Config_Utils import Tile
+
+    tile = Tile(34, 133, "")
+    tile._performance_metrics = threading.RLock()
+    tile._ashelper_jsonl_server = ASHelperJSONLServer("/bin/true")
+
+    restored = pickle.loads(pickle.dumps(tile))
+
+    assert not hasattr(restored, "_performance_metrics")
+    assert not hasattr(restored, "_ashelper_jsonl_server")

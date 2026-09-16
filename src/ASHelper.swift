@@ -3893,7 +3893,18 @@ struct RasterBlurParams {
     uint stride;
     uint radius;
     uint vertical;
+    uint borderMode;
 };
+
+inline int o4_reflect101(int coordinate, int limit) {
+    if (limit <= 1) return 0;
+    int value = coordinate;
+    while (value < 0 || value >= limit) {
+        if (value < 0) value = -value;
+        else value = 2 * limit - 2 - value;
+    }
+    return value;
+}
 
 kernel void o4_raster_blur_u8(
     device const uchar *input [[buffer(0)]],
@@ -3910,7 +3921,12 @@ kernel void o4_raster_blur_u8(
         int y = int(gid.y);
         if (params.vertical != 0) y += offset;
         else x += offset;
-        if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
+        if (params.borderMode == 1) {
+            if (params.vertical != 0) y = o4_reflect101(y, int(params.height));
+            else x = o4_reflect101(x, int(params.width));
+        } else if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) {
+            continue;
+        }
         value += float(input[y * int(params.stride) + x]) * weights[offset + radius];
     }
     output[gid.y * params.stride + gid.x] = uchar(clamp(value + 0.5, 0.0, 255.0));
@@ -3931,7 +3947,12 @@ kernel void o4_raster_blur_f32(
         int y = int(gid.y);
         if (params.vertical != 0) y += offset;
         else x += offset;
-        if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) continue;
+        if (params.borderMode == 1) {
+            if (params.vertical != 0) y = o4_reflect101(y, int(params.height));
+            else x = o4_reflect101(x, int(params.width));
+        } else if (x < 0 || y < 0 || x >= int(params.width) || y >= int(params.height)) {
+            continue;
+        }
         value += input[y * int(params.stride) + x] * weights[offset + radius];
     }
     output[gid.y * params.stride + gid.x] = value;
@@ -3958,6 +3979,7 @@ private struct RasterBlurParams {
     var stride: UInt32
     var radius: UInt32
     var vertical: UInt32
+    var borderMode: UInt32
 }
 
 private final class RasterMetalRuntime {
@@ -4005,7 +4027,8 @@ private final class RasterMetalRuntime {
         height: Int,
         stride: Int,
         weights: [Float],
-        float32: Bool
+        float32: Bool,
+        borderMode: UInt32 = 0
     ) throws -> Data {
         guard width > 0, height > 0, stride >= width else {
             throw RasterMetalError.invalid("shape")
@@ -4054,7 +4077,8 @@ private final class RasterMetalRuntime {
                 height: UInt32(height),
                 stride: UInt32(stride),
                 radius: UInt32(radius),
-                vertical: vertical ? 1 : 0
+                vertical: vertical ? 1 : 0,
+                borderMode: borderMode
             )
             encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(input, offset: 0, index: 0)
@@ -4136,7 +4160,8 @@ private final class RasterMetalRuntime {
             height: height,
             stride: width,
             weights: weights,
-            float32: true
+            float32: true,
+            borderMode: 0
         )
         let blurredMask = try blur(
             data: maskData,
@@ -4144,7 +4169,8 @@ private final class RasterMetalRuntime {
             height: height,
             stride: width,
             weights: weights,
-            float32: true
+            float32: true,
+            borderMode: 0
         )
         var output = [Float](repeating: 0, count: count)
         blurredWeighted.withUnsafeBytes { weightedBytes in
@@ -4208,6 +4234,16 @@ private func serverKernel(_ task: [String: Any]) -> [Float] {
     }
 }
 
+private func serverBorderMode(_ task: [String: Any]) -> UInt32 {
+    guard let value = task["border_mode"] as? String else { return 0 }
+    switch value.lowercased() {
+    case "reflect101", "reflect_101":
+        return 1
+    default:
+        return 0
+    }
+}
+
 private func serverRawRasterBatch(
     _ request: [String: Any],
     operation: String
@@ -4251,7 +4287,8 @@ private func serverRawRasterBatch(
                             height: height,
                             stride: stride / MemoryLayout<Float>.size,
                             weights: kernel,
-                            float32: true
+                            float32: true,
+                            borderMode: 0
                         )
                     }
                 } else {
@@ -4261,7 +4298,8 @@ private func serverRawRasterBatch(
                         height: height,
                         stride: stride,
                         weights: kernel,
-                        float32: false
+                        float32: false,
+                        borderMode: serverBorderMode(task)
                     )
                 }
                 try outputData.write(to: URL(fileURLWithPath: output), options: .atomic)

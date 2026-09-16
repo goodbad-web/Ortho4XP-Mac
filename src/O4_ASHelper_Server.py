@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+
+
+_STDOUT_EOF = object()
 
 
 class ASHelperServerError(RuntimeError):
@@ -45,12 +49,18 @@ class ASHelperJSONLServer:
         max_restarts: int = 1,
         logger: Optional[Callable[[str], None]] = None,
         environment: Optional[Mapping[str, str]] = None,
+        response_timeout_s: float = 300.0,
     ) -> None:
+        if float(response_timeout_s) <= 0:
+            raise ValueError("response_timeout_s must be positive")
         self.executable = os.path.abspath(executable)
         self.max_restarts = max(0, int(max_restarts))
         self.logger = logger or (lambda _message: None)
         self.environment = dict(environment) if environment is not None else None
+        self.response_timeout_s = float(response_timeout_s)
         self._process: Optional[subprocess.Popen[str]] = None
+        self._stdout_queue = None
+        self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
         self._restart_count = 0
@@ -94,6 +104,15 @@ class ASHelperJSONLServer:
                 bufsize=1,
                 env=process_environment,
             )
+            stdout_queue = queue.Queue()
+            self._stdout_queue = stdout_queue
+            self._stdout_thread = threading.Thread(
+                target=self._read_stdout,
+                args=(self._process, stdout_queue),
+                name="Ortho4XP-ASHelper-stdout",
+                daemon=True,
+            )
+            self._stdout_thread.start()
             self._stderr_thread = threading.Thread(
                 target=self._drain_stderr,
                 args=(self._process,),
@@ -101,6 +120,19 @@ class ASHelperJSONLServer:
                 daemon=True,
             )
             self._stderr_thread.start()
+
+    def _read_stdout(self, process: subprocess.Popen[str], stdout_queue) -> None:
+        stream = process.stdout
+        if stream is None:
+            stdout_queue.put(_STDOUT_EOF)
+            return
+        try:
+            for line in stream:
+                stdout_queue.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            stdout_queue.put(_STDOUT_EOF)
 
     def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
         stream = process.stderr
@@ -117,6 +149,7 @@ class ASHelperJSONLServer:
     def _stop_process(self) -> None:
         process = self._process
         self._process = None
+        self._stdout_queue = None
         if process is None:
             return
         try:
@@ -124,6 +157,12 @@ class ASHelperJSONLServer:
                 process.stdin.close()
         except (OSError, ValueError):
             pass
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
@@ -170,7 +209,8 @@ class ASHelperJSONLServer:
         with self._lock:
             self.start()
             process = self._process
-            if process is None or process.stdin is None or process.stdout is None:
+            response_queue = self._stdout_queue
+            if process is None or process.stdin is None or response_queue is None:
                 raise ASHelperServerError("ASHelper server streams are unavailable")
             request_id = payload.get("id")
             if not isinstance(request_id, str) or not request_id:
@@ -178,8 +218,8 @@ class ASHelperJSONLServer:
             try:
                 process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
                 process.stdin.flush()
-                line = process.stdout.readline()
-                if not line:
+                line = response_queue.get(timeout=self.response_timeout_s)
+                if line is _STDOUT_EOF:
                     raise ASHelperServerCrashed(
                         "ASHelper server exited while processing request"
                     )
@@ -193,6 +233,12 @@ class ASHelperJSONLServer:
                         )
                     )
                 return response
+            except queue.Empty as error:
+                raise self._handle_crash(
+                    "ASHelper server response timed out after {:.1f}s".format(
+                        self.response_timeout_s
+                    )
+                ) from error
             except ASHelperServerCrashed as error:
                 if error.restarted:
                     raise
