@@ -91,6 +91,22 @@ def test_merge_skips_transient_files(tmp_path):
     assert not (destination / "image.jpg.tmp").exists()
 
 
+def test_merge_refuses_top_level_symlink_without_copying_target(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    (source / "link.txt").symlink_to(outside)
+
+    result = RAM._merge_ram_tree_to_backup(str(source), str(destination))
+
+    assert not result.success
+    assert result.failures
+    assert not (destination / "link.txt").exists()
+    assert (source / "link.txt").is_symlink()
+
+
 def test_mount_refuses_unowned_volume_without_mutating_paths(ram_paths, monkeypatch):
     monkeypatch.setattr(RAM, "is_ram_disk_active", lambda path: True)
     tmp_path = Path(RAM.FNAMES.Tmp_dir)
@@ -146,12 +162,52 @@ def test_recovery_detaches_volume_only_state(ram_paths, monkeypatch):
         return True
 
     monkeypatch.setattr(RAM, "_detach_owned_session", fake_detach)
+    Path(session.tmp_path).mkdir()
     RAM._write_state(session)
 
     assert RAM.recover_orphaned_symlinks() is True
     assert detached == [session.ram_disk_path]
     assert not Path(RAM._state_path()).exists()
     assert Path(session.tmp_path).is_dir()
+
+
+def test_recovery_handles_state_saved_before_path_preparation(ram_paths, monkeypatch):
+    session = _session(ram_paths, use_orthophotos=False)
+    monkeypatch.setattr(RAM, "RAM_DISK_PATH", session.ram_disk_path)
+    Path(session.ram_disk_path).mkdir()
+    Path(session.tmp_path).mkdir()
+    _mock_owned_volume(monkeypatch)
+    detached = []
+    monkeypatch.setattr(
+        RAM,
+        "_detach_owned_session",
+        lambda current_session: detached.append(current_session.ram_disk_path) or True,
+    )
+    RAM._write_state(session)
+
+    assert RAM.recover_orphaned_symlinks() is True
+    assert detached == [session.ram_disk_path]
+    assert Path(session.tmp_path).is_dir()
+    assert not Path(RAM._state_path()).exists()
+
+
+def test_recovery_resumes_path_prepared_before_state_update(ram_paths, monkeypatch):
+    session = _session(ram_paths, use_orthophotos=False)
+    monkeypatch.setattr(RAM, "RAM_DISK_PATH", session.ram_disk_path)
+    ram_root = Path(session.ram_disk_path)
+    ram_root.mkdir()
+    Path(session.tmp_path).mkdir()
+    Path(session.tmp_backup).mkdir()
+    (Path(session.tmp_backup) / "original").write_bytes(b"original")
+    Path(session.tmp_path).rmdir()
+    Path(session.tmp_path).symlink_to(session.ram_disk_path)
+    _mock_owned_volume(monkeypatch)
+    monkeypatch.setattr(RAM, "_detach_owned_session", lambda current_session: True)
+    RAM._write_state(session)
+
+    assert RAM.recover_orphaned_symlinks() is True
+    assert (Path(session.tmp_path) / "original").read_bytes() == b"original"
+    assert not Path(RAM._state_path()).exists()
 
 
 def test_recovery_keeps_state_when_merge_fails(ram_paths, monkeypatch):

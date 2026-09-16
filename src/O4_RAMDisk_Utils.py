@@ -61,6 +61,8 @@ class _RamDiskSession:
     device_node: str
     use_orthophotos: bool
     session_id: str
+    prepared_paths: set = field(default_factory=set)
+    restoring_paths: set = field(default_factory=set)
     restored_paths: set = field(default_factory=set)
 
     @property
@@ -80,6 +82,8 @@ class _RamDiskSession:
             "device_node": self.device_node,
             "volume_name": RAM_VOLUME_NAME,
             "use_orthophotos": self.use_orthophotos,
+            "prepared_paths": sorted(self.prepared_paths),
+            "restoring_paths": sorted(self.restoring_paths),
             "restored_paths": sorted(self.restored_paths),
             "pid": os.getpid(),
         }
@@ -286,6 +290,8 @@ def _session_from_state(state):
         device_node=_normalise_device_node(state["device_node"]),
         use_orthophotos=bool(state["use_orthophotos"]),
         session_id=str(state["session_id"]),
+        prepared_paths=set(state.get("prepared_paths", [])),
+        restoring_paths=set(state.get("restoring_paths", [])),
         restored_paths=set(state.get("restored_paths", [])),
     )
 
@@ -505,6 +511,9 @@ def _merge_entry(src_path, dest_path):
     if os.path.isdir(src_path) and not os.path.islink(src_path):
         return merge_directories(src_path, dest_path)
     result = MergeResult()
+    if os.path.islink(src_path):
+        result.failures.append(f"source entry is a symlink: {src_path}")
+        return result
     if os.path.basename(src_path).endswith(".tmp"):
         result.skipped = 1
         return result
@@ -711,12 +720,16 @@ def mount_ram_disk(size_gb=4, use_orthophotos=False):
 
         os.makedirs(session.ram_ortho_path, exist_ok=True)
         _prepare_path(session.tmp_path, session.tmp_backup, session.ram_disk_path)
+        session.prepared_paths.add(session.tmp_path)
+        _write_state(session)
         if session.use_orthophotos:
             _prepare_path(
                 session.ortho_path,
                 session.ortho_backup,
                 session.ram_ortho_path,
             )
+            session.prepared_paths.add(session.ortho_path)
+            _write_state(session)
         _ACTIVE_SESSION = session
         UI.vprint(
             1,
@@ -768,7 +781,33 @@ def _cleanup_session(session):
     for path, target, backup, source in path_specs:
         if path == session.ortho_path and not session.use_orthophotos:
             continue
+        if path not in session.prepared_paths:
+            if os.path.islink(path) and not _expected_link(path, target):
+                raise RamDiskConflict(
+                    _ui_text(
+                        f"Path changed before RAM disk setup completed: {path}",
+                        f"RAMディスク設定完了前にパスが変更されました: {path}",
+                    )
+                )
+            if _expected_link(path, target) or _path_exists(backup):
+                session.prepared_paths.add(path)
+                _write_state(session)
+            else:
+                # The durable state may have been written just before this
+                # path was prepared. Leave an untouched normal/missing path
+                # alone and only detach the owned volume during recovery.
+                continue
         if path in session.restored_paths and _path_exists(path) and not os.path.islink(path):
+            continue
+        if (
+            path in session.restoring_paths
+            and _path_exists(path)
+            and not os.path.islink(path)
+            and not _path_exists(backup)
+        ):
+            session.restored_paths.add(path)
+            session.restoring_paths.discard(path)
+            _write_state(session)
             continue
         _ensure_owned_link_or_missing(path, target)
         destination = backup
@@ -798,6 +837,8 @@ def _cleanup_session(session):
         plans.append((path, target, backup, destination, staged))
 
     for path, target, backup, destination, staged in plans:
+        session.restoring_paths.add(path)
+        _write_state(session)
         if staged:
             _ensure_owned_link_or_missing(path, target)
             if os.path.islink(path):
@@ -808,6 +849,7 @@ def _cleanup_session(session):
         else:
             _restore_owned_path(path, backup, target, source_path=None)
         session.restored_paths.add(path)
+        session.restoring_paths.discard(path)
         _write_state(session)
 
     if active and not _detach_owned_session(session):
