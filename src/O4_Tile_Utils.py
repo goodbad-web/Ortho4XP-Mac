@@ -3084,16 +3084,22 @@ def _build_tile(tile, persist_config=True):
                         ),
                     )
                     gpu_backend_counts = {"metal": 0, "cpu": 0, "unknown": 0}
+                    gpu_route_failed = bool(server_failed)
+                    gpu_failure_items = len(batch_requests) if server_failed else 0
                     gpu_telemetry = {
                         "decode_ms": 0.0,
-                        "mask_ms": 0.0,
-                        "color_ms": 0.0,
+                        "mask_setup_ms": 0.0,
+                        "color_setup_ms": 0.0,
                         "preprocess_ms": 0.0,
                         "compression_ms": 0.0,
                         "readback_ms": 0.0,
                         "write_ms": 0.0,
                         "total_ms": 0.0,
                         "peak_rss_mb": 0.0,
+                    }
+                    gpu_telemetry_legacy_fields = {
+                        "mask_setup_ms": "mask_ms",
+                        "color_setup_ms": "color_ms",
                     }
                     if server_failed:
                         UI.vprint(
@@ -3115,6 +3121,8 @@ def _build_tile(tile, persist_config=True):
                                     "ERROR: Resident ASHelper DDS conversion failed: "
                                     + str(error),
                                 )
+                                gpu_route_failed = True
+                                gpu_failure_items += len(request_chunk)
                                 conversion_success = False
                                 break
                             server_results = server_response.get("results", [])
@@ -3123,16 +3131,30 @@ def _build_tile(tile, persist_config=True):
                                     1,
                                     "ERROR: Resident ASHelper returned an incomplete DDS batch.",
                                 )
+                                gpu_route_failed = True
+                                gpu_failure_items += len(request_chunk)
                                 conversion_success = False
                                 break
+                            chunk_failed_items = 0
                             for result in server_results:
+                                if not bool(result.get("ok", False)):
+                                    chunk_failed_items += 1
                                 backend = str(result.get("backend", "unknown"))
                                 if backend not in gpu_backend_counts:
                                     backend = "unknown"
                                 gpu_backend_counts[backend] += 1
                                 for field in gpu_telemetry:
                                     try:
-                                        value = float(result.get(field, 0.0) or 0.0)
+                                        legacy_field = gpu_telemetry_legacy_fields.get(
+                                            field, field
+                                        )
+                                        value = float(
+                                            result.get(
+                                                field,
+                                                result.get(legacy_field, 0.0),
+                                            )
+                                            or 0.0
+                                        )
                                         if field == "peak_rss_mb":
                                             gpu_telemetry[field] = max(
                                                 gpu_telemetry[field], value
@@ -3141,11 +3163,15 @@ def _build_tile(tile, persist_config=True):
                                             gpu_telemetry[field] += value
                                     except (TypeError, ValueError):
                                         pass
-                            if not server_response.get("ok", False):
+                            gpu_failure_items += chunk_failed_items
+                            if chunk_failed_items or not server_response.get("ok", False):
                                 UI.vprint(
                                     1,
                                     "ERROR: Resident ASHelper returned a failed DDS batch.",
                                 )
+                                gpu_route_failed = True
+                                if chunk_failed_items == 0:
+                                    gpu_failure_items += len(request_chunk)
                                 conversion_success = False
                                 break
                     else:
@@ -3161,11 +3187,13 @@ def _build_tile(tile, persist_config=True):
                                     check=False,
                                 )
                                 ret = batch_result.returncode
+                                summary_seen = False
                                 if batch_result.stdout:
                                     output_level = 0 if ret != 0 else 2
                                     for line in batch_result.stdout.splitlines():
                                         UI.vprint(output_level, "      " + line)
                                         if line.startswith("backend=dds "):
+                                            summary_seen = True
                                             fields = dict(
                                                 field.split("=", 1)
                                                 for field in line.split()
@@ -3180,10 +3208,18 @@ def _build_tile(tile, persist_config=True):
                                                 0,
                                                 int(fields.get("batch_tasks", 0)) - known_items,
                                             )
+                                            gpu_failure_items += int(fields.get("batch_failed", 0))
                                             for field in gpu_telemetry:
                                                 try:
+                                                    legacy_field = gpu_telemetry_legacy_fields.get(
+                                                        field, field
+                                                    )
                                                     value = float(
-                                                        fields.get(field, 0.0) or 0.0
+                                                        fields.get(
+                                                            field,
+                                                            fields.get(legacy_field, 0.0),
+                                                        )
+                                                        or 0.0
                                                     )
                                                     if field == "peak_rss_mb":
                                                         gpu_telemetry[field] = max(
@@ -3195,15 +3231,20 @@ def _build_tile(tile, persist_config=True):
                                                     pass
                                 if ret != 0:
                                     UI.vprint(1, f"ERROR: GPU Batch DDS conversion failed with return code {ret}")
+                                    gpu_route_failed = True
+                                    if not summary_seen:
+                                        gpu_failure_items += len(chunk) // 10
                                     conversion_success = False
                                     break
                             except Exception as e:
                                 UI.vprint(1, f"ERROR: Execution of GPU Batch DDS conversion failed: {str(e)}")
+                                gpu_route_failed = True
+                                gpu_failure_items += len(chunk) // 10
                                 conversion_success = False
                                 break
                     batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
                     if metrics is not None:
-                        if server_failed:
+                        if gpu_route_failed:
                             batch_backend = "failed"
                         elif server_used:
                             batch_backend = (
@@ -3236,7 +3277,7 @@ def _build_tile(tile, persist_config=True):
                         )
                         metrics.set_value(
                             "gpu_dds_worker_count",
-                            gpu_worker_count if server_used else (0 if server_failed else 8),
+                            gpu_worker_count if server_used and not gpu_route_failed else (0 if gpu_route_failed else 8),
                         )
                         metrics.set_value(
                             "gpu_dds_chunk_count",
@@ -3261,14 +3302,13 @@ def _build_tile(tile, persist_config=True):
                             )
                         metrics.increment(
                             "gpu_dds_failures",
-                            gpu_backend_counts["unknown"]
-                            + (len(batch_requests) if server_failed else 0),
+                            gpu_failure_items,
                         )
                         UI.vprint(
                             1,
                             "   GPU DDS summary: "
-                            f"backend={'resident' if server_used else ('failed' if server_failed else 'batch-v3')} "
-                            f"workers={gpu_worker_count if server_used else (0 if server_failed else 8)} "
+                            f"backend={'failed' if gpu_route_failed else ('resident' if server_used else 'batch-v3')} "
+                            f"workers={gpu_worker_count if server_used and not gpu_route_failed else (0 if gpu_route_failed else 8)} "
                             f"items={len(batch_requests)} "
                             f"metal={gpu_backend_counts['metal']} "
                             f"cpu_fallback={gpu_backend_counts['cpu']} "

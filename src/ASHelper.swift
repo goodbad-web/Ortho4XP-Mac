@@ -90,8 +90,12 @@ final class DDSConversionTelemetry {
     var decodeMs = 0.0
     var preprocessMs = 0.0
     var compressionMs = 0.0
-    var maskMs = 0.0
-    var colorMs = 0.0
+    // Core Image evaluates filter graphs when the destination is rendered,
+    // not while CIFilter outputImage is assembled.  Keep these setup-only
+    // timings distinct from compression_ms, which includes the deferred
+    // render and therefore the actual mask/color GPU work.
+    var maskSetupMs = 0.0
+    var colorSetupMs = 0.0
     var readbackMs = 0.0
     var writeMs = 0.0
     var totalMs = 0.0
@@ -1691,7 +1695,7 @@ func convertCGImageWithPreprocess(
             return false
         }
         finalCI = blended
-        telemetry?.maskMs = (CFAbsoluteTimeGetCurrent() - maskStarted) * 1000.0
+        telemetry?.maskSetupMs = (CFAbsoluteTimeGetCurrent() - maskStarted) * 1000.0
     }
     
     // 2. Color Balance (RGB Multiply)
@@ -1719,7 +1723,7 @@ func convertCGImageWithPreprocess(
             finalCI = controlled
         }
     }
-    telemetry?.colorMs = (CFAbsoluteTimeGetCurrent() - colorStarted) * 1000.0
+    telemetry?.colorSetupMs = (CFAbsoluteTimeGetCurrent() - colorStarted) * 1000.0
     
     telemetry?.preprocessMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
 
@@ -4613,8 +4617,11 @@ private func serverConvertBatch(_ request: [String: Any]) -> [[String: Any]] {
                     error: ok ? nil : "conversion_failed",
                     extra: [
                     "decode_ms": telemetry.decodeMs,
-                    "mask_ms": telemetry.maskMs,
-                    "color_ms": telemetry.colorMs,
+                    "mask_setup_ms": telemetry.maskSetupMs,
+                    "color_setup_ms": telemetry.colorSetupMs,
+                    // Compatibility aliases; see DDSConversionTelemetry.
+                    "mask_ms": telemetry.maskSetupMs,
+                    "color_ms": telemetry.colorSetupMs,
                     "preprocess_ms": telemetry.preprocessMs,
                     "compression_ms": telemetry.compressionMs,
                     "readback_ms": telemetry.readbackMs,
@@ -5030,8 +5037,8 @@ else if args[1] == "--convert-batch-v3" {
     var cpuCount = 0
     var failedCount = 0
     var decodeMs = 0.0
-    var maskMs = 0.0
-    var colorMs = 0.0
+    var maskSetupMs = 0.0
+    var colorSetupMs = 0.0
     var preprocessMs = 0.0
     var compressionMs = 0.0
     var readbackMs = 0.0
@@ -5065,8 +5072,8 @@ else if args[1] == "--convert-batch-v3" {
         }
         if !ok { failedCount += 1 }
         decodeMs += telemetry.decodeMs
-        maskMs += telemetry.maskMs
-        colorMs += telemetry.colorMs
+        maskSetupMs += telemetry.maskSetupMs
+        colorSetupMs += telemetry.colorSetupMs
         preprocessMs += telemetry.preprocessMs
         compressionMs += telemetry.compressionMs
         readbackMs += telemetry.readbackMs
@@ -5092,8 +5099,10 @@ else if args[1] == "--convert-batch-v3" {
             + "batch_failed=\(failedCount) metal_items=\(metalCount) "
             + "cpu_fallback_items=\(cpuCount) concurrency=\(concurrencyLimit) "
             + "decode_ms=\(String(format: "%.2f", decodeMs)) "
-            + "mask_ms=\(String(format: "%.2f", maskMs)) "
-            + "color_ms=\(String(format: "%.2f", colorMs)) "
+            + "mask_setup_ms=\(String(format: "%.2f", maskSetupMs)) "
+            + "color_setup_ms=\(String(format: "%.2f", colorSetupMs)) "
+            + "mask_ms=\(String(format: "%.2f", maskSetupMs)) "
+            + "color_ms=\(String(format: "%.2f", colorSetupMs)) "
             + "preprocess_ms=\(String(format: "%.2f", preprocessMs)) "
             + "compression_ms=\(String(format: "%.2f", compressionMs)) "
             + "readback_ms=\(String(format: "%.2f", readbackMs)) "
