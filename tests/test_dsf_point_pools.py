@@ -104,6 +104,25 @@ def test_precomputed_triangle_uv_matches_scalar_reference():
             assert actual[triangle_index, vertex_index, 1] == round(t * 65535)
 
 
+def test_precomputed_triangle_uv_supports_zoomlevels_below_five():
+    coords = _node_coords(
+        np.array([133.1, 133.2, 133.3]),
+        np.array([34.1, 34.2, 34.3]),
+    )
+    oriented_nodes = np.array([[0, 2, 1]], dtype=np.uint32)
+    attributes = [(0, 0, 4, "BI")]
+
+    actual = DSF._precompute_triangle_uvs(coords, oriented_nodes, attributes)
+    for vertex_index, node in enumerate(oriented_nodes[0]):
+        s, t = DSF.numpy_st_coord(
+            coords[5 * node + 1],
+            coords[5 * node],
+            *attributes[0][:3],
+        )
+        assert actual[0, vertex_index, 0] == round(s * 65535)
+        assert actual[0, vertex_index, 1] == round(t * 65535)
+
+
 def test_texture_requirements_are_planned_once_per_attribute(tmp_path, monkeypatch):
     tile = SimpleNamespace(
         build_dir=str(tmp_path),

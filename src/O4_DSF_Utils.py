@@ -156,7 +156,7 @@ def _validate_mesh_orthogrid_indices(til_xs, til_ys, bounds):
 def numpy_st_coord(lat, lon, tex_x, tex_y, zoomlevel):
     ratio_x = lon / 180
     ratio_y = numpy.log(numpy.tan((90 + lat) * numpy.pi / 360)) / numpy.pi
-    mult = 2 ** (zoomlevel - 5)
+    mult = 2.0 ** (zoomlevel - 5)
     s = (ratio_x + 1) * mult - (tex_x // 16)
     t = 1 - ((1 - ratio_y) * mult - tex_y // 16)
     s = numpy.clip(s, 0, 1)
