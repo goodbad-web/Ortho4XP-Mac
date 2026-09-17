@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from collections import defaultdict
 import struct
 import hashlib
+import time
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Mask_Utils as MASK
@@ -161,6 +162,183 @@ def numpy_st_coord(lat, lon, tex_x, tex_y, zoomlevel):
     s = numpy.clip(s, 0, 1)
     t = numpy.clip(t, 0, 1)
     return s, t
+
+
+def _integer_point_codes(node_coords, tile_lon, tile_lat):
+    """Return the 24-bit tile-relative coordinates used by DSF pools."""
+    xs = numpy.asarray(node_coords[0::5], dtype=numpy.float64) - tile_lon
+    ys = numpy.asarray(node_coords[1::5], dtype=numpy.float64) - tile_lat
+    scale = 1 << 24
+
+    def encode(values):
+        scaled = numpy.trunc(values * scale).astype(numpy.int64)
+        return numpy.where(values >= 1, scale - 1, scaled).astype(numpy.uint32)
+
+    return encode(xs), encode(ys)
+
+
+def _build_integer_point_pools(
+    x_codes,
+    y_codes,
+    bucket_size,
+    init_level=quad_init_level,
+):
+    """Build the DSF point partition without binary-string dictionaries.
+
+    The initial cells and child order are deterministic.  A cell is split
+    only when it exceeds the same capacity used by ``QuadTree``.
+    """
+    x_codes = numpy.asarray(x_codes, dtype=numpy.uint32)
+    y_codes = numpy.asarray(y_codes, dtype=numpy.uint32)
+    if x_codes.shape != y_codes.shape:
+        raise ValueError("point coordinate arrays must have the same shape")
+    if bucket_size <= 0:
+        raise ValueError("bucket_size must be positive")
+
+    node_count = x_codes.size
+    pool_id_by_node = numpy.empty(node_count, dtype=numpy.int32)
+    pool_nodes = []
+    pool_prefixes = []
+    init_shift = 24 - init_level
+    root_x = x_codes >> init_shift
+    root_y = y_codes >> init_shift
+    root_keys = sorted(set(zip(root_x.tolist(), root_y.tolist())))
+
+    for root_prefix_x, root_prefix_y in root_keys:
+        root_indices = numpy.flatnonzero(
+            (root_x == root_prefix_x) & (root_y == root_prefix_y)
+        ).astype(numpy.int32, copy=False)
+        pending = [(init_level, root_prefix_x, root_prefix_y, root_indices)]
+        while pending:
+            level, prefix_x, prefix_y, indices = pending.pop()
+            if indices.size <= bucket_size:
+                pool_id = len(pool_nodes)
+                ordered = numpy.sort(indices)
+                pool_nodes.append(ordered)
+                pool_prefixes.append((level, int(prefix_x), int(prefix_y)))
+                pool_id_by_node[ordered] = pool_id
+                continue
+
+            if level >= 24:
+                raise ValueError(
+                    "cannot split a DSF point pool beyond the 24-bit coordinate"
+                )
+            child_level = level + 1
+            child_shift = 24 - child_level
+            child_x = ((x_codes[indices] >> child_shift) & 1).astype(numpy.uint32)
+            child_y = ((y_codes[indices] >> child_shift) & 1).astype(numpy.uint32)
+            children = []
+            for bit_x, bit_y in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                child_indices = indices[(child_x == bit_x) & (child_y == bit_y)]
+                if child_indices.size:
+                    children.append(
+                        (
+                            child_level,
+                            (int(prefix_x) << 1) | bit_x,
+                            (int(prefix_y) << 1) | bit_y,
+                            child_indices,
+                        )
+                    )
+            pending.extend(reversed(children))
+
+    return pool_id_by_node, tuple(pool_nodes), tuple(pool_prefixes)
+
+
+def _pool_local_coordinates(codes, level):
+    """Extract the same 16-bit slice as ``bits[level:level + 16]``."""
+    codes = numpy.asarray(codes, dtype=numpy.uint32)
+    width = min(16, max(0, 24 - level))
+    if width == 0:
+        return numpy.zeros(codes.shape, dtype=numpy.uint16)
+    shift = max(0, 24 - (level + 16))
+    mask = (1 << width) - 1
+    return ((codes >> shift) & mask).astype(numpy.uint16)
+
+
+def _precompute_triangle_uvs(node_coords, oriented_tri_nodes, tri_tex_attr):
+    """Return rounded uint16 UV pairs for the oriented triangle vertices."""
+    oriented_tri_nodes = numpy.asarray(oriented_tri_nodes, dtype=numpy.intp)
+    attributes = tuple(tri_tex_attr)
+    tex_x = numpy.asarray([attribute[0] for attribute in attributes])
+    tex_y = numpy.asarray([attribute[1] for attribute in attributes])
+    zoomlevel = numpy.asarray([attribute[2] for attribute in attributes])
+    lons = numpy.asarray(node_coords[0::5])
+    lats = numpy.asarray(node_coords[1::5])
+    vertex_lons = lons[oriented_tri_nodes]
+    vertex_lats = lats[oriented_tri_nodes]
+    s, t = numpy_st_coord(
+        vertex_lats,
+        vertex_lons,
+        tex_x[:, numpy.newaxis],
+        tex_y[:, numpy.newaxis],
+        zoomlevel[:, numpy.newaxis],
+    )
+    uv = numpy.empty(oriented_tri_nodes.shape + (2,), dtype=numpy.uint16)
+    uv[..., 0] = numpy.rint(numpy.clip(s, 0, 1) * 65535).astype(numpy.uint16)
+    uv[..., 1] = numpy.rint(numpy.clip(t, 0, 1) * 65535).astype(numpy.uint16)
+    return uv
+
+
+def _plan_texture_requirements(tile, tri_tex_attr, tri_types):
+    """Compute texture and mask decisions once per texture attribute."""
+    flags = {}
+    for attributes, tri_type in zip(tri_tex_attr, tri_types):
+        state = flags.setdefault(
+            attributes,
+            {"has_water": False, "has_non_water": False},
+        )
+        if int(tri_type) == 2:
+            state["has_water"] = True
+        else:
+            state["has_non_water"] = True
+
+    plans = {}
+    for attributes, state in flags.items():
+        needs_mask = state["has_water"] or getattr(
+            tile, "imprint_masks_to_dds", False
+        )
+        mask_im = MASK.needs_mask(tile, *attributes) if needs_mask else False
+        mask_present = bool(mask_im)
+        mask_alpha = _masked_dds_requires_alpha(tile, mask_im)
+        texture_file_name = FNAMES.dds_file_name_from_attributes(*attributes)
+        needs_texture = state["has_non_water"] or mask_present
+        rebuild = False
+        if needs_texture:
+            target_tex = os.path.join(tile.build_dir, "textures", texture_file_name)
+            rebuild = not os.path.isfile(target_tex)
+        if needs_texture and not rebuild:
+            rebuild = not _texture_contract_matches(
+                tile,
+                attributes,
+                has_alpha=mask_alpha,
+            )
+        if needs_texture and mask_present:
+            target_mask = MASK.mask_name_for_texture(tile, *attributes)
+            if os.path.isfile(target_mask) and os.path.isfile(target_tex):
+                rebuild = rebuild or (
+                    os.path.getmtime(target_tex) < os.path.getmtime(target_mask)
+                )
+        if state["has_water"]:
+            mask_target = os.path.join(
+                tile.build_dir,
+                "textures",
+                FNAMES.mask_file(*attributes),
+            )
+            if mask_present:
+                if rebuild or not getattr(tile, "imprint_masks_to_dds", False):
+                    mask_im.save(mask_target)
+            else:
+                try:
+                    os.remove(mask_target)
+                except OSError:
+                    pass
+        plans[attributes] = {
+            "mask_present": mask_present,
+            "mask_alpha": mask_alpha,
+            "texture_file_name": texture_file_name,
+            "rebuild": rebuild,
+        }
+    return plans
 
 
 ################################################################################
@@ -726,6 +904,8 @@ def _build_dsf(tile, download_queue):
                             nbr_nodes, node_coords, node_types, tile)
     
     UI.vprint(1, "-> Computing point pools and texture requirements")
+    dsf_timings = {}
+    phase_started = time.perf_counter()
     
     # 5.1 Vectorized triangle attributes
     lons = node_coords[0::5]
@@ -761,57 +941,59 @@ def _build_dsf(tile, download_queue):
     idx_xs = til_xs - til_x_min
     idx_ys = til_ys - til_y_min
     tri_tex_attr = customzl_arr[idx_xs, idx_ys].tolist()
+    dsf_timings["triangle_attributes_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
     
-    # 5 Compute quadtree
+    # 5 Compute point pools using integer coordinates.
     if (tile.use_masks_for_inland):
         quad_capacity = quad_capacity_low
     else:
         quad_capacity = quad_capacity_high
-    pool_quadtree = QuadTree(quad_init_level, quad_capacity)
-    
-    # 5.1 NumPy batch slice and vectorized float2qquad format for high speedup
-    xs = node_coords[0::5] - tile.lon
-    ys = node_coords[1::5] - tile.lat
-    bx_list = [f"{int(16777216 * x):024b}" if x < 1 else "111111111111111111111111" for x in xs]
-    by_list = [f"{int(16777216 * y):024b}" if y < 1 else "111111111111111111111111" for y in ys]
-    
-    # Cache insert method locally to bypass name lookup inside loop
-    insert_method = pool_quadtree.insert
-    for i in range(nbr_nodes):
-        insert_method(bx_list[i], by_list[i], quad_init_level)
-        
-    pool_quadtree.clean()
-    pool_quadtree.statistics()
-    
+    phase_started = time.perf_counter()
+    x_codes, y_codes = _integer_point_codes(node_coords, tile.lon, tile.lat)
+    (
+        idx_node_to_idx_pool,
+        pool_nodes,
+        pool_prefixes,
+    ) = _build_integer_point_pools(
+        x_codes,
+        y_codes,
+        quad_capacity,
+        quad_init_level,
+    )
+    pool_sizes = numpy.asarray([nodes.size for nodes in pool_nodes], dtype=numpy.int32)
+    pool_levels = numpy.asarray(
+        [prefix[0] for prefix in pool_prefixes], dtype=numpy.int16
+    )
+    UI.vprint(2, "     Number of buckets:", len(pool_sizes))
+    UI.vprint(
+        2,
+        "     Average depth:",
+        pool_levels.mean() if pool_levels.size else 0,
+        ", Average bucket size:",
+        pool_sizes.mean() if pool_sizes.size else 0,
+    )
+    UI.vprint(
+        2,
+        "     Largest depth:",
+        int(pool_levels.max()) if pool_levels.size else 0,
+    )
+    dsf_timings["point_pools_ms"] = (time.perf_counter() - phase_started) * 1000.0
+
     # 6 Compute pool params
-    pool_nbr = len(pool_quadtree)
-    idx_node_to_idx_pool = {}
-    idx_pool = 0
-    key_to_idx_pool = {}
-    for key in pool_quadtree:
-        key_to_idx_pool[key] = idx_pool
-        for idx_node in pool_quadtree[key]["idx_nodes"]:
-            idx_node_to_idx_pool[idx_node] = idx_pool
-        idx_pool += 1
+    phase_started = time.perf_counter()
+    pool_nbr = len(pool_nodes)
     pool_param = {}
     node_icoords = numpy.zeros(5 * nbr_nodes, dtype = numpy.uint16)
-    nodes = pool_quadtree.nodes
-    for key in pool_quadtree:
-        level = len(key[0])
-        plist = sorted(list(pool_quadtree[key]["idx_nodes"]))
-        plist_arr = numpy.array(plist, dtype=numpy.int32)
+    for idx_pool, (plist_arr, prefix) in enumerate(zip(pool_nodes, pool_prefixes)):
+        level, prefix_x, prefix_y = prefix
         idx_0 = 5 * plist_arr
         idx_1 = idx_0 + 1
         idx_2 = idx_0 + 2
-        
-        node_icoords[idx_0] = [
-            int(nodes[idx_node][0][level : level + 16], 2)
-            for idx_node in plist
-        ]
-        node_icoords[idx_1] = [
-            int(nodes[idx_node][1][level : level + 16], 2)
-            for idx_node in plist
-        ]
+
+        node_icoords[idx_0] = _pool_local_coordinates(x_codes[plist_arr], level)
+        node_icoords[idx_1] = _pool_local_coordinates(y_codes[plist_arr], level)
         altitudes = node_coords[idx_2]
         altmin = floor(altitudes.min())
         altmax = ceil(altitudes.max())
@@ -831,11 +1013,11 @@ def _build_dsf(tile, download_queue):
         node_icoords[idx_2] = numpy.round(
             (altitudes - altmin) * inv_stp
         )
-        pool_param[key_to_idx_pool[key]] = (
+        pool_param[idx_pool] = (
             scal_x,
-            tile.lon + int(key[0], 2) * scal_x,
+            tile.lon + prefix_x * scal_x,
             scal_y,
-            tile.lat + int(key[1], 2) * scal_y,
+            tile.lat + prefix_y * scal_y,
             scale_z,
             altmin,
             2,
@@ -858,6 +1040,26 @@ def _build_dsf(tile, download_queue):
         (1 - tile.normal_map_strength * node_coords[4::5]) / 2 * 65535
     )
     node_icoords = array.array("H", node_icoords)
+    dsf_timings["pool_parameters_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
+
+    phase_started = time.perf_counter()
+    oriented_tri_nodes = tri_idx_reshaped[:, (0, 2, 1)]
+    tri_pool_ids = idx_node_to_idx_pool[oriented_tri_nodes]
+    triangle_uv = _precompute_triangle_uvs(
+        node_coords,
+        oriented_tri_nodes,
+        tri_tex_attr,
+    )
+    texture_requirements = _plan_texture_requirements(
+        tile,
+        tri_tex_attr,
+        tri_types,
+    )
+    dsf_timings["texture_plan_and_uv_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
 
     
     
@@ -865,7 +1067,6 @@ def _build_dsf(tile, download_queue):
     dico_terrains = {}
     overlay_terrains = set()
     treated_textures = set()
-    skipped_terrains_for_masking = set()
     dsf_pools = {}
     # we need more pools for textured nodes than for nodes : land, UV masked
     # water, and XP water
@@ -914,15 +1115,9 @@ def _build_dsf(tile, download_queue):
     # as well), point pools, etc.
 
     # Cache functions and variables locally to reduce dot resolution overhead
-    _dds_file_name_from_attributes = FNAMES.dds_file_name_from_attributes
-    _mask_file = FNAMES.mask_file
-    _needs_mask = MASK.needs_mask
-    _mask_name_for_texture = MASK.mask_name_for_texture
     _set_depth_ratio = BATHY.set_depth_ratio
-    _numpy_st_coord = numpy_st_coord
     _progress_bar = UI.progress_bar
     _vprint = UI.vprint
-    _build_dir = tile.build_dir
     _water_tech = tile.water_tech
     _imprint_masks_to_dds = tile.imprint_masks_to_dds
     _normal_map_strength = tile.normal_map_strength
@@ -931,6 +1126,7 @@ def _build_dsf(tile, download_queue):
     
     # Tri counter for progress_bars
     done = 0
+    phase_started = time.perf_counter()
 
     
     # First potentially masked water tris
@@ -956,26 +1152,10 @@ def _build_dsf(tile, download_queue):
             terrain_idx = dico_terrains[terrain_attributes]
             is_overlay = terrain_idx in overlay_terrains
         else:
-            needs_new_terrain = False
-            # if not we need to check with masks values
-            if terrain_attributes not in skipped_terrains_for_masking:
-                mask_im = _needs_mask(tile, *texture_attributes)
-                if mask_im:
-                    _vprint(2, "      Use of an alpha mask.")
-                    needs_new_terrain = True
-                else:
-                    skipped_terrains_for_masking.add(terrain_attributes)
-                    # clean up potential old masks in the tile dir
-                    try:
-                        os.remove(
-                            os.path.join(
-                                _build_dir,
-                                "textures",
-                                _mask_file(*texture_attributes),
-                            )
-                        )
-                    except:
-                        pass
+            texture_plan = texture_requirements[texture_attributes]
+            needs_new_terrain = texture_plan["mask_present"]
+            if needs_new_terrain:
+                _vprint(2, "      Use of an alpha mask.")
             if needs_new_terrain:
                 terrain_idx = len(dico_terrains)
                 textured_tris[terrain_idx] = defaultdict(
@@ -992,42 +1172,10 @@ def _build_dsf(tile, download_queue):
                 if is_overlay:
                     overlay_terrains.add(terrain_idx)
                 
-                texture_file_name = _dds_file_name_from_attributes(
-                    *texture_attributes
-                )
+                texture_file_name = texture_plan["texture_file_name"]
                 # do we need to (re)build a texture ?
                 if texture_attributes not in treated_textures:
-                    target_tex = os.path.join(
-                        _build_dir, "textures", texture_file_name
-                    )
-                    rebuild = False
-                    if not os.path.isfile(target_tex):
-                        rebuild = True
-                    else:
-                        rebuild = not _texture_contract_matches(
-                            tile,
-                            texture_attributes,
-                            has_alpha=_masked_dds_requires_alpha(tile, mask_im),
-                        )
-                        # Maybe masks were updated after target_tex was created.
-                        target_mask = _mask_name_for_texture(
-                            tile, *texture_attributes
-                        )
-                        if os.path.isfile(target_mask):
-                            mask_last_modified = os.path.getmtime(target_mask)
-                            tex_last_modified = os.path.getmtime(target_tex)
-                            if tex_last_modified < mask_last_modified:
-                                rebuild = True
-
-                    if rebuild or not _imprint_masks_to_dds:
-                        mask_im.save(
-                            os.path.join(
-                                _build_dir,
-                                "textures",
-                                _mask_file(*texture_attributes),
-                            )
-                        )
-
+                    rebuild = texture_plan["rebuild"]
                     if rebuild:
                         download_queue.put(texture_attributes)
                     else:
@@ -1053,8 +1201,9 @@ def _build_dsf(tile, download_queue):
         # First the ones associated to the dico_customzl
         if terrain_idx:
             tri_p = array.array("H")
-            for n in (n1, n3, n2):  # beware of ordering for orientation !
-                idx_pool = idx_node_to_idx_pool[n]
+            for vertex_pos, n in enumerate(oriented_tri_nodes[tri]):
+                n = int(n)
+                idx_pool = int(tri_pool_ids[tri, vertex_pos])
                 node_hash = (
                     idx_pool,
                     *node_icoords[5 * n : 5 * n + 2],
@@ -1063,11 +1212,7 @@ def _build_dsf(tile, download_queue):
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    (s, t) = _numpy_st_coord(
-                        node_coords[5 * n + 1],
-                        node_coords[5 * n],
-                        *texture_attributes[:3]
-                    )
+                    uv_s, uv_t = triangle_uv[tri, vertex_pos]
                     # BEWARE : normal coordinates are pointing (EAST,SOUTH)
                     # in X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
                     if is_overlay: 
@@ -1078,10 +1223,10 @@ def _build_dsf(tile, download_queue):
                         )
                         dsf_pools[idx_dsfpool].extend(
                             (
-                                int(round(s * 65535)),
-                                int(round(t * 65535)),
-                                int(round(s * 65535)),
-                                int(round(t * 65535)),
+                                int(uv_s),
+                                int(uv_t),
+                                int(uv_s),
+                                int(uv_t),
                             )
                         )
                     else:  # dtx5 dds with mask included
@@ -1097,8 +1242,8 @@ def _build_dsf(tile, download_queue):
                             ratio_bathy = 0
                             ratio_fetch = 0
                         dsf_pools[idx_dsfpool].extend(
-                            (int(65535 * ratio_fetch), int(65535 * ratio_bathy), 
-                             int(round(s * 65535)), int(round(t * 65535)))
+                            (int(65535 * ratio_fetch), int(65535 * ratio_bathy),
+                             int(uv_s), int(uv_t))
                         )
                     len_textured_nodes += 1
                     pos_in_pool = dsf_pool_length[idx_dsfpool]
@@ -1123,12 +1268,13 @@ def _build_dsf(tile, download_queue):
         # X-Plane water
         if (not terrain_idx) or is_overlay: 
             tri_p = array.array("H")
-            for n in (n1, n3, n2):  # beware of ordering for orientation !
+            for vertex_pos, n in enumerate(oriented_tri_nodes[tri]):
+                n = int(n)
                 node_hash = (n, 0)
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    idx_dsfpool = idx_node_to_idx_pool[n] + 2 * pool_nbr
+                    idx_dsfpool = int(tri_pool_ids[tri, vertex_pos]) + 2 * pool_nbr
                     len_textured_nodes += 1
                     pos_in_pool = dsf_pool_length[idx_dsfpool]
                     textured_nodes[node_hash] = [idx_dsfpool, pos_in_pool]
@@ -1185,25 +1331,11 @@ def _build_dsf(tile, download_queue):
             is_overlay = tri_type == 1
             if is_overlay:
                 overlay_terrains.add(terrain_idx)
-            texture_file_name = _dds_file_name_from_attributes(
-                *texture_attributes
-            )
+            texture_plan = texture_requirements[texture_attributes]
+            texture_file_name = texture_plan["texture_file_name"]
             # do we need to download a new texture ?
             if texture_attributes not in treated_textures:
-                target_tex = os.path.join(
-                            _build_dir, "textures", texture_file_name
-                            )
-                rebuild = False
-                if (not os.path.isfile(target_tex)):
-                    rebuild = True
-                elif not _texture_contract_matches(
-                    tile,
-                    texture_attributes,
-                    has_alpha=_texture_contract_has_alpha(
-                        tile, texture_attributes
-                    ),
-                ):
-                    rebuild = True
+                rebuild = texture_plan["rebuild"]
                 if (rebuild):
                     download_queue.put(texture_attributes)
                 else:
@@ -1225,8 +1357,9 @@ def _build_dsf(tile, download_queue):
         # We put the tri in the right terrain
         # First the ones associated to the dico_customzl
         tri_p = array.array("H")
-        for n in (n1, n3, n2):  # beware of ordering for orientation !
-            idx_pool = idx_node_to_idx_pool[n]
+        for vertex_pos, n in enumerate(oriented_tri_nodes[tri]):
+            n = int(n)
+            idx_pool = int(tri_pool_ids[tri, vertex_pos])
             node_hash = (
                 idx_pool,
                 *node_icoords[5 * n : 5 * n + 2],
@@ -1235,11 +1368,7 @@ def _build_dsf(tile, download_queue):
             if node_hash in textured_nodes:
                 (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
             else:
-                (s, t) = _numpy_st_coord(
-                    node_coords[5 * n + 1],
-                    node_coords[5 * n],
-                    *texture_attributes[:3]
-                )
+                uv_s, uv_t = triangle_uv[tri, vertex_pos]
                 # BEWARE : normal coordinates are pointing (EAST,SOUTH) in 
                 # X-Plane, not (EAST,NORTH) ! (cfr DSF specs), so v -> -v
                 if not tri_type:  # land
@@ -1248,7 +1377,7 @@ def _build_dsf(tile, download_queue):
                         node_icoords[5 * n : 5 * n + 5]
                     )
                     dsf_pools[idx_dsfpool].extend(
-                        (int(round(s * 65535)), int(round(t * 65535)))
+                        (int(uv_s), int(uv_t))
                     )
                 else:  # inland water
                     idx_dsfpool = idx_pool + pool_nbr
@@ -1260,8 +1389,8 @@ def _build_dsf(tile, download_queue):
                         (
                             32768,
                             32768,
-                            int(round(s * 65535)),
-                            int(round(t * 65535)),
+                            int(uv_s),
+                            int(uv_t),
                             0,
                             int(round(tile.ratio_water * 65535)),
                         )
@@ -1290,12 +1419,13 @@ def _build_dsf(tile, download_queue):
         # XP water
         if is_overlay: 
             tri_p = array.array("H")
-            for n in (n1, n3, n2):  # beware of ordering for orientation !
+            for vertex_pos, n in enumerate(oriented_tri_nodes[tri]):
+                n = int(n)
                 node_hash = (n, 0)
                 if node_hash in textured_nodes:
                     (idx_dsfpool, pos_in_pool) = textured_nodes[node_hash]
                 else:
-                    idx_dsfpool = idx_node_to_idx_pool[n] + 2 * pool_nbr
+                    idx_dsfpool = int(tri_pool_ids[tri, vertex_pos]) + 2 * pool_nbr
                     len_textured_nodes += 1
                     pos_in_pool = dsf_pool_length[idx_dsfpool]
                     textured_nodes[node_hash] = [idx_dsfpool, pos_in_pool]
@@ -1323,6 +1453,9 @@ def _build_dsf(tile, download_queue):
                 textured_tris[0]["cross-pool"].extend(tri_p)
     
     download_queue.put("quit")
+    dsf_timings["triangle_processing_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
 
     dsf_metrics = DSF_BUDGET.summarize_dsf_pools(
         len_textured_nodes,
@@ -1346,6 +1479,7 @@ def _build_dsf(tile, download_queue):
     dsf_metrics["budget"] = dsf_budget
     dsf_metrics["budget_exceeded"] = dsf_metrics["point_count"] > dsf_budget
 
+    encoding_started = time.perf_counter()
     UI.vprint(1, "-> Encoding of the DSF file")
     UI.vprint(1, "     Final DSF point instances: " + str(dsf_metrics["point_count"]))
     UI.vprint(
@@ -1644,6 +1778,11 @@ def _build_dsf(tile, download_queue):
         "bytes",
         "(" + UI.human_print(size_of_dsf) + ")",
     )
+    dsf_timings["encoding_ms"] = (time.perf_counter() - encoding_started) * 1000.0
+    dsf_metrics["timings_ms"] = dsf_timings
+    performance_metrics = getattr(tile, "_performance_metrics", None)
+    if performance_metrics is not None:
+        performance_metrics.set_value("dsf_timings_ms", dsf_timings)
     tile.last_dsf_metrics = dsf_metrics
     return 1
 
