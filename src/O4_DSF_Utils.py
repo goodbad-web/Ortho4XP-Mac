@@ -517,17 +517,21 @@ def create_terrain_file(
 ################################################################################
 def extract_elevation_and_bathymetry_data(lat, lon):
     UI.vprint(1, "     Extracting some rasters from X-Plane's Global Scenery")
+    effective_config = getattr(UI, "active_effective_config", {})
+    effective_overlay_src = effective_config.get(
+        "custom_overlay_src", OVL.custom_overlay_src
+    )
     global_scenery_dsf = FNAMES.resolve_global_scenery_dsf(
-        OVL.custom_overlay_src, lat, lon
+        effective_overlay_src, lat, lon
     )
     if global_scenery_dsf is None:
         scenery_candidates = FNAMES.global_scenery_dsf_candidates(
-            OVL.custom_overlay_src, lat, lon
+            effective_overlay_src, lat, lon
         )
         if not scenery_candidates:
             UI.exit_message_and_bottom_line(
                 "   ERROR: Global Scenery DSF was not found below ",
-                OVL.custom_overlay_src or "(empty path)",
+                effective_overlay_src or "(empty path)",
                 ". Expected Earth nav data/" + FNAMES.long_latlon(lat, lon) + ".dsf.",
             )
         else:
@@ -937,7 +941,7 @@ def _build_dsf(tile, download_queue):
         (n1, n2, n3) = tri_idx[3 * tri: 3 * tri + 3]
         if done % step == 0:
             _progress_bar(1, int(done / step * 0.9))
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
@@ -1161,7 +1165,7 @@ def _build_dsf(tile, download_queue):
         
         if done % step == 0:
             _progress_bar(1, int(done / step * 0.9))
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 _vprint(1, "DSF construction interrupted.")
                 return 0
         done += 1
@@ -1489,7 +1493,7 @@ def _build_dsf(tile, download_queue):
             f.write(struct.pack("<f", pool_param[k % pool_nbr][l]))
 
     UI.progress_bar(1, 95)
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.vprint(1, "DSF construction interrupted.")
         f.close()
         return 0
@@ -1606,7 +1610,7 @@ def _build_dsf(tile, download_queue):
         f.write(bDEMS)
 
     UI.progress_bar(1, 98)
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.vprint(1, "DSF construction interrupted.")
         f.close()
         return 0

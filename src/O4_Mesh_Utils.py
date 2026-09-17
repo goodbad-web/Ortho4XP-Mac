@@ -454,7 +454,7 @@ def extract_mesh_to_obj(
         ]
     for i in range(0, 2):  # skip 2 lines
         f_mesh.readline()
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
     UI.vprint(1, "    Reading triangles...")
@@ -506,7 +506,7 @@ def extract_mesh_to_obj(
             len_dico_new_tri += 1
     nbr_vert = len_textured_nodes
     nbr_tri = len_dico_new_tri
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
     UI.vprint(1, "    Writing the obj file.")
@@ -611,7 +611,8 @@ def _build_mesh(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
-    UI.red_flag = False
+    if not UI.is_building_all and UI.active_cancel_event is None:
+        UI.red_flag = False
     VECT.scalx = cos((tile.lat + 0.5) * pi / 180)
     UI.logprint(
         "Step 2 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
@@ -810,13 +811,13 @@ def _build_mesh(tile):
             )
             return 0
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
     vertices, tri_rows = post_process_nodes_altitudes(tile)
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 

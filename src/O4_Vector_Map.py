@@ -52,7 +52,8 @@ def _build_poly_file(tile):
     if UI.is_working:
         return 0
     UI.is_working = 1
-    UI.red_flag = 0
+    if not UI.is_building_all and UI.active_cancel_event is None:
+        UI.red_flag = 0
     tile.osm_degraded_layers = set()
     tile.osm_failures = []
     tile.osm_failure_action = None
@@ -81,7 +82,7 @@ def _build_poly_file(tile):
     poly_file = FNAMES.input_poly_file(tile)
     vector_map = VECT.Vector_Map()
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -95,7 +96,7 @@ def _build_poly_file(tile):
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -109,7 +110,7 @@ def _build_poly_file(tile):
             1, "   Number of edges at this point:", len(vector_map.dico_edges)
         )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -121,7 +122,7 @@ def _build_poly_file(tile):
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -133,7 +134,7 @@ def _build_poly_file(tile):
         1, "   Number of edges at this point:", len(vector_map.dico_edges)
     )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -174,7 +175,7 @@ def _build_poly_file(tile):
         ortho_network, tile.dem.alt_vec, "DUMMY", check=True, skip_cut=True
     )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
 
@@ -201,7 +202,7 @@ def _build_poly_file(tile):
         gluing_network, tile.dem.alt_vec, "DUMMY", check=True, skip_cut=True
     )
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
     UI.vprint(0, "-> Transcription to the files ", poly_file, "and .node")
@@ -398,7 +399,7 @@ def include_roads(vector_map, tile, apt_array, apt_area):
         if small_roads_result != OSM.OSM_COMPLETE:
             return small_roads_result
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return 0
     UI.vprint(1, "    * Checking which large roads need levelling.")
     (road_network_banked, road_network_flat) = OSM.OSM_to_MultiLineString(
@@ -408,7 +409,7 @@ def include_roads(vector_map, tile, apt_array, apt_area):
         tags_for_exclusion,
         road_is_too_much_banked,
     )
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return 0
     if small_road_layer is not None:
         road_layer = small_road_layer
@@ -440,13 +441,13 @@ def include_roads(vector_map, tile, apt_array, apt_area):
             show_progress=True,
         )
         UI.vprint(3, "Time for improved buffering:", time.time() - timer)
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             return 0
         UI.vprint(1, "      Encoding it.")
         vector_map.encode_MultiPolygon(
             road_area, alt_vec_shift, "INTERP_ALT", check=True, refine=100
         )
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             return 0
     # Hack (23/02/2024 : seems better without actually, keep it just in case)
     if False and not road_network_flat.is_empty:
@@ -705,7 +706,7 @@ def include_water(vector_map, tile):
                 ),
             )
             return None
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             UI.logprint(
                 "Water polygon indexing cancelled for",
                 area_name,

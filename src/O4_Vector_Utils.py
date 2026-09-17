@@ -432,7 +432,7 @@ class Vector_Map:
             done += 1
             if done % step == 0:
                 UI.progress_bar(1, int(100 * done / todo))
-                if UI.red_flag:
+                if UI.is_cancel_requested():
                     return 0
         return 1
 
@@ -464,7 +464,7 @@ class Vector_Map:
             done += 1
             if done % step == 0:
                 UI.progress_bar(1, int(100 * done / todo))
-                if UI.red_flag:
+                if UI.is_cancel_requested():
                     return 0
         return 1
 
@@ -739,7 +739,7 @@ def MultiPolygon_to_Indexed_Polygons(multipol, merge_overlappings=True):
         done += 1
         if done % step == 0:
             UI.progress_bar(1, int(100 * done / todo))
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 return 0
     return (idx_pol, dico_pol)
 
@@ -1052,20 +1052,20 @@ def improved_buffer(
     )
     if show_progress:
         UI.progress_bar(1, 40)
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return geometry.Polygon()
     output_geometry = output_geometry.buffer(
         -1 * separation_width, join_style=2, mitre_limit=1.5, resolution=1
     )
     if show_progress:
         UI.progress_bar(1, 80)
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return geometry.Polygon()
     if simplify_length:
         output_geometry = output_geometry.simplify(simplify_length)
     if show_progress:
         UI.progress_bar(1, 100)
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return geometry.Polygon()
     output_geometry = affinity.affine_transform(
         output_geometry, [1 / scalx, 0, 0, 1, 0, 0]

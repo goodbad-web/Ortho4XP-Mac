@@ -1439,7 +1439,7 @@ def http_request_to_image(
                 UI.vprint(2, "Unmanaged Server answer:", status_code)
                 UI.vprint(3, url, r.headers)
                 break
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 return (0, "Stopped")
             tentative_image += 1
         except requests.exceptions.RequestException as e:
@@ -1451,7 +1451,7 @@ def http_request_to_image(
             # trying a new session ?
             http_session = requests.Session()
             time.sleep(2)
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 return (0, "Stopped")
             tentative_request += 1
         if (
@@ -1995,7 +1995,7 @@ def _fetch_orthophoto_image(
         (success, big_image) = build_texture_from_bbox_and_size(
             [xmin, ymax, xmax, ymin], "3857", (width, height), provider
         )
-    if UI.red_flag or not success:
+    if UI.is_cancel_requested() or not success:
         return (0, None, provider_limited)
     if getattr(big_image, "size", None) != (width, height):
         if quality_state is not None:
@@ -2244,7 +2244,7 @@ def download_jpeg_ortho(
             ),
         )
         success, big_image = 0, None
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         return 0
 
     file_path = os.path.join(file_dir, file_name)
@@ -2578,7 +2578,8 @@ def build_combined_ortho(
 
 ################################################################################
 def build_geotiffs(tile, texture_attributes_list):
-    UI.red_flag = False
+    if UI.active_cancel_event is None:
+        UI.red_flag = False
     timer = time.time()
     initialize_color_filters_dict()
     initialize_providers_dict()
@@ -2604,7 +2605,7 @@ def build_geotiffs(tile, texture_attributes_list):
             return 0
         done += 1
         UI.progress_bar(1, int(100 * done / todo))
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             UI.exit_message_and_bottom_line()
             return 0
     UI.timings_and_bottom_line(timer)
@@ -2687,7 +2688,8 @@ def build_provider_texture(dest_dir, provider_code, zoomlevel):
 
 ################################################################################
 def create_tile_preview(lat, lon, zoomlevel, provider_code):
-    UI.red_flag = False
+    if UI.active_cancel_event is None:
+        UI.red_flag = False
     os.makedirs(FNAMES.Preview_dir, exist_ok=True)
     filepreview = FNAMES.preview(lat, lon, zoomlevel, provider_code)
     if not os.path.isfile(filepreview):
@@ -2782,7 +2784,11 @@ def gdalwarp_alternative(s_bbox, s_epsg, s_im, t_bbox, t_epsg, t_size):
 ################################################################################
 def color_transform(im, color_code):
     try:
-        use_gpu = getattr(UI, "use_gpu_for_color_filters", False)
+        effective_config = getattr(UI, "active_effective_config", {})
+        use_gpu = effective_config.get(
+            "use_gpu_for_color_filters",
+            getattr(UI, "use_gpu_for_color_filters", False),
+        )
         if use_gpu:
             import cv2
             img_array = numpy.array(im)

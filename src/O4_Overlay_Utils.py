@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import subprocess
+import signal
 import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 
@@ -24,13 +25,90 @@ else:
     unzip_cmd = "7z "
     dsftool_cmd = os.path.join(FNAMES.Utils_dir, "lin", "DSFTool")
 
-################################################################################
+
+def _cancel_requested(cancel_check):
+    if cancel_check is None:
+        return UI.is_cancel_requested()
+    try:
+        return bool(cancel_check())
+    except TypeError:
+        return bool(cancel_check)
+
+
+def _run_cancellable(command, cancel_check):
+    """Run DSFTool/7z while allowing the GUI stop request to terminate it."""
+    process_group = os.name == "posix"
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=process_group,
+        )
+    except OSError:
+        raise
+    while True:
+        if _cancel_requested(cancel_check):
+            try:
+                if process_group:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                else:
+                    process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                output, _ = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+            return subprocess.CompletedProcess(
+                command, process.returncode or -15, output or ""
+            )
+        try:
+            output, _ = process.communicate(timeout=0.1)
+            return subprocess.CompletedProcess(command, process.returncode, output or "")
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def build_overlay(lat, lon):
+    return _build_overlay_impl(lat, lon)
+
+
+def build_overlay_to_path(lat, lon, output_path, config=None, cancel_check=None):
+    """Build an overlay into a caller-owned staging path."""
+    return _build_overlay_impl(
+        lat,
+        lon,
+        output_path=output_path,
+        config=config,
+        cancel_check=cancel_check,
+    )
+
+
+################################################################################
+def _build_overlay_impl(
+    lat,
+    lon,
+    output_path=None,
+    config=None,
+    cancel_check=None,
+):
+    config = config or {}
+    effective_overlay_src = config.get("custom_overlay_src", custom_overlay_src)
+    effective_exclude_pol = config.get("ovl_exclude_pol", ovl_exclude_pol)
+    effective_exclude_net = config.get("ovl_exclude_net", ovl_exclude_net)
+    destination_tmp = None
     if UI.is_working:
         return 0
     UI.is_working = 1
     timer = time.time()
     try:
+        if _cancel_requested(cancel_check):
+            return 0
         UI.logprint("Step 4 for tile lat=", lat, ", lon=", lon, ": starting.")
         UI.vprint(
             0,
@@ -39,16 +117,16 @@ def build_overlay(lat, lon):
             + " : \n--------\n",
         )
         file_to_sniff = FNAMES.resolve_global_scenery_dsf(
-            custom_overlay_src, lat, lon
+            effective_overlay_src, lat, lon
         )
         if file_to_sniff is None:
             scenery_candidates = FNAMES.global_scenery_dsf_candidates(
-                custom_overlay_src, lat, lon
+                effective_overlay_src, lat, lon
             )
             if not scenery_candidates:
                 message = (
                     "   ERROR: Global Scenery DSF was not found below "
-                    + (custom_overlay_src or "(empty path)")
+                    + (effective_overlay_src or "(empty path)")
                     + ". Expected Earth nav data/"
                     + FNAMES.long_latlon(lat, lon)
                     + ".dsf."
@@ -69,6 +147,8 @@ def build_overlay(lat, lon):
             FNAMES.Tmp_dir, FNAMES.short_latlon(lat, lon) + ".dsf"
         )
         UI.vprint(1, "-> Making a copy of the original overlay DSF in tmp dir")
+        if _cancel_requested(cancel_check):
+            return 0
         try:
             shutil.copy(file_to_sniff, file_to_sniff_loc)
         except:
@@ -84,7 +164,7 @@ def build_overlay(lat, lon):
             archive_path = file_to_sniff_loc + ".7z"
             os.replace(file_to_sniff_loc, archive_path)
             try:
-                unzip_res = subprocess.run(
+                unzip_res = _run_cancellable(
                     [
                         unzip_cmd.strip(),
                         "e",
@@ -92,12 +172,7 @@ def build_overlay(lat, lon):
                         "-o" + FNAMES.Tmp_dir,
                         archive_path,
                     ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
+                    cancel_check,
                 )
             except OSError as error:
                 UI.exit_message_and_bottom_line(
@@ -107,6 +182,8 @@ def build_overlay(lat, lon):
             if unzip_res.stdout:
                 for line in unzip_res.stdout.splitlines():
                     UI.vprint(1, "     " + line)
+            if _cancel_requested(cancel_check):
+                return 0
             if unzip_res.returncode != 0 or not os.path.isfile(file_to_sniff_loc):
                 UI.exit_message_and_bottom_line("   ERROR: could not uncompress overlay DSF.")
                 return 0
@@ -129,21 +206,15 @@ def build_overlay(lat, lon):
             dsf2text_out,
         ]
         try:
-            dsf2text_res = subprocess.run(
-                dsfconvertcmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            dsf2text_res = _run_cancellable(dsfconvertcmd, cancel_check)
         except OSError as error:
             UI.exit_message_and_bottom_line("   ERROR: could not run DSFTool:", error)
             return 0
         if dsf2text_res.stdout:
             for line in dsf2text_res.stdout.splitlines():
                 UI.vprint(1, "     " + line)
+        if _cancel_requested(cancel_check):
+            return 0
         if dsf2text_res.returncode != 0 or not os.path.isfile(dsf2text_out):
             UI.exit_message_and_bottom_line("   ERROR: DSFTool crashed.")
             return 0
@@ -161,8 +232,10 @@ def build_overlay(lat, lon):
         pol_type = 0
         pol_dict = {}
         exclude_set_updated = False
-        full_ovl_exclude_pol = set(ovl_exclude_pol)
+        full_ovl_exclude_pol = set(effective_exclude_pol)
         while line:
+            if _cancel_requested(cancel_check):
+                return 0
             if "PROPERTY" in line:
                 g.write(line)
             elif "POLYGON_DEF" in line:
@@ -217,9 +290,9 @@ def build_overlay(lat, lon):
             elif "BEGIN_SEGMENT" in line:
                 road_type = int(line.split()[2])
                 if (
-                    road_type not in ovl_exclude_net
-                    and "" not in ovl_exclude_net
-                    and "*" not in ovl_exclude_net
+                    road_type not in effective_exclude_net
+                    and "" not in effective_exclude_net
+                    and "*" not in effective_exclude_net
                 ):
                     while line and ("END_SEGMENT" not in line):
                         g.write(line)
@@ -253,28 +326,27 @@ def build_overlay(lat, lon):
         except OSError:
             pass
         try:
-            text2dsf_res = subprocess.run(
-                dsfconvertcmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            text2dsf_res = _run_cancellable(dsfconvertcmd, cancel_check)
         except OSError as error:
             UI.exit_message_and_bottom_line("   ERROR: could not run DSFTool:", error)
             return 0
         if text2dsf_res.stdout:
             for line in text2dsf_res.stdout.splitlines():
                 UI.vprint(1, "     " + line)
+        if _cancel_requested(cancel_check):
+            return 0
         if text2dsf_res.returncode != 0 or not os.path.isfile(output_overlay):
             UI.exit_message_and_bottom_line("   ERROR: DSFTool crashed.")
             return 0
-        dest_dir = os.path.join(
-            FNAMES.Overlay_dir, "Earth nav data", FNAMES.round_latlon(lat, lon)
+        canonical_dest = os.path.join(
+            FNAMES.Overlay_dir,
+            "Earth nav data",
+            FNAMES.round_latlon(lat, lon),
+            FNAMES.short_latlon(lat, lon) + ".dsf",
         )
-        UI.vprint(1, "-> Coping the final overlay DSF in " + dest_dir)
+        destination_path = output_path or canonical_dest
+        dest_dir = os.path.dirname(destination_path)
+        UI.vprint(1, "-> Copying the final overlay DSF in " + dest_dir)
         if not os.path.exists(dest_dir):
             try:
                 os.makedirs(dest_dir)
@@ -285,10 +357,11 @@ def build_overlay(lat, lon):
                 )
                 return 0
         try:
-            shutil.copy(
-                output_overlay,
-                os.path.join(dest_dir, FNAMES.short_latlon(lat, lon) + ".dsf"),
-            )
+            destination_tmp = destination_path + ".tmp"
+            shutil.copy(output_overlay, destination_tmp)
+            if _cancel_requested(cancel_check):
+                return 0
+            os.replace(destination_tmp, destination_path)
         except OSError as error:
             UI.exit_message_and_bottom_line(
                 "   ERROR: could not copy final overlay DSF:", error
@@ -315,6 +388,8 @@ def build_overlay(lat, lon):
                 FNAMES.Tmp_dir, tmp_base + "_tmp_dsf.txt.sea_level.raw"
             ),
         ]
+        if destination_tmp:
+            tmp_paths.append(destination_tmp)
         for path in tmp_paths:
             try:
                 os.remove(path)

@@ -1,4 +1,6 @@
+import errno
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +9,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import O4_Tile_Utils as TILE  # noqa: E402
+import O4_Overlay_Utils as OVL  # noqa: E402
 
 
 def _tile(tmp_path, monkeypatch, lat=1, lon=2):
@@ -571,6 +574,190 @@ def test_config_failure_rolls_back_selected_outputs_to_initial_snapshot(
     assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
 
 
+def test_all_in_one_overlay_failure_restores_core_overlay_and_config(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    tile.build_overlays_in_all_in_one = True
+    monkeypatch.setattr(TILE.FNAMES, "Overlay_dir", str(tmp_path / "Overlays"))
+    build_dir = Path(tile.build_dir)
+    _write_outputs(tile, "initial")
+    overlay_path = (
+        Path(TILE.FNAMES.Overlay_dir)
+        / "Earth nav data"
+        / TILE.FNAMES.round_latlon(tile.lat, tile.lon)
+        / (TILE.FNAMES.short_latlon(tile.lat, tile.lon) + ".dsf")
+    )
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text("old-overlay", encoding="utf-8")
+    config_path = build_dir / (
+        "Ortho4XP_{}.cfg".format(TILE.FNAMES.short_latlon(tile.lat, tile.lon))
+    )
+    config_path.write_text("old-config", encoding="utf-8")
+
+    def fake_pipeline(current_tile):
+        assert overlay_path.read_text(encoding="utf-8") == "old-overlay"
+        _write_outputs(current_tile, "candidate")
+        current_tile.last_dsf_metrics = {
+            "point_count": 80,
+            "budget_exceeded": False,
+            "structurally_valid": True,
+        }
+        return 1
+
+    def failed_overlay(current_tile, output_path=None):
+        Path(output_path).write_text("partial-overlay", encoding="utf-8")
+        return 0
+
+    tile.write_to_config = lambda: config_path.write_text(
+        "new-config", encoding="utf-8"
+    ) or 1
+    monkeypatch.setattr(TILE, "_run_pipeline_once", fake_pipeline)
+    monkeypatch.setattr(TILE, "_build_overlay_stage", failed_overlay)
+    monkeypatch.setattr(TILE.UI, "red_flag", False)
+    assert TILE._build_all(tile, include_overlays=True) == 0
+    assert (build_dir / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    assert overlay_path.read_text(encoding="utf-8") == "old-overlay"
+    assert config_path.read_text(encoding="utf-8") == "old-config"
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
+def test_all_in_one_overlay_success_publishes_core_overlay_and_config_atomically(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    tile.build_overlays_in_all_in_one = True
+    monkeypatch.setattr(TILE.FNAMES, "Overlay_dir", str(tmp_path / "Overlays"))
+    build_dir = Path(tile.build_dir)
+    _write_outputs(tile, "initial")
+    overlay_path = (
+        Path(TILE.FNAMES.Overlay_dir)
+        / "Earth nav data"
+        / TILE.FNAMES.round_latlon(tile.lat, tile.lon)
+        / (TILE.FNAMES.short_latlon(tile.lat, tile.lon) + ".dsf")
+    )
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text("old-overlay", encoding="utf-8")
+    config_path = build_dir / (
+        "Ortho4XP_{}.cfg".format(TILE.FNAMES.short_latlon(tile.lat, tile.lon))
+    )
+    config_path.write_text("old-config", encoding="utf-8")
+
+    def fake_pipeline(current_tile):
+        _write_outputs(current_tile, "candidate")
+        current_tile.last_dsf_metrics = {
+            "point_count": 80,
+            "budget_exceeded": False,
+            "structurally_valid": True,
+        }
+        return 1
+
+    def successful_overlay(current_tile, output_path=None):
+        Path(output_path).write_text("new-overlay", encoding="utf-8")
+        return 1
+
+    tile.write_to_config = lambda: config_path.write_text(
+        "new-config", encoding="utf-8"
+    ) or 1
+    monkeypatch.setattr(TILE, "_run_pipeline_once", fake_pipeline)
+    monkeypatch.setattr(TILE, "_build_overlay_stage", successful_overlay)
+    monkeypatch.setattr(TILE.UI, "red_flag", False)
+
+    assert TILE._build_all(tile, include_overlays=True) == 1
+    assert (build_dir / "Data+01+002.mesh").read_text(encoding="utf-8") == "candidate"
+    assert overlay_path.read_text(encoding="utf-8") == "new-overlay"
+    assert config_path.read_text(encoding="utf-8") == "new-config"
+    assert not (build_dir / TILE._BUILD_TRANSACTION_MARKER).exists()
+
+
+def _prepare_overlay_recovery_case(tmp_path, monkeypatch):
+    tile = _tile(tmp_path, monkeypatch)
+    tile.build_overlays_in_all_in_one = True
+    monkeypatch.setattr(TILE.FNAMES, "Overlay_dir", str(tmp_path / "Overlays"))
+    _write_outputs(tile, "initial")
+    overlay_path = (
+        Path(TILE.FNAMES.Overlay_dir)
+        / "Earth nav data"
+        / TILE.FNAMES.round_latlon(tile.lat, tile.lon)
+        / (TILE.FNAMES.short_latlon(tile.lat, tile.lon) + ".dsf")
+    )
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text("old-overlay", encoding="utf-8")
+    config_path = Path(tile.build_dir) / (
+        "Ortho4XP_{}.cfg".format(TILE.FNAMES.short_latlon(tile.lat, tile.lon))
+    )
+    config_path.write_text("old-config", encoding="utf-8")
+    transaction = TILE._BuildTransaction(tile, include_overlay=True)
+    _write_outputs(tile, "candidate")
+    candidate = transaction.capture_candidate(0)
+    transaction.restore_snapshot(candidate)
+    return tile, transaction, candidate, overlay_path, config_path
+
+
+def test_v2_overlay_pending_journal_recovers_old_state(
+    tmp_path, monkeypatch
+):
+    tile, transaction, candidate, overlay_path, config_path = (
+        _prepare_overlay_recovery_case(tmp_path, monkeypatch)
+    )
+    transaction.overlay_candidate_path()
+    transaction._write_marker("overlay-pending", candidate, {})
+    Path(transaction.marker_path).unlink()
+
+    assert TILE._recover_build_transaction(tile) is True
+    assert (Path(tile.build_dir) / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    assert overlay_path.read_text(encoding="utf-8") == "old-overlay"
+    assert config_path.read_text(encoding="utf-8") == "old-config"
+    assert not Path(transaction.root).exists()
+    assert not Path(transaction.journal_path).exists()
+
+
+def test_v2_overlay_commit_recovery_discards_new_overlay(
+    tmp_path, monkeypatch
+):
+    tile, transaction, candidate, overlay_path, config_path = (
+        _prepare_overlay_recovery_case(tmp_path, monkeypatch)
+    )
+    candidate_overlay = transaction.overlay_candidate_path()
+    Path(candidate_overlay).write_text("new-overlay", encoding="utf-8")
+    assert transaction.activate_overlay(candidate_overlay) is True
+    transaction._write_marker("committing", candidate, {})
+
+    assert TILE._recover_build_transaction(tile) is True
+    assert (Path(tile.build_dir) / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    assert overlay_path.read_text(encoding="utf-8") == "old-overlay"
+    assert config_path.read_text(encoding="utf-8") == "old-config"
+    assert not Path(transaction.root).exists()
+
+
+def test_transaction_exdev_during_cross_volume_move_restores_and_cleans(
+    tmp_path, monkeypatch
+):
+    tile = _tile(tmp_path, monkeypatch)
+    _write_outputs(tile, "initial")
+    original_copy2 = TILE.shutil.copy2
+
+    def fail_mask_snapshot(source, destination):
+        if "/initial/mask/" in str(destination):
+            raise OSError(errno.EXDEV, "cross-device link")
+        return original_copy2(source, destination)
+
+    monkeypatch.setattr(TILE.shutil, "copy2", fail_mask_snapshot)
+    try:
+        TILE._BuildTransaction(tile)
+    except OSError as error:
+        assert error.errno == errno.EXDEV
+    else:
+        raise AssertionError("transaction unexpectedly succeeded")
+
+    assert (Path(tile.build_dir) / "Data+01+002.mesh").read_text(encoding="utf-8") == "initial"
+    assert not (Path(tile.build_dir) / TILE._BUILD_TRANSACTION_MARKER).exists()
+    assert not list(Path(tile.build_dir).parent.glob(".o4xp-build-transaction-*"))
+    assert not list(Path(TILE.FNAMES.mask_dir(tile.lat, tile.lon)).parent.glob(
+        ".o4xp-mask-transaction-*"
+    ))
+
+
 def test_baseline_failure_restores_prebuild_outputs(
     tmp_path, monkeypatch
 ):
@@ -675,3 +862,57 @@ def test_pipeline_reports_exception_and_cancellation_separately(monkeypatch):
     assert TILE._run_pipeline_once(tile) == 0
     assert tile.last_pipeline_failure["cancelled"] is True
     assert "cancelled" in messages[-1]
+
+
+def test_operation_token_survives_stage_boundary_and_blocks_next_stage(monkeypatch):
+    tile = SimpleNamespace()
+    calls = []
+    event = threading.Event()
+    TILE.UI.begin_operation(event)
+    monkeypatch.setattr(TILE.UI, "is_building_all", True)
+
+    def cancel_vector(_):
+        calls.append("vector")
+        TILE.UI.cancel_operation("user")
+        return 0
+
+    monkeypatch.setattr(TILE.VMAP, "build_poly_file", cancel_vector)
+    monkeypatch.setattr(
+        TILE.MESH,
+        "build_mesh",
+        lambda _: calls.append("mesh") or 1,
+    )
+    try:
+        assert TILE._run_pipeline_once(tile) == 0
+        assert calls == ["vector"]
+        assert event.is_set()
+    finally:
+        TILE.UI.end_operation()
+
+
+def test_build_continuous_passes_tile_overlay_setting(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        TILE,
+        "_start_full_pipeline",
+        lambda tile, include_overlays: calls.append(include_overlays) or 1,
+    )
+    TILE.build_continuous(SimpleNamespace(build_overlays_in_all_in_one=True))
+    TILE.build_continuous(SimpleNamespace(build_overlays_in_all_in_one=False))
+    assert calls == [True, False]
+
+
+def test_overlay_child_process_is_terminated_by_cancel_token():
+    event = threading.Event()
+    timer = threading.Timer(0.05, event.set)
+    timer.start()
+    try:
+        result = OVL._run_cancellable(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            event.is_set,
+        )
+    finally:
+        timer.cancel()
+        timer.join()
+    assert event.is_set()
+    assert result.returncode != 0

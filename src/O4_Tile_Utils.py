@@ -51,6 +51,7 @@ max_parallel_tiles = 1
 
 
 _BUILD_TRANSACTION_MARKER = ".Ortho4XP_build_recovery.json"
+_BUILD_TRANSACTION_JOURNAL = _BUILD_TRANSACTION_MARKER + ".journal"
 _LEGACY_MASK_PATTERN = re.compile(r"^-?\d+_-?\d+\.png$")
 _DISTANCE_MASK_PATTERN = re.compile(r"^-?\d+_-?\d+_dist\.png$")
 _MASK_TEXTURE_PATTERN = re.compile(r"^-?\d+_-?\d+_.+_ZL\d+\.png$")
@@ -305,53 +306,136 @@ def _is_generated_terrain_name(name):
 
 
 class _BuildTransaction:
-    """Keep each full-pipeline attempt recoverable without copying tile data.
+    """Keep a tile build recoverable while publishing one coherent result.
 
-    The pipeline writes to the canonical tile paths.  This transaction moves
-    only known Ortho4XP outputs to a sibling staging directory, so an attempt
-    can run from a clean output set and a later failure cannot mix its files
-    with a previous successful attempt.  Moves stay on the same filesystem
-    and therefore do not duplicate multi-gigabyte DDS assets.
+    Staging is created next to each canonical output volume.  In particular,
+    masks and overlays must not be staged below the build directory: doing so
+    makes an otherwise atomic ``os.replace`` fail with ``EXDEV`` on common
+    installations.  DDS files are still hardlinked/copied using the existing
+    policy, so large tile payloads are not duplicated unnecessarily.
     """
 
-    def __init__(self, tile, preserve_inputs=False):
+    def __init__(self, tile, preserve_inputs=False, include_overlay=False):
         self.build_dir = os.path.abspath(tile.build_dir)
         self.mask_dir = os.path.abspath(FNAMES.mask_dir(tile.lat, tile.lon))
         self.grouped = bool(getattr(tile, "grouped", False))
         self.preserve_inputs = bool(preserve_inputs)
+        self.include_overlay = bool(include_overlay)
         self.parent_dir = os.path.dirname(self.build_dir) or os.curdir
         os.makedirs(self.build_dir, exist_ok=True)
         os.makedirs(self.parent_dir, exist_ok=True)
         self.root = tempfile.mkdtemp(
             prefix=".o4xp-build-transaction-", dir=self.parent_dir
         )
+        self.roots = {"tile": self.root, "shared": self.root}
+        mask_parent = os.path.dirname(self.mask_dir) or os.curdir
+        os.makedirs(mask_parent, exist_ok=True)
+        self.mask_root = tempfile.mkdtemp(
+            prefix=".o4xp-mask-transaction-", dir=mask_parent
+        )
+        self.roots["mask"] = self.mask_root
+        if self.include_overlay:
+            overlay_parent = os.path.abspath(FNAMES.Overlay_dir)
+            os.makedirs(overlay_parent, exist_ok=True)
+            self.overlay_root = tempfile.mkdtemp(
+                prefix=".o4xp-overlay-transaction-", dir=overlay_parent
+            )
+            self.roots["overlay"] = self.overlay_root
+        else:
+            self.overlay_root = None
+        self.overlay_active = False
         self.marker_path = os.path.join(
             self.build_dir, _BUILD_TRANSACTION_MARKER
         )
+        self.journal_path = os.path.join(
+            self.build_dir, _BUILD_TRANSACTION_JOURNAL
+        )
         self.tile_lat = int(tile.lat)
         self.tile_lon = int(tile.lon)
+        self.config_paths = {
+            "config": os.path.join(
+                self.build_dir,
+                "Ortho4XP_{}.cfg".format(
+                    FNAMES.short_latlon(self.tile_lat, self.tile_lon)
+                ),
+            ),
+            "backup": os.path.join(
+                self.build_dir,
+                "Ortho4XP_{}.cfg.bak".format(
+                    FNAMES.short_latlon(self.tile_lat, self.tile_lon)
+                ),
+            ),
+        }
+        self.initial_config = {}
         try:
+            self._snapshot_initial_config()
             if self.preserve_inputs:
                 # A standalone Step 3 still needs the existing mesh, masks,
                 # and reusable DDS files visible at their canonical paths.
-                # Hardlinks provide a rollback snapshot without duplicating
-                # multi-gigabyte texture payloads.
                 self._write_marker("snapshotting", None, None)
-                self._link_current_to("initial")
+                self._snapshot_initial_outputs()
                 self._write_marker("active", None, None)
             else:
-                self._write_marker("active", None, None)
-                self._move_current_to("initial")
+                self._write_marker("snapshotting", None, None)
+                # Keep the pre-build snapshot immutable for the whole
+                # transaction.  Moving it out of the canonical tree made a
+                # later rollback depend on the exact order of intermediate
+                # restores and could consume the only copy of the old tile.
+                self._snapshot_initial_outputs()
+                self._write_marker("clearing", None, None)
+                self._remove_current_outputs()
                 self._write_marker("active", None, None)
         except Exception:
-            if self.preserve_inputs:
-                shutil.rmtree(self.root, ignore_errors=True)
-                for path in (self.marker_path, self.marker_path + ".tmp"):
+            # Roll back *all* staging allocations, including the mask/overlay
+            # volumes.  The old implementation only cleaned preserve_inputs
+            # failures and could leave a marker that hid an EXDEV failure.
+            recovery_failed = False
+            if not self.preserve_inputs:
+                try:
+                    self.restore_snapshot_files("initial")
+                except Exception:
+                    # The original exception remains the useful diagnostic;
+                    # recovery on the next launch can use any surviving marker.
+                    recovery_failed = True
+            if not recovery_failed:
+                for root in set(self.roots.values()):
+                    shutil.rmtree(root, ignore_errors=True)
+                for path in (
+                    self.marker_path,
+                    self.marker_path + ".tmp",
+                    self.journal_path,
+                ):
                     try:
                         os.remove(path)
                     except OSError:
                         pass
             raise
+
+    def _snapshot_initial_config(self):
+        config_root = os.path.join(self.root, "initial", "config")
+        for name, source_path in self.config_paths.items():
+            present = os.path.isfile(source_path)
+            self.initial_config[name] = present
+            if present:
+                os.makedirs(config_root, exist_ok=True)
+                shutil.copy2(
+                    source_path,
+                    os.path.join(config_root, os.path.basename(source_path)),
+                )
+
+    def _staging_root(self, kind):
+        return self.roots["mask"] if kind == "mask" else self.roots[kind]
+
+    def _snapshot_kind_root(self, snapshot_name, kind):
+        return os.path.join(self._staging_root(kind), snapshot_name, kind)
+
+    def _snapshot_initial_outputs(self):
+        previous_overlay_active = self.overlay_active
+        self.overlay_active = self.include_overlay
+        try:
+            self._link_current_to("initial")
+        finally:
+            self.overlay_active = previous_overlay_active
 
     def _write_marker(
         self,
@@ -361,11 +445,17 @@ class _BuildTransaction:
         target_snapshot=None,
     ):
         marker = {
-            "version": 1,
+            "version": 2,
             "state": state,
+            # Keep the v1 field for older recovery tooling and tests.
             "transaction_root": self.root,
+            "transaction_roots": dict(self.roots),
             "build_dir": self.build_dir,
             "mask_dir": self.mask_dir,
+            "overlay_dir": os.path.abspath(FNAMES.Overlay_dir),
+            "overlay_path": self.overlay_path if self.include_overlay else None,
+            "include_overlay": self.include_overlay,
+            "initial_config": dict(self.initial_config),
             "grouped": self.grouped,
             "preserve_inputs": self.preserve_inputs,
             "lat": self.tile_lat,
@@ -381,6 +471,45 @@ class _BuildTransaction:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(marker_tmp, self.marker_path)
+        try:
+            with open(self.journal_path, "a", encoding="utf-8") as stream:
+                json.dump(marker, stream, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            # The manifest is authoritative.  A journal write can fail on a
+            # read-only sidecar filesystem without making a successfully
+            # published tile unusable.
+            pass
+
+    @property
+    def overlay_path(self):
+        return os.path.join(
+            os.path.abspath(FNAMES.Overlay_dir),
+            "Earth nav data",
+            FNAMES.round_latlon(self.tile_lat, self.tile_lon),
+            FNAMES.short_latlon(self.tile_lat, self.tile_lon) + ".dsf",
+        )
+
+    def overlay_candidate_path(self):
+        if not self.include_overlay or self.overlay_root is None:
+            raise RuntimeError("overlay staging is not enabled")
+        path = os.path.join(
+            self.overlay_root,
+            "overlay-candidate",
+            os.path.basename(self.overlay_path),
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def activate_overlay(self, candidate_path):
+        if not os.path.isfile(candidate_path):
+            return False
+        os.makedirs(os.path.dirname(self.overlay_path), exist_ok=True)
+        os.replace(candidate_path, self.overlay_path)
+        self.overlay_active = True
+        return True
 
     def set_best_snapshot(self, snapshot_name, settings=None, config=None):
         self.best_config = config
@@ -448,42 +577,51 @@ class _BuildTransaction:
         return paths
 
     def _current_output_paths(self):
-        return self._tile_output_paths() + self._mask_output_paths()
+        paths = self._tile_output_paths() + self._mask_output_paths()
+        if (
+            self.include_overlay
+            and self.overlay_active
+            and os.path.isfile(self.overlay_path)
+        ):
+            paths.append(("overlay", self.overlay_path))
+        return paths
 
     def _link_current_to(self, snapshot_name):
         """Snapshot current files while leaving standalone inputs visible."""
-        snapshot_root = os.path.join(self.root, snapshot_name)
         for kind, source_path in self._current_output_paths():
-            source_root = self.mask_dir if kind == "mask" else self.build_dir
+            source_root = {
+                "mask": self.mask_dir,
+                "overlay": os.path.dirname(self.overlay_path),
+            }.get(kind, self.build_dir)
             relative_path = os.path.relpath(source_path, source_root)
             destination_path = os.path.join(
-                snapshot_root, kind, relative_path
+                self._snapshot_kind_root(snapshot_name, kind), relative_path
             )
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
             if source_path.lower().endswith(".dds"):
-                # DDS conversion activates output with os.replace(), so a
-                # hardlink preserves the old multi-gigabyte payload without a
-                # second copy. The build directory and its sibling snapshot
-                # are deliberately on the same filesystem.
                 os.link(source_path, destination_path)
             else:
-                # Terrain, mesh, and mask files can be opened in-place by
-                # legacy code; a hardlink would let those writes corrupt the
-                # rollback snapshot. These files are small enough to copy,
-                # and mask files may live on another filesystem.
                 shutil.copy2(source_path, destination_path)
 
     def _move_current_to(self, snapshot_name):
-        snapshot_root = os.path.join(self.root, snapshot_name)
-        os.makedirs(snapshot_root, exist_ok=True)
         for kind, source_path in self._current_output_paths():
-            source_root = self.mask_dir if kind == "mask" else self.build_dir
+            source_root = {
+                "mask": self.mask_dir,
+                "overlay": os.path.dirname(self.overlay_path),
+            }.get(kind, self.build_dir)
             relative_path = os.path.relpath(source_path, source_root)
             destination_path = os.path.join(
-                snapshot_root, kind, relative_path
+                self._snapshot_kind_root(snapshot_name, kind), relative_path
             )
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
             os.replace(source_path, destination_path)
+
+    def _remove_current_outputs(self):
+        for _, source_path in self._current_output_paths():
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
 
     def capture_candidate(self, attempt):
         snapshot_name = "candidate-{}".format(attempt)
@@ -491,33 +629,26 @@ class _BuildTransaction:
         return snapshot_name
 
     def clone_snapshot(self, source_snapshot, target_snapshot):
-        """Clone a candidate without consuming it.
-
-        DDS payloads are hardlinked while small text/raster outputs are copied,
-        matching the transaction's existing snapshot policy.  This gives a
-        partial retry a private rollback point even though restoring a
-        candidate moves its files back to canonical paths.
-        """
-        source_root = os.path.join(self.root, source_snapshot)
-        target_root = os.path.join(self.root, target_snapshot)
-        if not os.path.isdir(source_root):
-            raise FileNotFoundError(source_root)
-        for kind in ("tile", "shared", "mask"):
-            source_kind_root = os.path.join(source_root, kind)
+        """Clone a candidate without consuming it."""
+        found = False
+        for kind in ("tile", "shared", "mask", "overlay"):
+            source_kind_root = self._snapshot_kind_root(source_snapshot, kind)
             if not os.path.isdir(source_kind_root):
                 continue
+            found = True
+            target_kind_root = self._snapshot_kind_root(target_snapshot, kind)
             for dir_path, _, names in os.walk(source_kind_root):
                 for name in names:
                     source_path = os.path.join(dir_path, name)
                     relative_path = os.path.relpath(source_path, source_kind_root)
-                    destination_path = os.path.join(
-                        target_root, kind, relative_path
-                    )
+                    destination_path = os.path.join(target_kind_root, relative_path)
                     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
                     if source_path.lower().endswith(".dds"):
                         os.link(source_path, destination_path)
                     else:
                         shutil.copy2(source_path, destination_path)
+        if not found:
+            raise FileNotFoundError(source_snapshot)
         return target_snapshot
 
     def discard_current(self, label):
@@ -527,60 +658,102 @@ class _BuildTransaction:
         """Restore shared grouped assets before the next clean attempt."""
         if not self.grouped:
             return
-        source_root = os.path.join(self.root, "initial", "shared")
+        source_root = self._snapshot_kind_root("initial", "shared")
         if not os.path.isdir(source_root):
             return
         for dir_path, _, names in os.walk(source_root):
             for name in names:
                 source_path = os.path.join(dir_path, name)
                 relative_path = os.path.relpath(source_path, source_root)
-                destination_path = os.path.join(
-                    self.build_dir, relative_path
-                )
+                destination_path = os.path.join(self.build_dir, relative_path)
                 os.makedirs(os.path.dirname(destination_path), exist_ok=True)
                 os.replace(source_path, destination_path)
 
     def restore_snapshot(self, snapshot_name):
         self.discard_current("before-restore")
         self.restore_snapshot_files(snapshot_name)
+        if snapshot_name == "initial":
+            self.restore_initial_config()
+
+    def restore_initial_config(self):
+        config_root = os.path.join(self.root, "initial", "config")
+        for name, destination_path in self.config_paths.items():
+            if self.initial_config.get(name, False):
+                source_path = os.path.join(
+                    config_root, os.path.basename(destination_path)
+                )
+                if os.path.isfile(source_path):
+                    self._publish_snapshot_file(source_path, destination_path)
+            else:
+                try:
+                    os.remove(destination_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _publish_snapshot_file(source_path, destination_path):
+        """Publish a snapshot file without consuming the initial snapshot."""
+        destination_dir = os.path.dirname(destination_path) or os.curdir
+        os.makedirs(destination_dir, exist_ok=True)
+        temporary_path = os.path.join(
+            destination_dir,
+            ".o4xp-restore-{}-{}".format(
+                os.getpid(), uuid.uuid4().hex
+            ),
+        )
+        try:
+            if source_path.lower().endswith(".dds"):
+                try:
+                    os.link(source_path, temporary_path)
+                except OSError:
+                    shutil.copy2(source_path, temporary_path)
+            else:
+                shutil.copy2(source_path, temporary_path)
+            os.replace(temporary_path, destination_path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
 
     def restore_snapshot_files(self, snapshot_name):
-        """Move the remaining files of a snapshot into canonical paths.
-
-        This operation is intentionally idempotent: a recovery run can finish
-        a restore after a process stopped between two file moves.
-        """
-        snapshot_root = os.path.join(self.root, snapshot_name)
+        """Move the remaining files of a snapshot into canonical paths."""
         for kind, destination_root in (
             ("tile", self.build_dir),
             ("shared", self.build_dir),
             ("mask", self.mask_dir),
+            ("overlay", os.path.dirname(self.overlay_path)),
         ):
-            source_root = os.path.join(snapshot_root, kind)
+            if kind == "overlay" and not self.include_overlay:
+                continue
+            source_root = self._snapshot_kind_root(snapshot_name, kind)
             if not os.path.isdir(source_root):
                 continue
             for dir_path, _, names in os.walk(source_root):
                 for name in names:
                     source_path = os.path.join(dir_path, name)
                     relative_path = os.path.relpath(source_path, source_root)
-                    destination_path = os.path.join(
-                        destination_root, relative_path
-                    )
-                    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                    os.replace(source_path, destination_path)
+                    destination_path = os.path.join(destination_root, relative_path)
+                    if snapshot_name == "initial":
+                        self._publish_snapshot_file(source_path, destination_path)
+                    else:
+                        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                        os.replace(source_path, destination_path)
 
     def snapshot_has_files(self, snapshot_name):
-        snapshot_root = os.path.join(self.root, snapshot_name)
-        for _, _, names in os.walk(snapshot_root):
-            if names:
-                return True
+        for kind in ("tile", "shared", "mask", "overlay"):
+            if kind == "overlay" and not self.include_overlay:
+                continue
+            snapshot_root = self._snapshot_kind_root(snapshot_name, kind)
+            for _, _, names in os.walk(snapshot_root):
+                if names:
+                    return True
         return False
 
     def export_snapshot(self, snapshot_name, status):
         """Copy a candidate to persistent, non-published degraded staging."""
-        source_root = os.path.join(self.root, snapshot_name)
-        if not os.path.isdir(source_root):
-            raise FileNotFoundError(source_root)
+        if not self.snapshot_has_files(snapshot_name):
+            raise FileNotFoundError(snapshot_name)
         staging_root = tempfile.mkdtemp(
             prefix=".o4xp-degraded-{}-".format(
                 FNAMES.short_latlon(self.tile_lat, self.tile_lon)
@@ -589,7 +762,7 @@ class _BuildTransaction:
         )
         try:
             for kind in ("tile", "shared", "mask"):
-                source_kind_root = os.path.join(source_root, kind)
+                source_kind_root = self._snapshot_kind_root(snapshot_name, kind)
                 if not os.path.isdir(source_kind_root):
                     continue
                 destination_kind_root = os.path.join(staging_root, kind)
@@ -620,15 +793,18 @@ class _BuildTransaction:
             raise
 
     def cleanup(self):
-        shutil.rmtree(self.root)
-        try:
-            os.remove(self.marker_path)
-        except OSError:
-            pass
-        try:
-            os.remove(self.marker_path + ".tmp")
-        except OSError:
-            pass
+        for root in set(self.roots.values()):
+            if os.path.isdir(root):
+                shutil.rmtree(root)
+        for path in (
+            self.marker_path,
+            self.marker_path + ".tmp",
+            getattr(self, "journal_path", self.marker_path + ".journal"),
+        ):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def _transaction_marker_path(tile):
@@ -637,14 +813,44 @@ def _transaction_marker_path(tile):
     )
 
 
+def _transaction_journal_path(tile):
+    return os.path.join(
+        os.path.abspath(tile.build_dir), _BUILD_TRANSACTION_JOURNAL
+    )
+
+
 def _recover_build_transaction(tile):
     """Restore a left-over full-pipeline transaction after a hard stop."""
     marker_path = _transaction_marker_path(tile)
+    journal_path = _transaction_journal_path(tile)
     if not os.path.isfile(marker_path):
-        return True
+        if not os.path.isfile(journal_path):
+            return True
+        marker = None
+        try:
+            with open(journal_path, "r", encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        candidate = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(candidate, dict):
+                        marker = candidate
+        except OSError:
+            return True
+        if marker is None:
+            try:
+                os.remove(journal_path)
+            except OSError:
+                pass
+            return True
+    else:
+        marker = None
     try:
-        with open(marker_path, "r", encoding="utf-8") as stream:
-            marker = json.load(stream)
+        if marker is None:
+            with open(marker_path, "r", encoding="utf-8") as stream:
+                marker = json.load(stream)
+        version = int(marker.get("version", 1))
         root = os.path.abspath(marker["transaction_root"])
         build_dir = os.path.abspath(tile.build_dir)
         mask_dir = os.path.abspath(FNAMES.mask_dir(tile.lat, tile.lon))
@@ -658,10 +864,6 @@ def _recover_build_transaction(tile):
             or int(marker.get("lon")) != int(tile.lon)
         ):
             raise ValueError("recovery marker does not match the current tile")
-        if not os.path.isdir(root):
-            os.remove(marker_path)
-            return True
-
         transaction = _BuildTransaction.__new__(_BuildTransaction)
         transaction.build_dir = build_dir
         transaction.mask_dir = mask_dir
@@ -669,15 +871,88 @@ def _recover_build_transaction(tile):
         transaction.preserve_inputs = bool(marker.get("preserve_inputs", False))
         transaction.parent_dir = os.path.abspath(parent_dir)
         transaction.root = root
+        transaction.roots = {
+            "tile": root,
+            "shared": root,
+            "mask": root,
+        }
+        transaction.mask_root = root
+        transaction.overlay_root = None
+        transaction.include_overlay = False
+        if version >= 2:
+            transaction.include_overlay = bool(marker.get("include_overlay", False))
+            raw_roots = marker.get("transaction_roots", {})
+            if not isinstance(raw_roots, dict):
+                raise ValueError("recovery marker has invalid transaction roots")
+            transaction.roots = {
+                "tile": os.path.abspath(raw_roots.get("tile", root)),
+                "shared": os.path.abspath(raw_roots.get("shared", root)),
+                "mask": os.path.abspath(raw_roots.get("mask", root)),
+            }
+            transaction.root = transaction.roots["tile"]
+            transaction.mask_root = transaction.roots["mask"]
+            if transaction.include_overlay:
+                overlay_root = raw_roots.get("overlay")
+                if not overlay_root:
+                    raise ValueError("recovery marker has no overlay root")
+                transaction.overlay_root = os.path.abspath(overlay_root)
+                transaction.roots["overlay"] = transaction.overlay_root
         transaction.marker_path = marker_path
+        transaction.journal_path = journal_path
         transaction.tile_lat = int(tile.lat)
         transaction.tile_lon = int(tile.lon)
+        transaction.config_paths = {
+            "config": os.path.join(
+                build_dir,
+                "Ortho4XP_{}.cfg".format(FNAMES.short_latlon(tile.lat, tile.lon)),
+            ),
+            "backup": os.path.join(
+                build_dir,
+                "Ortho4XP_{}.cfg.bak".format(FNAMES.short_latlon(tile.lat, tile.lon)),
+            ),
+        }
+        transaction.initial_config = dict(marker.get("initial_config", {}))
         transaction.best_config = marker.get("best_config")
         state = marker.get("state", "active")
+        transaction.overlay_active = bool(
+            transaction.include_overlay
+            and state in ("committing", "discarding", "restoring")
+        )
         best_snapshot = marker.get("best_snapshot")
         best_settings = marker.get("best_settings")
         best_config = marker.get("best_config")
         target_snapshot = marker.get("target_snapshot")
+
+        # A v2 marker may have roots on separate volumes.  Validate every
+        # root before using it so a stale/crafted marker cannot make recovery
+        # move files outside the configured output locations.
+        roots_to_validate = {
+            "tile": (transaction.roots["tile"], parent_dir, ".o4xp-build-transaction-"),
+            "shared": (transaction.roots["shared"], parent_dir, ".o4xp-build-transaction-"),
+            "mask": (
+                transaction.roots["mask"],
+                os.path.dirname(mask_dir) or os.curdir,
+                ".o4xp-mask-transaction-",
+            ),
+        }
+        if transaction.include_overlay:
+            roots_to_validate["overlay"] = (
+                transaction.roots["overlay"],
+                os.path.abspath(FNAMES.Overlay_dir),
+                ".o4xp-overlay-transaction-",
+            )
+        for kind, (candidate_root, expected_parent, prefix) in roots_to_validate.items():
+            expected_parent = os.path.abspath(expected_parent)
+            if os.path.dirname(candidate_root) != expected_parent:
+                # v1 puts all kinds under the build parent.  It has already
+                # passed the historical validation above and remains valid.
+                if version == 1 and kind in ("shared", "mask"):
+                    continue
+                raise ValueError("recovery {} root is outside its volume".format(kind))
+            if not os.path.basename(candidate_root).startswith(prefix):
+                if version == 1 and kind in ("shared", "mask"):
+                    continue
+                raise ValueError("recovery {} root has an invalid name".format(kind))
 
         if state == "snapshotting":
             # Standalone snapshot creation only links/copies into staging; the
@@ -686,12 +961,46 @@ def _recover_build_transaction(tile):
             transaction.cleanup()
             return True
 
+        if state == "clearing":
+            # The v2 snapshot is complete, but canonical generated files may
+            # have been partially removed before the process stopped.
+            transaction.discard_current("before-restore")
+            transaction._write_marker("restoring", None, None, "initial")
+            transaction.restore_snapshot_files("initial")
+            transaction.restore_initial_config()
+            transaction.cleanup()
+            return True
+
         if state in ("complete", "restored"):
             transaction.cleanup()
             return True
 
+        if version >= 2 and state in ("overlay-pending", "committing"):
+            # Overlay generation and activation are part of the same public
+            # transaction.  An interrupted commit is deliberately resolved
+            # to the old state; the next invocation can then build again.
+            target_snapshot = "initial"
+            transaction._write_marker(
+                "discarding", None, None, target_snapshot
+            )
+            transaction.discard_current("before-restore")
+            transaction._write_marker(
+                "restoring", None, None, target_snapshot
+            )
+            transaction.restore_snapshot_files(target_snapshot)
+            transaction.restore_initial_config()
+            transaction.cleanup()
+            return True
+
+        atomic_overlay_transaction = bool(
+            version >= 2 and transaction.include_overlay
+        )
         if state == "discarding":
-            target_snapshot = target_snapshot or best_snapshot or "initial"
+            target_snapshot = (
+                "initial"
+                if atomic_overlay_transaction
+                else target_snapshot or best_snapshot or "initial"
+            )
             transaction.discard_current("before-restore")
             transaction._write_marker(
                 "restoring",
@@ -702,19 +1011,33 @@ def _recover_build_transaction(tile):
             state = "restoring"
 
         if state == "restoring":
-            target_snapshot = target_snapshot or best_snapshot or "initial"
+            target_snapshot = (
+                "initial"
+                if atomic_overlay_transaction
+                else target_snapshot or best_snapshot or "initial"
+            )
             transaction.restore_snapshot_files(target_snapshot)
             if target_snapshot == "initial":
+                if version >= 2:
+                    transaction.restore_initial_config()
                 best_settings = None
                 best_config = None
             else:
                 state = "config-pending"
 
         elif state == "config-pending":
+            if atomic_overlay_transaction:
+                transaction._write_marker("discarding", None, None, "initial")
+                transaction.discard_current("before-restore")
+                transaction._write_marker("restoring", None, None, "initial")
+                transaction.restore_snapshot_files("initial")
+                transaction.restore_initial_config()
+                transaction.cleanup()
+                return True
             if best_snapshot and transaction.snapshot_has_files(best_snapshot):
                 transaction.restore_snapshot_files(best_snapshot)
         else:
-            snapshot_name = best_snapshot or "initial"
+            snapshot_name = "initial" if atomic_overlay_transaction else best_snapshot or "initial"
             transaction._write_marker(
                 "discarding",
                 best_snapshot,
@@ -730,6 +1053,8 @@ def _recover_build_transaction(tile):
             )
             transaction.restore_snapshot_files(snapshot_name)
             if snapshot_name == "initial":
+                if version >= 2:
+                    transaction.restore_initial_config()
                 best_settings = None
                 best_config = None
 
@@ -1727,7 +2052,7 @@ class _StreamingConversionRunner:
         return True
 
     def finish(self):
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             self.scheduler.cancel()
         else:
             self.scheduler.close()
@@ -1743,7 +2068,7 @@ class _StreamingConversionRunner:
         finally:
             if self.gpu_server is not None and self._owns_gpu_server:
                 self.gpu_server.close()
-            if UI.red_flag or self.scheduler.error is not None:
+            if UI.is_cancel_requested() or self.scheduler.error is not None:
                 self.pool.terminate()
             else:
                 self.pool.close()
@@ -2502,7 +2827,7 @@ def download_textures(
 
     download_success = parallel_join(dl_workers)
 
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.vprint(1, "Download process interrupted.")
         return 0
 
@@ -2631,7 +2956,8 @@ def _build_tile(tile, persist_config=True):
     if UI.is_working:
         return 0
     UI.is_working = 1
-    UI.red_flag = False
+    if not UI.is_building_all and UI.active_cancel_event is None:
+        UI.red_flag = False
     UI.logprint(
         "Step 3 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
     )
@@ -2758,7 +3084,7 @@ def _build_tile(tile, persist_config=True):
                         "エラー: ストリーミング変換を開始できません: {}".format(error),
                     ),
                 )
-                UI.red_flag = True
+                UI.cancel_operation("internal")
                 build_dsf_thread.join()
                 return 0
         download_thread.start()
@@ -3823,14 +4149,14 @@ def _build_tile(tile, persist_config=True):
                 UI.lvprint(0, f"WARNING: {len(convert_list) - success_count} textures failed to convert.")
                 UI.lvprint(0, "Skipping cleanup to protect existing data.")
 
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 UI.vprint(1, "DDS conversion process interrupted.")
             elif dico_conv_progress["done"] >= 1:
                 UI.vprint(1, " *DDS conversion of textures completed.")
     if convert_launched and not conversion_success:
         UI.exit_message_and_bottom_line("ERROR: DDS conversion failed.")
         return 0
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line()
         return 0
     performance_metrics = getattr(tile, "_performance_metrics", None)
@@ -3945,7 +4271,7 @@ def _build_tile(tile, persist_config=True):
 
 ################################################################################
 def _report_pipeline_failure(tile, stage_name, error=None, traceback_text=None):
-    cancelled = bool(UI.red_flag)
+    cancelled = bool(UI.is_cancel_requested())
     failure = {
         "stage": stage_name,
         "cancelled": cancelled,
@@ -3986,7 +4312,7 @@ def _report_pipeline_failure(tile, stage_name, error=None, traceback_text=None):
 def _report_metrics_failure(tile):
     failure = {
         "stage": "DSF metrics",
-        "cancelled": bool(UI.red_flag),
+        "cancelled": bool(UI.is_cancel_requested()),
         "error": "missing or structurally invalid DSF metrics",
     }
     tile.last_pipeline_failure = failure
@@ -4044,11 +4370,36 @@ def _start_full_pipeline(tile, include_overlays):
                 getattr(tile, "use_gpu_acceleration", getattr(UI, "use_gpu_acceleration", True))
             ),
             "use_gpu_for_masks": bool(getattr(tile, "use_gpu_for_masks", False)),
+            "use_gpu_for_color_filters": bool(
+                getattr(
+                    tile,
+                    "use_gpu_for_color_filters",
+                    getattr(UI, "use_gpu_for_color_filters", False),
+                )
+            ),
             "use_gpu_for_dem_smoothing": bool(
                 getattr(tile, "use_gpu_for_dem_smoothing", False)
             ),
+            "write_build_log": bool(
+                getattr(tile, "write_build_log", getattr(UI, "write_build_log", False))
+            ),
+            "build_overlays_in_all_in_one": bool(
+                getattr(tile, "build_overlays_in_all_in_one", False)
+            ),
+            "custom_overlay_src": getattr(
+                tile, "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+            ),
+            "ovl_exclude_pol": list(
+                getattr(tile, "ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+            ),
+            "ovl_exclude_net": list(
+                getattr(tile, "ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+            ),
         }
     )
+    cancel_event = UI.active_cancel_event or threading.Event()
+    UI.begin_operation(cancel_event, metrics.data["config"])
+    tile._cancel_event = cancel_event
     try:
         try:
             IMG.validate_imagery_cache_settings()
@@ -4095,6 +4446,7 @@ def _start_full_pipeline(tile, include_overlays):
             metrics.fail(error)
             UI.vprint(1, "WARNING: Could not flush tile build log:", error)
         try:
+            metrics.set_value("cancel_reason", getattr(UI, "cancel_reason", None))
             metrics.write(
                 os.path.join(tile.build_dir, "Ortho4XP_performance.json"),
                 finished=True,
@@ -4108,6 +4460,11 @@ def _start_full_pipeline(tile, include_overlays):
                 delattr(tile, "_ashelper_jsonl_server")
             except AttributeError:
                 pass
+        try:
+            delattr(tile, "_cancel_event")
+        except AttributeError:
+            pass
+        UI.end_operation()
 
 
 def build_all(tile):
@@ -4116,7 +4473,12 @@ def build_all(tile):
 
 def build_continuous(tile):
     """Build all core stages with DSF-budget retries for the CLI path."""
-    return _start_full_pipeline(tile, include_overlays=False)
+    return _start_full_pipeline(
+        tile,
+        include_overlays=bool(
+            getattr(tile, "build_overlays_in_all_in_one", False)
+        ),
+    )
 
 
 def _run_pipeline_once(tile, start_stage="vector data"):
@@ -4149,6 +4511,16 @@ def _run_pipeline_once(tile, start_stage="vector data"):
             stage_succeeded = False
             stage_error = error
             stage_traceback = traceback.format_exc()
+        if metrics is not None:
+            if UI.is_cancel_requested():
+                result_name = "cancelled"
+            elif stage_result == OSM.OSM_DEGRADED:
+                result_name = "degraded"
+            elif stage_succeeded:
+                result_name = "success"
+            else:
+                result_name = "failed"
+            metrics.set_value("stage_result.{}".format(stage_name), result_name)
         if stage_result == OSM.OSM_DEGRADED:
             pipeline_result = OSM.OSM_DEGRADED
             UI.vprint(
@@ -4163,7 +4535,7 @@ def _run_pipeline_once(tile, start_stage="vector data"):
                 ),
             )
             continue
-        if not stage_succeeded or UI.red_flag:
+        if not stage_succeeded or UI.is_cancel_requested():
             _report_pipeline_failure(
                 tile, stage_name, stage_error, stage_traceback
             )
@@ -4235,6 +4607,13 @@ def _build_all_transactional(tile, include_overlays=True):
     transaction = None
     best_candidate = None
     performance_metrics = getattr(tile, "_performance_metrics", None)
+    overlay_enabled = bool(
+        include_overlays and getattr(tile, "build_overlays_in_all_in_one", False)
+    )
+    if performance_metrics is not None:
+        performance_metrics.set_value("overlay_enabled", overlay_enabled)
+        if not overlay_enabled:
+            performance_metrics.set_value("overlay_result", "disabled")
 
     def restore_snapshot(snapshot_name):
         if transaction is None:
@@ -4262,6 +4641,8 @@ def _build_all_transactional(tile, include_overlays=True):
                 snapshot_name,
             )
             transaction.restore_snapshot_files(snapshot_name)
+            if snapshot_name == "initial":
+                transaction.restore_initial_config()
             return True
         except Exception as error:
             UI.logprint(
@@ -4286,6 +4667,8 @@ def _build_all_transactional(tile, include_overlays=True):
             return False
         try:
             transaction.cleanup()
+            if performance_metrics is not None:
+                performance_metrics.set_value("transaction_state", "rolled_back")
             return True
         except Exception as error:
             UI.logprint("ERROR: Could not remove tile transaction staging:", repr(error))
@@ -4293,7 +4676,9 @@ def _build_all_transactional(tile, include_overlays=True):
             return False
 
     try:
-        transaction = _BuildTransaction(tile)
+        transaction = _BuildTransaction(tile, include_overlay=overlay_enabled)
+        if performance_metrics is not None:
+            performance_metrics.set_value("transaction_state", "active")
         previous_candidate = None
         for attempt in range(DSF_BUDGET.MAX_AUTO_REDUCE_ATTEMPTS + 1):
             if attempt:
@@ -4384,7 +4769,16 @@ def _build_all_transactional(tile, include_overlays=True):
                     stream.write("\n")
                 transaction._write_marker("restoring", None, None, "initial")
                 transaction.restore_snapshot_files("initial")
+                transaction.restore_initial_config()
                 transaction.cleanup()
+                if performance_metrics is not None:
+                    performance_metrics.set_value(
+                        "overlay_result",
+                        "skipped_degraded" if overlay_enabled else "disabled",
+                    )
+                    performance_metrics.set_value(
+                        "transaction_state", "rolled_back"
+                    )
                 _restore_auto_reduce_settings(tile, base_settings)
                 tile.last_pipeline_result = OSM.OSM_DEGRADED
                 UI.vprint(
@@ -4407,9 +4801,9 @@ def _build_all_transactional(tile, include_overlays=True):
                         )
                     _restore_auto_reduce_settings(tile, base_settings)
                     restore_and_cleanup(
-                        best_candidate["snapshot"]
-                        if best_candidate is not None
-                        else "initial"
+                        "initial"
+                        if overlay_enabled or best_candidate is None
+                        else best_candidate["snapshot"]
                     )
                     return OSM.OSM_FAILED
                 UI.vprint(
@@ -4523,6 +4917,12 @@ def _build_all_transactional(tile, include_overlays=True):
         )
         tile.last_dsf_metrics = dict(best_candidate["metrics"])
 
+        if UI.is_cancel_requested():
+            _report_pipeline_failure(tile, "tile publication")
+            _restore_auto_reduce_settings(tile, base_settings)
+            restore_and_cleanup("initial")
+            return 0
+
         if best_candidate["metrics"].get(
             "budget_exceeded", best_candidate["metrics"]["point_count"] > budget
         ):
@@ -4535,23 +4935,34 @@ def _build_all_transactional(tile, include_overlays=True):
                 ),
             )
 
-        if not tile.write_to_config():
+        if not overlay_enabled:
+            if UI.is_cancel_requested():
+                _report_pipeline_failure(tile, "tile configuration publication")
+                _restore_auto_reduce_settings(tile, base_settings)
+                restore_and_cleanup("initial")
+                return 0
+            if not tile.write_to_config():
+                UI.vprint(
+                    0,
+                    UI.ui_text(
+                        "ERROR: Could not save final tile configuration; restoring the previous tile state.",
+                        "エラー: 最終タイル設定を保存できないため、以前のタイル状態に戻します。",
+                    ),
+                )
+                _restore_auto_reduce_settings(tile, base_settings)
+                restore_and_cleanup("initial")
+                return 0
+            if UI.is_cancel_requested():
+                _report_pipeline_failure(tile, "tile configuration publication")
+                _restore_auto_reduce_settings(tile, base_settings)
+                restore_and_cleanup("initial")
+                return 0
             UI.vprint(
-                0,
-                UI.ui_text(
-                    "ERROR: Could not save final tile configuration; restoring the previous tile state.",
-                    "エラー: 最終タイル設定を保存できないため、以前のタイル状態に戻します。",
+                1,
+                "[Auto-Reduce] Saved settings from selected full-pipeline attempt {} to tile config.".format(
+                    best_candidate["attempt"]
                 ),
             )
-            _restore_auto_reduce_settings(tile, base_settings)
-            restore_and_cleanup("initial")
-            return 0
-        UI.vprint(
-            1,
-            "[Auto-Reduce] Saved settings from selected full-pipeline attempt {} to tile config.".format(
-                best_candidate["attempt"]
-            ),
-        )
         if best_candidate["attempt"] > 0 and not tile.grouped:
             try:
                 removed_textures = remove_unwanted_textures(tile)
@@ -4579,12 +4990,6 @@ def _build_all_transactional(tile, include_overlays=True):
                         "警告: 自動削減後の未参照テクスチャを整理できないため、有効なタイルを保持します。",
                     ),
                 )
-        try:
-            transaction.cleanup()
-        except Exception as error:
-            UI.logprint("WARNING: Could not remove tile transaction staging:", repr(error))
-            UI.vprint(1, "WARNING: Tile transaction staging remains for recovery:", error)
-
     except Exception as error:
         if performance_metrics is not None:
             performance_metrics.end_attempt("exception")
@@ -4606,7 +5011,10 @@ def _build_all_transactional(tile, include_overlays=True):
         recovered_settings = base_settings
         if transaction is not None:
             try:
-                if best_candidate is not None:
+                if overlay_enabled:
+                    _restore_auto_reduce_settings(tile, base_settings)
+                    restore_and_cleanup("initial")
+                elif best_candidate is not None:
                     _restore_auto_reduce_settings(tile, best_candidate["settings"])
                     if restore_snapshot(best_candidate["snapshot"]):
                         transaction._write_marker(
@@ -4651,18 +5059,98 @@ def _build_all_transactional(tile, include_overlays=True):
         return 0
 
     UI.is_working = 0
-    if include_overlays and getattr(tile, "build_overlays_in_all_in_one", False):
+    if overlay_enabled:
         UI.vprint(0, "-> Automatically extracting overlays (All in one)...")
+        transaction._write_marker(
+            "overlay-pending",
+            best_candidate["snapshot"],
+            best_candidate["settings"],
+        )
+        if performance_metrics is not None:
+            performance_metrics.set_value("transaction_state", "overlay-pending")
+        overlay_candidate = transaction.overlay_candidate_path()
         overlay_context = (
             performance_metrics.stage("overlay")
             if performance_metrics is not None
             else nullcontext()
         )
-        with overlay_context:
-            overlay_result = _build_overlay_stage(tile)
-        if not overlay_result or UI.red_flag:
-            _report_pipeline_failure(tile, "overlay extraction")
+        overlay_error = None
+        overlay_traceback = None
+        try:
+            with overlay_context:
+                overlay_result = _build_overlay_stage(
+                    tile, output_path=overlay_candidate
+                )
+        except Exception as error:
+            overlay_result = 0
+            overlay_error = error
+            overlay_traceback = traceback.format_exc()
+        if not overlay_result or UI.is_cancel_requested():
+            _report_pipeline_failure(
+                tile, "overlay extraction", overlay_error, overlay_traceback
+            )
+            if performance_metrics is not None:
+                performance_metrics.set_value(
+                    "overlay_result",
+                    "cancelled" if UI.is_cancel_requested() else "failed",
+                )
+            _restore_auto_reduce_settings(tile, base_settings)
+            restore_and_cleanup("initial")
             return 0
+        transaction._write_marker(
+            "committing",
+            best_candidate["snapshot"],
+            best_candidate["settings"],
+        )
+        if performance_metrics is not None:
+            performance_metrics.set_value("transaction_state", "committing")
+        try:
+            if not transaction.activate_overlay(overlay_candidate):
+                raise OSError("overlay candidate was not produced")
+            if not tile.write_to_config():
+                raise OSError("could not save final tile configuration")
+        except Exception as error:
+            UI.vprint(
+                0,
+                UI.ui_text(
+                    "ERROR: Could not publish the overlay and tile configuration; restoring the previous tile state: {}".format(
+                        error
+                    ),
+                    "エラー: Overlayとタイル設定を公開できないため、以前のタイル状態に戻します: {}".format(
+                        error
+                    ),
+                ),
+            )
+            _restore_auto_reduce_settings(tile, base_settings)
+            restore_and_cleanup("initial")
+            return 0
+        UI.vprint(
+            1,
+            "[Auto-Reduce] Saved settings from selected full-pipeline attempt {} to tile config.".format(
+                best_candidate["attempt"]
+            ),
+        )
+        transaction._write_marker(
+            "complete",
+            best_candidate["snapshot"],
+            best_candidate["settings"],
+        )
+        if performance_metrics is not None:
+            performance_metrics.set_value("overlay_result", "success")
+            performance_metrics.set_value("transaction_state", "complete")
+    else:
+        transaction._write_marker(
+            "complete",
+            best_candidate["snapshot"],
+            best_candidate["settings"],
+        )
+        if performance_metrics is not None:
+            performance_metrics.set_value("transaction_state", "complete")
+    try:
+        transaction.cleanup()
+    except Exception as error:
+        UI.logprint("WARNING: Could not remove tile transaction staging:", repr(error))
+        UI.vprint(1, "WARNING: Tile transaction staging remains for recovery:", error)
     return 1
 
 ################################################################################
@@ -4685,11 +5173,11 @@ def _run_batch_stage(tile, stage_name, stage):
             "\n",
             traceback.format_exc(),
         )
-    if not UI.red_flag and stage_result == OSM.OSM_DEGRADED:
+    if not UI.is_cancel_requested() and stage_result == OSM.OSM_DEGRADED:
         return OSM.OSM_DEGRADED
-    if succeeded and not UI.red_flag:
+    if succeeded and not UI.is_cancel_requested():
         return OSM.OSM_COMPLETE
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         UI.exit_message_and_bottom_line(
             UI.ui_text(
                 "ERROR: Batch build cancelled during {}.".format(stage_name),
@@ -4721,29 +5209,75 @@ def _overlay_worker_entry(
     ovl_exclude_pol,
     ovl_exclude_net,
     result_queue,
+    output_path=None,
 ):
     """Run overlay extraction with process-local UI/module state."""
     try:
         import O4_Overlay_Utils as overlay_utils
         import O4_UI_Utils as ui_utils
+        import signal
 
         ui_utils.is_working = 0
-        ui_utils.red_flag = False
-        overlay_utils.custom_overlay_src = custom_overlay_src
-        overlay_utils.ovl_exclude_pol = list(ovl_exclude_pol)
-        overlay_utils.ovl_exclude_net = list(ovl_exclude_net)
-        result_queue.put(int(bool(overlay_utils.build_overlay(lat, lon))))
+        config = {
+            "custom_overlay_src": custom_overlay_src,
+            "ovl_exclude_pol": list(ovl_exclude_pol),
+            "ovl_exclude_net": list(ovl_exclude_net),
+        }
+        cancel_event = threading.Event()
+        ui_utils.begin_operation(cancel_event, config)
+
+        def request_worker_cancel(signum, frame):
+            ui_utils.cancel_operation("parent")
+
+        previous_sigterm = signal.signal(signal.SIGTERM, request_worker_cancel)
+        try:
+            if output_path:
+                result = overlay_utils.build_overlay_to_path(
+                    lat,
+                    lon,
+                    output_path,
+                    config=config,
+                    cancel_check=ui_utils.is_cancel_requested,
+                )
+            else:
+                result = overlay_utils.build_overlay(lat, lon)
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            ui_utils.end_operation()
+        result_queue.put(int(bool(result)))
     except Exception:
         result_queue.put(0)
 
 
-def _build_overlay_stage(tile):
+def _build_overlay_stage(tile, output_path=None):
     """Use the historical serial overlay path unless explicitly opted in."""
+    config = {
+        "custom_overlay_src": getattr(
+            tile, "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+        ),
+        "ovl_exclude_pol": list(
+            getattr(tile, "ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+        ),
+        "ovl_exclude_net": list(
+            getattr(tile, "ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+        ),
+    }
+    cancel_check = lambda: UI.is_cancel_requested() or bool(
+        getattr(getattr(tile, "_cancel_event", None), "is_set", lambda: False)()
+    )
     if not getattr(tile, "enable_parallel_overlay", enable_parallel_overlay):
+        if output_path:
+            return OVL.build_overlay_to_path(
+                tile.lat, tile.lon, output_path, config=config, cancel_check=cancel_check
+            )
         return OVL.build_overlay(tile.lat, tile.lon)
     # A parallel tile worker already has isolated process state. Nesting a
     # second child here would only add startup cost and lose useful logging.
     if getattr(tile, "_parallel_tile_worker", False):
+        if output_path:
+            return OVL.build_overlay_to_path(
+                tile.lat, tile.lon, output_path, config=config, cancel_check=cancel_check
+            )
         return OVL.build_overlay(tile.lat, tile.lon)
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
@@ -4752,17 +5286,18 @@ def _build_overlay_stage(tile):
         args=(
             tile.lat,
             tile.lon,
-            getattr(OVL, "custom_overlay_src", ""),
-            getattr(OVL, "ovl_exclude_pol", []),
-            getattr(OVL, "ovl_exclude_net", []),
+            config["custom_overlay_src"],
+            config["ovl_exclude_pol"],
+            config["ovl_exclude_net"],
             result_queue,
+            output_path,
         ),
         name="Ortho4XP-overlay-{}".format(FNAMES.short_latlon(tile.lat, tile.lon)),
     )
     process.start()
     try:
         while process.is_alive():
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 process.terminate()
                 process.join(timeout=2)
                 return 0
@@ -4845,6 +5380,32 @@ def _parallel_tile_stage_uses_gpu(tile, stage_name):
 
 
 def _parallel_tile_worker(payload):
+    import O4_UI_Utils as worker_ui
+
+    tile_values = payload.get("tile_values", {})
+    effective_config = {
+        "write_build_log": bool(tile_values.get("write_build_log", False)),
+        "use_gpu_for_color_filters": bool(
+            tile_values.get("use_gpu_for_color_filters", False)
+        ),
+        "custom_overlay_src": tile_values.get(
+            "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+        ),
+        "ovl_exclude_pol": list(
+            tile_values.get("ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+        ),
+        "ovl_exclude_net": list(
+            tile_values.get("ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+        ),
+    }
+    worker_ui.begin_operation(threading.Event(), effective_config)
+    try:
+        return _parallel_tile_worker_impl(payload)
+    finally:
+        worker_ui.end_operation()
+
+
+def _parallel_tile_worker_impl(payload):
     """Build one tile in a spawn-isolated process for opt-in batch mode."""
     try:
         import O4_Config_Utils as CFG
@@ -4862,6 +5423,25 @@ def _parallel_tile_worker(payload):
         tile.build_dir = FNAMES.build_dir(lat, lon, tile.custom_build_dir)
         tile.make_dirs()
         tile._parallel_tile_worker = True
+        worker_ui.update_operation_config(
+            {
+                "write_build_log": bool(
+                    getattr(tile, "write_build_log", getattr(worker_ui, "write_build_log", False))
+                ),
+                "use_gpu_for_color_filters": bool(
+                    getattr(tile, "use_gpu_for_color_filters", False)
+                ),
+                "custom_overlay_src": getattr(
+                    tile, "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+                ),
+                "ovl_exclude_pol": list(
+                    getattr(tile, "ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+                ),
+                "ovl_exclude_net": list(
+                    getattr(tile, "ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+                ),
+            }
+        )
         worker_osm.osm_download_failure_policy = worker_osm.normalize_osm_failure_policy(
             payload.get("osm_download_failure_policy", worker_osm.osm_download_failure_policy)
         )
@@ -4869,8 +5449,15 @@ def _parallel_tile_worker(payload):
         worker_ui.red_flag = False
 
         transaction = None
-        if payload.get("do_osm"):
-            transaction = _BuildTransaction(tile, preserve_inputs=True)
+        if any(
+            payload.get(name)
+            for name in ("do_osm", "do_mesh", "do_mask", "do_dsf", "do_ovl")
+        ):
+            transaction = _BuildTransaction(
+                tile,
+                preserve_inputs=True,
+                include_overlay=bool(payload.get("do_ovl")),
+            )
             tile._allow_degraded_intermediate = True
 
         stages = []
@@ -4886,7 +5473,10 @@ def _parallel_tile_worker(payload):
             stages.append(
                 (
                     "overlay extraction",
-                    lambda current_tile: _build_overlay_stage(current_tile),
+                    lambda current_tile: _build_overlay_stage(
+                        current_tile,
+                        output_path=transaction.overlay_candidate_path(),
+                    ),
                 )
             )
 
@@ -4909,12 +5499,12 @@ def _parallel_tile_worker(payload):
                     stage_result = stage(tile)
                 except Exception as error:
                     if transaction is not None:
-                        transaction.restore_snapshot("worker-exception")
+                        transaction.restore_snapshot("initial")
                         transaction.cleanup()
                     return lat, lon, OSM.OSM_FAILED, "{}: {}".format(stage_name, error)
-            if worker_ui.red_flag:
+            if worker_ui.is_cancel_requested():
                 if transaction is not None:
-                    transaction.restore_snapshot("worker-cancelled")
+                    transaction.restore_snapshot("initial")
                     transaction.cleanup()
                 return lat, lon, OSM.OSM_FAILED, "{} cancelled".format(stage_name)
             if stage_result == OSM.OSM_DEGRADED:
@@ -4922,7 +5512,7 @@ def _parallel_tile_worker(payload):
                 continue
             if stage_result != OSM.OSM_COMPLETE:
                 if transaction is not None:
-                    transaction.restore_snapshot("worker-failed")
+                    transaction.restore_snapshot("initial")
                     transaction.cleanup()
                 return lat, lon, OSM.OSM_FAILED, "{} failed".format(stage_name)
 
@@ -4954,10 +5544,15 @@ def _parallel_tile_worker(payload):
                 ) as stream:
                     json.dump(status, stream, ensure_ascii=False, sort_keys=True, indent=2)
                     stream.write("\n")
-                transaction.restore_snapshot_files("initial")
+                transaction.restore_snapshot("initial")
                 transaction.cleanup()
                 tile._allow_degraded_intermediate = False
                 return lat, lon, OSM.OSM_DEGRADED, staging_path
+            if payload.get("do_ovl"):
+                if not transaction.activate_overlay(transaction.overlay_candidate_path()):
+                    transaction.restore_snapshot("initial")
+                    transaction.cleanup()
+                    return lat, lon, OSM.OSM_FAILED, "overlay publication failed"
             transaction.cleanup()
             tile._allow_degraded_intermediate = False
         return lat, lon, OSM.OSM_COMPLETE, None
@@ -5034,7 +5629,7 @@ def _build_tile_list_parallel(
 
             active = list(processes)
             while active:
-                if UI.red_flag:
+                if UI.is_cancel_requested():
                     for process in active:
                         if process.is_alive():
                             process.terminate()
@@ -5129,9 +5724,44 @@ def _build_tile_list_parallel(
 def build_tile_list(
     tile, list_lat_lon, do_osm, do_mesh, do_mask, do_dsf, do_ovl, do_ptc
 ):
+    """Build a batch with one operation-local cancellation token."""
+    if UI.active_cancel_event is not None:
+        return _build_tile_list_impl(
+            tile, list_lat_lon, do_osm, do_mesh, do_mask, do_dsf, do_ovl, do_ptc
+        )
+    effective_config = {
+        "write_build_log": bool(
+            getattr(tile, "write_build_log", getattr(UI, "write_build_log", False))
+        ),
+        "use_gpu_for_color_filters": bool(
+            getattr(tile, "use_gpu_for_color_filters", False)
+        ),
+        "custom_overlay_src": getattr(
+            tile, "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+        ),
+        "ovl_exclude_pol": list(
+            getattr(tile, "ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+        ),
+        "ovl_exclude_net": list(
+            getattr(tile, "ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+        ),
+    }
+    UI.begin_operation(threading.Event(), effective_config)
+    try:
+        return _build_tile_list_impl(
+            tile, list_lat_lon, do_osm, do_mesh, do_mask, do_dsf, do_ovl, do_ptc
+        )
+    finally:
+        UI.end_operation()
+
+
+def _build_tile_list_impl(
+    tile, list_lat_lon, do_osm, do_mesh, do_mask, do_dsf, do_ovl, do_ptc
+):
     if UI.is_working:
         return 0
-    UI.red_flag = 0
+    if not UI.is_cancel_requested() and UI.active_cancel_event is None:
+        UI.red_flag = 0
     requested_parallel_tiles = int(
         getattr(tile, "max_parallel_tiles", max_parallel_tiles) or 1
     )
@@ -5162,7 +5792,7 @@ def build_tile_list(
     k = 0
     for (lat, lon) in list_lat_lon:
         k += 1
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             UI.exit_message_and_bottom_line(
                 UI.ui_text(
                     "ERROR: Batch build cancelled before the next tile.",
@@ -5224,7 +5854,27 @@ def build_tile_list(
                 )
                 continue
 
-        if do_osm or do_mesh or do_dsf:
+        UI.update_operation_config(
+            {
+                "write_build_log": bool(
+                    getattr(tile, "write_build_log", getattr(UI, "write_build_log", False))
+                ),
+                "use_gpu_for_color_filters": bool(
+                    getattr(tile, "use_gpu_for_color_filters", False)
+                ),
+                "custom_overlay_src": getattr(
+                    tile, "custom_overlay_src", getattr(OVL, "custom_overlay_src", "")
+                ),
+                "ovl_exclude_pol": list(
+                    getattr(tile, "ovl_exclude_pol", getattr(OVL, "ovl_exclude_pol", []))
+                ),
+                "ovl_exclude_net": list(
+                    getattr(tile, "ovl_exclude_net", getattr(OVL, "ovl_exclude_net", []))
+                ),
+            }
+        )
+
+        if do_osm or do_mesh or do_dsf or do_ovl:
             try:
                 tile.make_dirs()
             except Exception as error:
@@ -5244,9 +5894,13 @@ def build_tile_list(
                 continue
 
         batch_transaction = None
-        if do_osm:
+        if do_osm or do_mesh or do_mask or do_dsf or do_ovl:
             try:
-                batch_transaction = _BuildTransaction(tile, preserve_inputs=True)
+                batch_transaction = _BuildTransaction(
+                    tile,
+                    preserve_inputs=True,
+                    include_overlay=bool(do_ovl),
+                )
                 tile._allow_degraded_intermediate = True
             except Exception as error:
                 batch_failed = True
@@ -5281,7 +5935,10 @@ def build_tile_list(
             stages.append(
                 (
                     "overlay extraction",
-                    _build_overlay_stage,
+                    lambda current_tile: _build_overlay_stage(
+                        current_tile,
+                        output_path=batch_transaction.overlay_candidate_path(),
+                    ),
                 )
             )
 
@@ -5347,7 +6004,7 @@ def build_tile_list(
                             indent=2,
                         )
                         stream.write("\n")
-                    batch_transaction.restore_snapshot_files("initial")
+                    batch_transaction.restore_snapshot("initial")
                     batch_transaction.cleanup()
                     batch_degraded = True
                     tile_succeeded = False
@@ -5363,9 +6020,13 @@ def build_tile_list(
                         ),
                     )
                 elif tile_succeeded:
+                    if do_ovl:
+                        overlay_candidate = batch_transaction.overlay_candidate_path()
+                        if not batch_transaction.activate_overlay(overlay_candidate):
+                            raise OSError("overlay candidate was not produced")
                     batch_transaction.cleanup()
                 else:
-                    batch_transaction.restore_snapshot("failed")
+                    batch_transaction.restore_snapshot("initial")
                     batch_transaction.cleanup()
             except Exception as error:
                 batch_failed = True

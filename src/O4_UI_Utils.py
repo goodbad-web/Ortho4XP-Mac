@@ -25,12 +25,91 @@ Ortho4XP_dir = ".." if getattr(sys, "frozen", False) else "."
 verbosity = 1
 red_flag = False
 is_working = False
+active_cancel_event = None
+last_operation_cancelled = False
+cancel_reason = None
+active_effective_config = {}
+active_write_build_log = None
 cleaning_level = 1
 gui = None
 log = True
 write_build_log = False
 build_log_buffer = []
 is_building_all = False
+
+
+def begin_operation(cancel_event=None, effective_config=None):
+    """Start an operation with a fresh, operation-local cancellation state."""
+    global active_cancel_event, last_operation_cancelled, cancel_reason
+    global active_effective_config, active_write_build_log, red_flag
+    pending_cancel = bool(red_flag and cancel_reason)
+    pending_reason = cancel_reason if pending_cancel else None
+    active_cancel_event = cancel_event
+    last_operation_cancelled = False
+    # A GUI Stop can arrive after the token is reserved but before the worker
+    # thread enters _start_full_pipeline.  Preserve that reason while
+    # re-binding the already-cancelled token to the operation context.
+    cancel_reason = pending_reason
+    active_effective_config = dict(effective_config or {})
+    active_write_build_log = active_effective_config.get("write_build_log")
+    red_flag = False
+    if pending_cancel and active_cancel_event is not None:
+        try:
+            active_cancel_event.set()
+        except AttributeError:
+            pass
+
+
+def cancel_operation(reason="user"):
+    """Request cancellation without relying only on the legacy global flag."""
+    global red_flag, cancel_reason
+    red_flag = True
+    cancel_reason = reason
+    event = active_cancel_event
+    if event is not None:
+        try:
+            event.set()
+        except AttributeError:
+            pass
+
+
+def update_operation_config(values):
+    """Update the effective snapshot for a per-tile batch item."""
+    global active_effective_config, active_write_build_log
+    active_effective_config.update(dict(values or {}))
+    if "write_build_log" in active_effective_config:
+        active_write_build_log = active_effective_config["write_build_log"]
+
+
+def is_cancel_requested():
+    event = active_cancel_event
+    if event is not None:
+        try:
+            # Keep legacy writers observable while an operation-local token
+            # is active.  Stage code must not clear the token, but a few
+            # older helpers still set red_flag directly on internal failure.
+            return bool(event.is_set()) or bool(red_flag)
+        except AttributeError:
+            pass
+    return bool(red_flag)
+
+
+def end_operation():
+    """Record and clear an operation state after its result was determined."""
+    global active_cancel_event, last_operation_cancelled, red_flag
+    global active_effective_config, active_write_build_log
+    event = active_cancel_event
+    if event is not None:
+        try:
+            last_operation_cancelled = bool(event.is_set()) or bool(red_flag)
+        except AttributeError:
+            last_operation_cancelled = bool(cancel_reason)
+    else:
+        last_operation_cancelled = bool(red_flag)
+    active_cancel_event = None
+    active_effective_config = {}
+    active_write_build_log = None
+    red_flag = False
 
 
 def ui_text(english, japanese):
@@ -78,7 +157,7 @@ def vprint(min_verbosity, *args):
     msg = " ".join([str(x) for x in args])
     if verbosity >= min_verbosity:
         print(msg)
-        if write_build_log:
+        if active_write_build_log if active_write_build_log is not None else write_build_log:
             build_log_buffer.append(msg)
         if gui:
             gui.status_queue.put(msg)
@@ -106,7 +185,7 @@ def lvprint(min_verbosity, *args):
         print(msg)
         if log:
             logprint(msg)
-        if write_build_log:
+        if active_write_build_log if active_write_build_log is not None else write_build_log:
             build_log_buffer.append(msg)
         if gui:
             gui.status_queue.put(msg)
@@ -166,7 +245,12 @@ def get_config_summary(tile=None):
 def initialize_build_log(build_dir, tile=None):
     global build_log_buffer
     build_log_buffer = []
-    if not write_build_log:
+    build_log_enabled = (
+        active_write_build_log
+        if active_write_build_log is not None
+        else write_build_log
+    )
+    if not build_log_enabled:
         return
     build_log_buffer.append(get_config_summary(tile))
     try:
@@ -182,7 +266,12 @@ def initialize_build_log(build_dir, tile=None):
 ################################################################################
 def flush_build_log(build_dir):
     global build_log_buffer
-    if not write_build_log or not build_log_buffer:
+    build_log_enabled = (
+        active_write_build_log
+        if active_write_build_log is not None
+        else write_build_log
+    )
+    if not build_log_enabled or not build_log_buffer:
         build_log_buffer = []
         return
     try:

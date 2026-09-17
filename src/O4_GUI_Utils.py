@@ -693,8 +693,14 @@ class Ortho4XP_GUI(tk.Tk):
             UI.vprint(0, f"ERROR: {label} failed unexpectedly: {error}")
         finally:
             # Some legacy auxiliary actions do not reset this flag themselves.
+            was_cancelled = bool(
+                getattr(UI, "last_operation_cancelled", False)
+                or UI.is_cancel_requested()
+            )
             UI.is_working = 0
-            self.stage_result_queue.put((label, result, bool(UI.red_flag)))
+            self.stage_result_queue.put((label, result, was_cancelled))
+            if getattr(UI, "active_cancel_event", None) is not None:
+                UI.end_operation()
 
     def _start_background_stage(self, label, target, *args):
         if getattr(self, "working_thread", None) is not None and self.working_thread.is_alive():
@@ -705,6 +711,16 @@ class Ortho4XP_GUI(tk.Tk):
             UI.vprint(0, message)
             self.status_var.set(message)
             return 0
+        # Do not let a previous operation's stop state leak into this action's
+        # completion status; the All in one token is reserved immediately
+        # below so a new Stop request has a stable target.
+        UI.last_operation_cancelled = False
+        UI.red_flag = False
+        UI.cancel_reason = None
+        if target is TILE.build_all:
+            # Reserve the token before starting the thread so Stop cannot win
+            # the small window before _start_full_pipeline initializes it.
+            UI.begin_operation(threading.Event())
         self.status_var.set(_ui_text(f"Running: {label}", f"実行中: {label}"))
         self.working_thread = threading.Thread(
             target=self._run_background_stage,
@@ -837,7 +853,7 @@ class Ortho4XP_GUI(tk.Tk):
         worker = getattr(self, "working_thread", None)
         worker_running = worker is not None and worker.is_alive()
         if worker_running:
-            UI.red_flag = True
+            UI.cancel_operation("user")
         if cache_running or worker_running:
             self.status_var.set(
                 _ui_text(
@@ -846,7 +862,7 @@ class Ortho4XP_GUI(tk.Tk):
                 )
             )
             return
-        UI.red_flag = True
+        UI.cancel_operation("user")
         self.status_var.set(
             _ui_text(
                 "Stop requested. Waiting for the current step to stop...",
@@ -1086,7 +1102,7 @@ class Ortho4XP_GUI(tk.Tk):
         if cache_running:
             cache_window.request_cancel()
         if worker is not None and worker.is_alive():
-            UI.red_flag = True
+            UI.cancel_operation("exit")
         cache_worker = (
             getattr(cache_window, "worker_thread", None)
             if cache_window is not None

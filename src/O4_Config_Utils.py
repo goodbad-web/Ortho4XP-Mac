@@ -907,6 +907,7 @@ class Tile:
         state = self.__dict__.copy()
         state.pop("_performance_metrics", None)
         state.pop("_ashelper_jsonl_server", None)
+        state.pop("_cancel_event", None)
         return state
 
     def make_dirs(self):

@@ -128,7 +128,8 @@ def _build_masks(tile, for_imagery=False):
     sea_level = im.getpixel((0, 127 * (1 - min(1, 0.1 + tile.ratio_water))))
     del im
     
-    UI.red_flag = False
+    if not UI.is_building_all and UI.active_cancel_event is None:
+        UI.red_flag = False
     UI.logprint(
         "Step 2.5 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
     )

@@ -275,7 +275,7 @@ class _OverpassRequestCoordinator:
     @contextmanager
     def _lock_only(self, cancel_check=None):
         """Acquire the file lock without waiting for an existing cooldown."""
-        cancel_check = cancel_check or (lambda: getattr(UI, "red_flag", False))
+        cancel_check = cancel_check or UI.is_cancel_requested
         self._acquire_thread_lock(cancel_check)
         handle = None
         try:
@@ -325,7 +325,7 @@ class _OverpassRequestCoordinator:
     @contextmanager
     def slot(self, cancel_check=None):
         """Yield one exclusive Overpass HTTP request slot."""
-        cancel_check = cancel_check or (lambda: getattr(UI, "red_flag", False))
+        cancel_check = cancel_check or UI.is_cancel_requested
         self._acquire_thread_lock(cancel_check)
         handle = None
         try:
@@ -1467,7 +1467,7 @@ def _download_osm_query_groups(
                 query_payload, bbox, server_code, return_metadata=True
             )
         )
-        if UI.red_flag:
+        if UI.is_cancel_requested():
             return None, responses, {
                 "query": _overpass_query_label(query_payload),
                 "group_index": group_index,
@@ -1992,7 +1992,7 @@ def OSM_query_to_OSM_layer(
     else:
         response = response_result
         response_info = {}
-    if UI.red_flag:
+    if UI.is_cancel_requested():
         _record_layer_failure(
             osm_layer,
             {"layer": "standalone", "reason": "cancelled"},
@@ -2398,7 +2398,7 @@ def get_overpass_data(query, bbox, server_code=None, return_metadata=False):
                     "request failed:",
                     error,
                 )
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 metadata = {"status": FAILED, "reason": "cancelled", "attempts": attempts}
                 return (None, metadata) if return_metadata else 0
 

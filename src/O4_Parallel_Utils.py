@@ -45,7 +45,7 @@ class parallel_worker(threading.Thread):
                     ),
                     self._progress.get("message"),
                 )
-            if UI.red_flag:
+            if UI.is_cancel_requested():
                 return 0
 
 ################################################################################
@@ -61,7 +61,11 @@ def parallel_launch(task, queue, nbr_workers, progress=None):
 def parallel_join(workers):
     for worker in workers:
         worker.join()
-    return int(bool(workers) and all(worker.success for worker in workers) and not UI.red_flag)
+    return int(
+        bool(workers)
+        and all(worker.success for worker in workers)
+        and not UI.is_cancel_requested()
+    )
 
 ################################################################################
 def parallel_execute(task, execute_queue, nbr_workers, progress=None):
@@ -75,7 +79,11 @@ def parallel_execute(task, execute_queue, nbr_workers, progress=None):
         workers.append(worker)
     for worker in workers:
         worker.join()
-    return int(bool(success[0]) and all(worker.success for worker in workers) and not UI.red_flag)
+    return int(
+        bool(success[0])
+        and all(worker.success for worker in workers)
+        and not UI.is_cancel_requested()
+    )
 
 ################################################################################
 # Multiprocessing support
@@ -120,13 +128,17 @@ class ReusableMultiprocessingPool:
                     )
                 if done % log_step == 0 or done == total:
                     UI.vprint(1, f"   ... {done}/{total} ({int(100 * done / total)}%)")
-                if UI.red_flag:
+                if UI.is_cancel_requested():
                     self.terminate()
                     break
         except Exception as e:
             UI.vprint(1, f"Pool execution error: {e}")
             self.terminate()
-        return int(done == total and success == total and not UI.red_flag)
+        return int(
+            done == total
+            and success == total
+            and not UI.is_cancel_requested()
+        )
 
     def close(self):
         if not self._closed:

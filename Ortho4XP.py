@@ -155,7 +155,10 @@ if __name__ == '__main__':
                     print(cmd_line); sys.exit(2)
             try:
                 result = TILE.build_continuous(tile)
-                exit_code = _continuous_build_exit_code(result, UI.red_flag)
+                exit_code = _continuous_build_exit_code(
+                    result,
+                    UI.red_flag or getattr(UI, "last_operation_cancelled", False),
+                )
                 if exit_code == CLI_DEGRADED_EXIT_CODE:
                     print(
                         UI.ui_text(
