@@ -49,6 +49,7 @@ _TILE_DIR = re.compile(r"zOrtho4XP_(?P<lat>[+-]\d{1,3})(?P<lon>[+-]\d{1,3})$")
 _TILE_CONFIG = re.compile(
     r"Ortho4XP_(?P<lat>[+-]\d{1,3})(?P<lon>[+-]\d{1,3})\.cfg$"
 )
+_REPAIR_WEBP_QUALITY = 95
 
 
 def _parse_image_name(name):
@@ -209,6 +210,16 @@ def _existing_sibling_cache_paths(target, file_dir, target_path):
         if os.path.abspath(path) != os.path.abspath(target_path)
         and os.path.isfile(path)
     ]
+
+
+def _save_rebuilt_cache_image(image, path):
+    if Path(path).suffix.lower() == ".webp":
+        configured_quality = getattr(IMG, "imagery_cache_quality", "")
+        quality = configured_quality or _REPAIR_WEBP_QUALITY
+        _, quality = CACHE.validate_cache_settings("webp", quality)
+        CACHE.save_cache_image(image, path, "webp", quality)
+        return
+    IMG.save_imagery_cache_image(image, path, jpeg_quality=90)
 
 
 def _parent_candidates(target, file_dir):
@@ -378,11 +389,11 @@ def _repair_one(target, tile, backup_entries, parent_download_cache=None):
     dds_backup = next(entry for entry in backup_entries if entry["path"] == dds_path)
     try:
         os.makedirs(file_dir, exist_ok=True)
-        IMG.save_imagery_cache_image(image, target_path, jpeg_quality=90)
+        _save_rebuilt_cache_image(image, target_path)
         if not _image_is_4096(target_path):
             raise ValueError("rebuilt JPEG failed 4096x4096 validation")
         for sibling_path in sibling_paths:
-            IMG.save_imagery_cache_image(image, sibling_path, jpeg_quality=90)
+            _save_rebuilt_cache_image(image, sibling_path)
             if not _image_is_4096(sibling_path):
                 raise ValueError(
                     f"rebuilt cache failed 4096x4096 validation: {sibling_path}"

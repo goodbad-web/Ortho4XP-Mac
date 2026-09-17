@@ -452,7 +452,6 @@ def test_repair_cli_refreshes_existing_sibling_cache(monkeypatch, tmp_path):
         {"path": str(sibling_path), "exists": True, "backup_path": None},
         {"path": str(dds_path), "exists": False, "backup_path": None},
     ]
-    saved_paths = []
 
     monkeypatch.setattr(
         repair,
@@ -464,15 +463,10 @@ def test_repair_cli_refreshes_existing_sibling_cache(monkeypatch, tmp_path):
         "_rebuild_from_parent",
         lambda *_args, **_kwargs: (
             1,
-            Image.new("RGB", (4096, 4096), "blue"),
+            Image.new("RGB", (1, 1), "blue"),
             18,
             "parent.jpg",
         ),
-    )
-    monkeypatch.setattr(
-        repair.IMG,
-        "save_imagery_cache_image",
-        lambda _image, path, **_kwargs: saved_paths.append(path),
     )
     monkeypatch.setattr(repair, "_image_is_4096", lambda _path: True)
     monkeypatch.setattr(repair.IMG, "convert_texture", lambda *_args, **_kwargs: 1)
@@ -485,7 +479,9 @@ def test_repair_cli_refreshes_existing_sibling_cache(monkeypatch, tmp_path):
     result = repair._repair_one(target, tile, backup_entries)
 
     assert result["status"] == "repaired"
-    assert saved_paths == [str(target_path), str(sibling_path)]
+    with Image.open(sibling_path) as sibling:
+        assert sibling.format == "WEBP"
+        assert sibling.size == (1, 1)
 
 
 def test_repair_cli_apply_rolls_back_one_target_and_records_sha256(
