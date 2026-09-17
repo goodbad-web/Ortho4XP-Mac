@@ -1280,6 +1280,18 @@ def test_non_all_in_one_keeps_aggregate_query_behavior(monkeypatch, tmp_path):
         assert not Path(item_cache).exists()
         assert not Path(item_manifest).exists()
 
+    monkeypatch.setattr(
+        OSM,
+        "get_overpass_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("verified aggregate cache should avoid network")
+        ),
+    )
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    assert calls == [tuple(queries)]
+
 
 def test_schema_v1_verified_manifest_remains_compatible(monkeypatch, tmp_path):
     cache = tmp_path / "tile_water.osm.bz2"

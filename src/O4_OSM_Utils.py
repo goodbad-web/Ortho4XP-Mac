@@ -1134,11 +1134,15 @@ def _validate_request_plan(manifest, queries, tags_of_interest, allow_unbound_re
     if split_reason not in (None, "http_504", "item_cache"):
         return None
 
-    expected_groups = (
-        [[query] for query in expected_queries]
-        if split_reason == "item_cache"
-        else _partition_osm_queries(expected_queries)
-    )
+    if split_reason == "item_cache":
+        expected_groups = [[query] for query in expected_queries]
+    elif split_reason == "http_504":
+        expected_groups = _partition_osm_queries(expected_queries)
+    else:
+        # A normal request is published as one group, even when the query
+        # contains several clauses.  Only an explicit 504 split changes the
+        # request partition represented by the manifest.
+        expected_groups = [expected_queries]
     if len(expected_groups) != group_count:
         return None
     for index, (manifest_group, expected_group) in enumerate(
