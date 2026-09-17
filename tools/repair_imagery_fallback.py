@@ -196,6 +196,21 @@ def _target_context(target, tile):
     return file_dir, target_path, dds_path
 
 
+def _existing_sibling_cache_paths(target, file_dir, target_path):
+    return [
+        path
+        for path in CACHE.cache_paths(
+            file_dir,
+            target["til_x_left"],
+            target["til_y_top"],
+            target["zoomlevel"],
+            target["provider_code"],
+        )
+        if os.path.abspath(path) != os.path.abspath(target_path)
+        and os.path.isfile(path)
+    ]
+
+
 def _parent_candidates(target, file_dir):
     candidates = []
     for parent_zl in range(target["zoomlevel"] - 1, 15, -1):
@@ -329,6 +344,7 @@ def _restore_direct_conversion(previous):
 
 def _repair_one(target, tile, backup_entries, parent_download_cache=None):
     file_dir, target_path, dds_path = _target_context(target, tile)
+    sibling_paths = _existing_sibling_cache_paths(target, file_dir, target_path)
     expected_dimensions = IMG.expected_texture_dimensions(
         tile,
         target["til_x_left"],
@@ -356,12 +372,21 @@ def _repair_one(target, tile, backup_entries, parent_download_cache=None):
     target_backup = next(
         entry for entry in backup_entries if entry["path"] == target_path
     )
+    sibling_backups = [
+        entry for entry in backup_entries if entry["path"] in sibling_paths
+    ]
     dds_backup = next(entry for entry in backup_entries if entry["path"] == dds_path)
     try:
         os.makedirs(file_dir, exist_ok=True)
         IMG.save_imagery_cache_image(image, target_path, jpeg_quality=90)
         if not _image_is_4096(target_path):
             raise ValueError("rebuilt JPEG failed 4096x4096 validation")
+        for sibling_path in sibling_paths:
+            IMG.save_imagery_cache_image(image, sibling_path, jpeg_quality=90)
+            if not _image_is_4096(sibling_path):
+                raise ValueError(
+                    f"rebuilt cache failed 4096x4096 validation: {sibling_path}"
+                )
         if not IMG.convert_texture(
             tile,
             target["til_x_left"],
@@ -390,7 +415,7 @@ def _repair_one(target, tile, backup_entries, parent_download_cache=None):
         }
     except Exception as error:
         rollback_errors = []
-        for entry in (target_backup, dds_backup):
+        for entry in (target_backup, *sibling_backups, dds_backup):
             try:
                 _restore_entry(entry)
             except Exception as rollback_error:
@@ -494,6 +519,9 @@ def main(argv=None):
                 "target_path": target_path,
                 "dds_path": dds_path,
                 "candidates": candidates,
+                "sibling_paths": _existing_sibling_cache_paths(
+                    target, file_dir, target_path
+                ),
             }
             contexts.append(context)
             if not args.apply:
@@ -503,6 +531,7 @@ def main(argv=None):
                         "status": "would_repair",
                         "target_path": target_path,
                         "dds_path": dds_path,
+                        "sibling_paths": context["sibling_paths"],
                         "parent_candidates": candidates,
                     }
                 )
@@ -519,7 +548,13 @@ def main(argv=None):
         report["backup_dir"] = str(backup_dir.resolve())
         paths = []
         for context in contexts:
-            paths.extend((context["target_path"], context["dds_path"]))
+            paths.extend(
+                (
+                    context["target_path"],
+                    *context["sibling_paths"],
+                    context["dds_path"],
+                )
+            )
         backup_entries = []
         try:
             for index, path in enumerate(dict.fromkeys(paths)):
@@ -557,7 +592,11 @@ def main(argv=None):
                     entry
                     for entry in backup_entries
                     if entry["path"]
-                    in (context["target_path"], context["dds_path"])
+                    in (
+                        context["target_path"],
+                        *context["sibling_paths"],
+                        context["dds_path"],
+                    )
                 ]
                 previous_ui_state = _configure_direct_conversion(context["tile"])
                 try:
