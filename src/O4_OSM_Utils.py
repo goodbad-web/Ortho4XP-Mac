@@ -1129,10 +1129,16 @@ def _validate_request_plan(manifest, queries, tags_of_interest, allow_unbound_re
         len(expected_queries)
     ):
         return None
-    if split_reason not in (None, "http_504"):
+    if split_reason == "item_cache" and group_count != len(expected_queries):
+        return None
+    if split_reason not in (None, "http_504", "item_cache"):
         return None
 
-    expected_groups = _partition_osm_queries(expected_queries)
+    expected_groups = (
+        [[query] for query in expected_queries]
+        if split_reason == "item_cache"
+        else _partition_osm_queries(expected_queries)
+    )
     if len(expected_groups) != group_count:
         return None
     for index, (manifest_group, expected_group) in enumerate(
@@ -1242,6 +1248,114 @@ def _build_cache_manifest(
     return manifest
 
 
+def _osm_query_cache_paths(lat, lon, cached_suffix, query, tags_of_interest):
+    query_signature = _query_signature([query], tags_of_interest)
+    filename = FNAMES.osm_query_cached(
+        lat, lon, cached_suffix, query_signature
+    )
+    return query_signature, filename, filename + ".manifest.json"
+
+
+def _write_bz2_atomic(filename, payload):
+    """Publish one raw OSM response without exposing a partial file."""
+    directory = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(directory, exist_ok=True)
+    temporary_filename = None
+    try:
+        fd, temporary_filename = tempfile.mkstemp(
+            prefix=os.path.basename(filename) + ".tmp-",
+            dir=directory,
+        )
+        os.close(fd)
+        with bz2.open(temporary_filename, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary_filename, filename)
+        temporary_filename = None
+        return True
+    except OSError as error:
+        UI.vprint(1, "    Could not atomically write OSM cache", filename, ":", error)
+        return False
+    finally:
+        if temporary_filename is not None:
+            try:
+                os.remove(temporary_filename)
+            except OSError:
+                pass
+
+
+def _publish_osm_query_cache(
+    query,
+    payload,
+    response_info,
+    lat,
+    lon,
+    tags_of_interest,
+    cached_suffix,
+):
+    """Validate and publish one logical query cache and its manifest."""
+    input_tags, target_tags = _build_osm_tag_filters(
+        [query], tags_of_interest
+    )
+    candidate = OSM_layer()
+    if not candidate.update_dicosm(payload, input_tags, target_tags):
+        return False
+
+    _, filename, manifest_filename = _osm_query_cache_paths(
+        lat, lon, cached_suffix, query, tags_of_interest
+    )
+    has_unverified_cache = os.path.isfile(filename) or os.path.isfile(
+        manifest_filename
+    )
+    if has_unverified_cache and not _preserve_unverified_osm_cache(
+        filename, manifest_filename
+    ):
+        UI.vprint(
+            1,
+            "    WARNING: Keeping the OSM query data in memory; cache publication was skipped.",
+        )
+        return False
+    if not _write_bz2_atomic(filename, payload):
+        return False
+
+    response_info = dict(response_info or {})
+    response_info["group_index"] = 0
+    response_info["group_queries"] = _manifest_queries([query])
+    manifest = _build_cache_manifest(
+        cached_suffix,
+        (lat, lon, lat + 1, lon + 1),
+        [query],
+        tags_of_interest,
+        [response_info],
+        candidate,
+        filename,
+        request_plan=_build_request_plan([[query]], tags_of_interest, None),
+    )
+    if not _write_json_atomic(manifest_filename, manifest):
+        UI.vprint(
+            1,
+            "    WARNING: OSM query cache remains unverified:",
+            filename,
+        )
+        return False
+    return True
+
+
+def _read_bz2_payload(filename):
+    try:
+        with bz2.open(filename, "rb") as stream:
+            return stream.read()
+    except (OSError, EOFError, ValueError):
+        return None
+
+
+def _build_item_cache_request_plan(queries, tags_of_interest):
+    return _build_request_plan(
+        [[query] for query in queries],
+        tags_of_interest,
+        "item_cache",
+    )
+
+
 def _load_verified_cache(
     osm_layer, filename, manifest_filename, layer_name, bbox, queries, tags_of_interest,
     input_tags, target_tags, allow_unbound_request=False,
@@ -1348,6 +1462,7 @@ def _load_verified_cache(
             "manifest": manifest_filename,
             "validity": manifest.get("validity", VALID_DATA),
             "counts": manifest.get("counts", {}),
+            "responses": responses,
         }
         UI.vprint(1, "    * Recycling verified OSM data from", filename)
         UI.logprint(
@@ -1518,6 +1633,250 @@ def _download_osm_query_groups(
             "reason": "response-parse-failed",
         }
     return candidate_layer, responses, None
+
+
+def _run_osm_queries_with_item_cache(
+    queries,
+    osm_layer,
+    lat,
+    lon,
+    tags_of_interest,
+    server_code,
+    cached_suffix,
+):
+    """Reuse valid query caches and download only missing logical queries."""
+    queries = _normalize_osm_queries(queries)
+    input_tags, target_tags = _build_osm_tag_filters(
+        queries, tags_of_interest
+    )
+    bbox = (lat, lon, lat + 1, lon + 1)
+    cached_data_filename = FNAMES.osm_cached(lat, lon, cached_suffix)
+    aggregate_manifest_filename = FNAMES.osm_cache_manifest(
+        lat, lon, cached_suffix
+    )
+    aggregate_unverified = os.path.isfile(cached_data_filename) or os.path.isfile(
+        aggregate_manifest_filename
+    )
+    if aggregate_unverified:
+        UI.vprint(
+            1,
+            "    * Ignoring unverified OSM cache (manifest missing or mismatched):",
+            cached_data_filename,
+        )
+        UI.logprint(
+            "[OSM] cache=unverified layer=",
+            cached_suffix,
+            "data=",
+            cached_data_filename,
+        )
+
+    payloads = []
+    responses = []
+    missing = []
+    for query_index, query in enumerate(queries):
+        query_signature, filename, item_manifest_filename = _osm_query_cache_paths(
+            lat, lon, cached_suffix, query, tags_of_interest
+        )
+        item_layer = OSM_layer()
+        item_input_tags, item_target_tags = _build_osm_tag_filters(
+            [query], tags_of_interest
+        )
+        if _load_verified_cache(
+            item_layer,
+            filename,
+            item_manifest_filename,
+            cached_suffix,
+            bbox,
+            [query],
+            tags_of_interest,
+            item_input_tags,
+            item_target_tags,
+        ):
+            payload = _read_bz2_payload(filename)
+            if payload is not None:
+                payloads.append(payload)
+                item_responses = (item_layer.last_cache_info or {}).get(
+                    "responses", []
+                )
+                response_info = dict(item_responses[0]) if item_responses else {
+                    "status": VALID_DATA,
+                    "data_status": VALID_DATA,
+                    "http_status": 200,
+                    "server": overpass_server_choice,
+                }
+                response_info["group_index"] = query_index
+                response_info["group_queries"] = _manifest_queries([query])
+                responses.append(response_info)
+                UI.logprint(
+                    "[OSM] cache=item-verified layer=",
+                    cached_suffix,
+                    "query_signature=",
+                    query_signature,
+                )
+                UI.vprint(
+                    1,
+                    "    * Recycling verified OSM query data from",
+                    filename,
+                )
+                continue
+
+        UI.logprint(
+            "[OSM] cache=item-missing layer=",
+            cached_suffix,
+            "query_signature=",
+            query_signature,
+        )
+        UI.vprint(
+            1,
+            "    * OSM query cache missing or invalid:",
+            filename,
+        )
+        missing.append((query_index, query))
+
+    for query_index, query in missing:
+        UI.vprint(
+            1,
+            "    * Downloading OSM data for",
+            _overpass_query_label(query),
+        )
+        response, response_info = _response_with_metadata(
+            get_overpass_data(
+                query, bbox, server_code, return_metadata=True
+            )
+        )
+        if UI.is_cancel_requested():
+            _record_layer_failure(
+                osm_layer,
+                {
+                    "layer": cached_suffix,
+                    "query": _overpass_query_label(query),
+                    "group_index": query_index,
+                    "reason": "cancelled",
+                    "metadata": response_info,
+                },
+            )
+            return OSM_FAILED
+        if not response:
+            _record_layer_failure(
+                osm_layer,
+                {
+                    "layer": cached_suffix,
+                    "query": _overpass_query_label(query),
+                    "group_index": query_index,
+                    "reason": "no-valid-response",
+                    "metadata": response_info,
+                },
+            )
+            return OSM_FAILED
+
+        data_status, reason, counts = _inspect_osm_response(response)
+        if data_status is None:
+            _record_layer_failure(
+                osm_layer,
+                {
+                    "layer": cached_suffix,
+                    "query": _overpass_query_label(query),
+                    "group_index": query_index,
+                    "reason": reason or "response-parse-failed",
+                    "metadata": response_info,
+                },
+            )
+            return OSM_FAILED
+        response_info = dict(response_info or {})
+        response_info.setdefault("status", data_status)
+        response_info.setdefault("data_status", data_status)
+        response_info.setdefault("http_status", 200)
+        response_info.setdefault("counts", counts)
+        response_info.setdefault("server", server_code or overpass_server_choice)
+        response_info["group_index"] = query_index
+        response_info["group_queries"] = _manifest_queries([query])
+
+        candidate = OSM_layer()
+        if not candidate.update_dicosm(response, input_tags, target_tags):
+            _record_layer_failure(
+                osm_layer,
+                {
+                    "layer": cached_suffix,
+                    "query": _overpass_query_label(query),
+                    "group_index": query_index,
+                    "reason": "response-parse-failed",
+                    "metadata": response_info,
+                },
+            )
+            return OSM_FAILED
+        _publish_osm_query_cache(
+            query,
+            response,
+            response_info,
+            lat,
+            lon,
+            tags_of_interest,
+            cached_suffix,
+        )
+        payloads.append(response)
+        responses.append(response_info)
+        UI.logprint(
+            "[OSM] cache=item-downloaded layer=",
+            cached_suffix,
+            "query_signature=",
+            _query_signature([query], tags_of_interest),
+        )
+
+    try:
+        merged_payload = _merge_osm_payloads(payloads)
+    except (ElementTree.ParseError, TypeError, ValueError) as error:
+        _record_layer_failure(
+            osm_layer,
+            {
+                "layer": cached_suffix,
+                "reason": "response-parse-failed",
+                "error": repr(error),
+            },
+        )
+        return OSM_FAILED
+    candidate_layer = OSM_layer()
+    if not candidate_layer.update_dicosm(merged_payload, input_tags, target_tags):
+        _record_layer_failure(
+            osm_layer,
+            {"layer": cached_suffix, "reason": "response-parse-failed"},
+        )
+        return OSM_FAILED
+    _replace_layer(osm_layer, candidate_layer)
+    osm_layer.last_result = OSM_COMPLETE
+    osm_layer.last_failure = None
+
+    if aggregate_unverified and not _preserve_unverified_osm_cache(
+        cached_data_filename, aggregate_manifest_filename
+    ):
+        UI.vprint(
+            1,
+            "    WARNING: Keeping the new OSM data in memory; cache publication was skipped.",
+        )
+    elif osm_layer.write_to_file(cached_data_filename):
+        manifest = _build_cache_manifest(
+            cached_suffix,
+            bbox,
+            queries,
+            tags_of_interest,
+            sorted(
+                responses,
+                key=lambda response: response.get("group_index", 0),
+            ),
+            osm_layer,
+            cached_data_filename,
+            request_plan=_build_item_cache_request_plan(
+                queries, tags_of_interest
+            ),
+        )
+        if not _write_json_atomic(aggregate_manifest_filename, manifest):
+            UI.vprint(
+                1,
+                "    WARNING: OSM cache remains unverified:",
+                cached_data_filename,
+            )
+    else:
+        UI.vprint(1, "    WARNING: Could not save OSM cache", cached_data_filename)
+    return OSM_COMPLETE
 
 
 def _retry_after_seconds(response):
@@ -1788,6 +2147,17 @@ def OSM_queries_to_OSM_layer(
         target_tags,
     ):
         return OSM_COMPLETE
+
+    if cached_suffix and UI.is_building_all:
+        return _run_osm_queries_with_item_cache(
+            queries,
+            osm_layer,
+            lat,
+            lon,
+            tags_of_interest,
+            server_code,
+            cached_suffix,
+        )
 
     if cached_suffix and os.path.isfile(cached_data_filename):
         UI.vprint(

@@ -31,6 +31,10 @@ class Response:
 
 @pytest.fixture(autouse=True)
 def isolated_overpass_request_coordinator(monkeypatch, tmp_path):
+    isolated_osm_root = tmp_path / "OSM_data"
+    monkeypatch.setattr(OSM.FNAMES, "OSM_dir", str(isolated_osm_root))
+    monkeypatch.setattr(FNAMES, "OSM_dir", str(isolated_osm_root))
+    monkeypatch.setattr(OSM.UI, "is_building_all", True)
     clock = [1000.0]
     sleeps = []
 
@@ -426,7 +430,9 @@ def test_unverified_cache_is_preserved_when_new_generation_is_published(
     assert manifest.exists()
 
 
-def test_manifest_bbox_and_hash_mismatch_are_not_reused(monkeypatch, tmp_path):
+def test_aggregate_manifest_mismatch_falls_back_to_verified_item_cache(
+    monkeypatch, tmp_path
+):
     cache = tmp_path / "tile_water.osm.bz2"
     manifest = tmp_path / "tile_water.osm.bz2.manifest.json"
     monkeypatch.setattr(OSM.FNAMES, "osm_cached", lambda *args: str(cache))
@@ -463,13 +469,13 @@ def test_manifest_bbox_and_hash_mismatch_are_not_reused(monkeypatch, tmp_path):
     assert OSM.OSM_queries_to_OSM_layer(
         queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_COMPLETE
-    assert len(network_calls) == 2
+    assert len(network_calls) == 1
 
     cache.write_bytes(cache.read_bytes() + b"tampered")
     assert OSM.OSM_queries_to_OSM_layer(
         queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_COMPLETE
-    assert len(network_calls) == 3
+    assert len(network_calls) == 1
 
 
 def test_unverified_cache_is_not_reused_and_partial_query_is_discarded(
@@ -1016,7 +1022,7 @@ def test_non_504_failure_does_not_trigger_query_split(monkeypatch):
     assert calls == [tuple(queries)]
 
 
-def test_split_failure_discards_partial_layer_and_does_not_publish_cache(
+def test_missing_item_failure_preserves_successful_item_cache(
     monkeypatch, tmp_path
 ):
     cache = tmp_path / "tile_water.osm.bz2"
@@ -1034,15 +1040,6 @@ def test_split_failure_discards_partial_layer_and_does_not_publish_cache(
     def network(query, bbox, server_code=None, return_metadata=False):
         calls.append(query)
         if len(calls) == 1:
-            result = (
-                None,
-                {
-                    "status": OSM.FAILED,
-                    "reason": "all-covered-servers-failed",
-                    "attempts": [{"http_status": 504}],
-                },
-            )
-        elif len(calls) == 2:
             result = (_osm_with_node(), _valid_response_info())
         else:
             result = (
@@ -1068,13 +1065,30 @@ def test_split_failure_discards_partial_layer_and_does_not_publish_cache(
     assert OSM.OSM_queries_to_OSM_layer(
         queries, layer, 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_FAILED
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert not layer.dicosmn
     assert not manifest.exists()
     assert cache.read_bytes() == old_payload
 
+    first_item = OSM._osm_query_cache_paths(
+        30, 130, "water", queries[0], []
+    )
+    assert Path(first_item[1]).exists()
+    assert Path(first_item[2]).exists()
 
-def test_split_success_publishes_one_grouped_manifest_and_reuses_it(
+    def retry_missing_item(query, bbox, server_code=None, return_metadata=False):
+        calls.append(query)
+        return _osm_with_node(), _valid_response_info()
+
+    monkeypatch.setattr(OSM, "get_overpass_data", retry_missing_item)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    assert calls[2] == queries[1]
+    assert manifest.exists()
+
+
+def test_item_caches_publish_and_reuse_without_network(
     monkeypatch, tmp_path
 ):
     cache = tmp_path / "tile_water.osm.bz2"
@@ -1089,17 +1103,7 @@ def test_split_success_publishes_one_grouped_manifest_and_reuses_it(
 
     def network(query, bbox, server_code=None, return_metadata=False):
         calls.append(query)
-        if len(calls) == 1:
-            result = (
-                None,
-                {
-                    "status": OSM.FAILED,
-                    "reason": "all-covered-servers-failed",
-                    "attempts": [{"http_status": 504}],
-                },
-            )
-        else:
-            result = (_osm_with_node(), _valid_response_info())
+        result = (_osm_with_node(), _valid_response_info())
         return result if return_metadata else result[0]
 
     monkeypatch.setattr(OSM, "get_overpass_data", network)
@@ -1115,9 +1119,18 @@ def test_split_success_publishes_one_grouped_manifest_and_reuses_it(
     ) == OSM.OSM_COMPLETE
     saved = json.loads(manifest.read_text(encoding="utf-8"))
     assert saved["schema_version"] == 2
-    assert saved["request_plan"]["group_count"] == 2
-    assert saved["request_plan"]["split_reason"] == "http_504"
-    assert [response["group_index"] for response in saved["responses"]] == [0, 1]
+    assert saved["request_plan"]["group_count"] == len(queries)
+    assert saved["request_plan"]["split_reason"] == "item_cache"
+    assert [response["group_index"] for response in saved["responses"]] == list(
+        range(len(queries))
+    )
+    assert len(calls) == len(queries)
+    for query in queries:
+        _, item_cache, item_manifest = OSM._osm_query_cache_paths(
+            30, 130, "water", query, []
+        )
+        assert Path(item_cache).exists()
+        assert Path(item_manifest).exists()
 
     def fail_network(*args, **kwargs):
         raise AssertionError("grouped verified cache should avoid network")
@@ -1126,7 +1139,146 @@ def test_split_success_publishes_one_grouped_manifest_and_reuses_it(
     assert OSM.OSM_queries_to_OSM_layer(
         queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_COMPLETE
-    assert len(calls) == 3
+    assert len(calls) == len(queries)
+
+
+def test_valid_empty_item_cache_is_reused(monkeypatch, tmp_path):
+    cache = tmp_path / "tile_water.osm.bz2"
+    manifest = tmp_path / "tile_water.osm.bz2.manifest.json"
+    monkeypatch.setattr(OSM.FNAMES, "osm_cached", lambda *args: str(cache))
+    monkeypatch.setattr(OSM.FNAMES, "osm_cache_manifest", lambda *args: str(manifest))
+    queries = ['way["natural"="water"]', 'way["waterway"="dock"]']
+    calls = []
+
+    def network(query, bbox, server_code=None, return_metadata=False):
+        calls.append(query)
+        if query == queries[0]:
+            result = (b"<osm></osm>", _valid_response_info(OSM.VALID_EMPTY))
+        else:
+            result = (_osm_with_node(), _valid_response_info())
+        return result if return_metadata else result[0]
+
+    monkeypatch.setattr(OSM, "get_overpass_data", network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    assert len(calls) == 2
+
+    aggregate = json.loads(manifest.read_text(encoding="utf-8"))
+    aggregate["bbox"] = [31.0, 130.0, 32.0, 131.0]
+    manifest.write_text(json.dumps(aggregate), encoding="utf-8")
+
+    def fail_network(*args, **kwargs):
+        raise AssertionError("verified item caches should avoid network")
+
+    monkeypatch.setattr(OSM, "get_overpass_data", fail_network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+
+
+def test_item_cache_hash_mismatch_redownloads_only_that_query(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "tile_water.osm.bz2"
+    manifest = tmp_path / "tile_water.osm.bz2.manifest.json"
+    monkeypatch.setattr(OSM.FNAMES, "osm_cached", lambda *args: str(cache))
+    monkeypatch.setattr(OSM.FNAMES, "osm_cache_manifest", lambda *args: str(manifest))
+    queries = ['way["natural"="water"]', 'way["waterway"="dock"]']
+    calls = []
+
+    def network(query, bbox, server_code=None, return_metadata=False):
+        calls.append(query)
+        result = (_osm_with_node(), _valid_response_info())
+        return result if return_metadata else result[0]
+
+    monkeypatch.setattr(OSM, "get_overpass_data", network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    _, first_cache, _ = OSM._osm_query_cache_paths(
+        30, 130, "water", queries[0], []
+    )
+    Path(first_cache).write_bytes(Path(first_cache).read_bytes() + b"tampered")
+    aggregate = json.loads(manifest.read_text(encoding="utf-8"))
+    aggregate["bbox"] = [31.0, 130.0, 32.0, 131.0]
+    manifest.write_text(json.dumps(aggregate), encoding="utf-8")
+
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    assert calls == [queries[0], queries[1], queries[0]]
+
+
+def test_tuple_query_is_cached_as_one_logical_item(monkeypatch, tmp_path):
+    cache = tmp_path / "tile_airports.osm.bz2"
+    manifest = tmp_path / "tile_airports.osm.bz2.manifest.json"
+    monkeypatch.setattr(OSM.FNAMES, "osm_cached", lambda *args: str(cache))
+    monkeypatch.setattr(OSM.FNAMES, "osm_cache_manifest", lambda *args: str(manifest))
+    query = (
+        'node["aeroway"]',
+        'way["aeroway"]',
+        'rel["aeroway"]',
+    )
+    calls = []
+
+    def network(request, bbox, server_code=None, return_metadata=False):
+        calls.append(request)
+        result = (b"<osm></osm>", _valid_response_info(OSM.VALID_EMPTY))
+        return result if return_metadata else result[0]
+
+    monkeypatch.setattr(OSM, "get_overpass_data", network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        [query], OSM.OSM_layer(), 30, 130, ["all"], cached_suffix="airports"
+    ) == OSM.OSM_COMPLETE
+    assert calls == [query]
+    _, item_cache, item_manifest = OSM._osm_query_cache_paths(
+        30, 130, "airports", query, ["all"]
+    )
+    assert Path(item_cache).exists()
+    assert Path(item_manifest).exists()
+
+    aggregate = json.loads(manifest.read_text(encoding="utf-8"))
+    aggregate["bbox"] = [31.0, 130.0, 32.0, 131.0]
+    manifest.write_text(json.dumps(aggregate), encoding="utf-8")
+    monkeypatch.setattr(
+        OSM,
+        "get_overpass_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("tuple item cache should avoid network")
+        ),
+    )
+    assert OSM.OSM_queries_to_OSM_layer(
+        [query], OSM.OSM_layer(), 30, 130, ["all"], cached_suffix="airports"
+    ) == OSM.OSM_COMPLETE
+
+
+def test_non_all_in_one_keeps_aggregate_query_behavior(monkeypatch, tmp_path):
+    monkeypatch.setattr(OSM.UI, "is_building_all", False)
+    cache = tmp_path / "tile_water.osm.bz2"
+    manifest = tmp_path / "tile_water.osm.bz2.manifest.json"
+    monkeypatch.setattr(OSM.FNAMES, "osm_cached", lambda *args: str(cache))
+    monkeypatch.setattr(OSM.FNAMES, "osm_cache_manifest", lambda *args: str(manifest))
+    queries = ['way["natural"="water"]', 'way["waterway"="dock"]']
+    calls = []
+
+    def network(query, bbox, server_code=None, return_metadata=False):
+        calls.append(query)
+        result = (_osm_with_node(), _valid_response_info())
+        return result if return_metadata else result[0]
+
+    monkeypatch.setattr(OSM, "get_overpass_data", network)
+    assert OSM.OSM_queries_to_OSM_layer(
+        queries, OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
+    ) == OSM.OSM_COMPLETE
+    assert calls == [tuple(queries)]
+    assert cache.exists()
+    for query in queries:
+        _, item_cache, item_manifest = OSM._osm_query_cache_paths(
+            30, 130, "water", query, []
+        )
+        assert not Path(item_cache).exists()
+        assert not Path(item_manifest).exists()
 
 
 def test_schema_v1_verified_manifest_remains_compatible(monkeypatch, tmp_path):
@@ -1171,7 +1323,7 @@ def test_schema_v1_verified_manifest_remains_compatible(monkeypatch, tmp_path):
     ) == OSM.OSM_COMPLETE
 
 
-def test_grouped_manifest_partition_mismatch_is_not_reused(monkeypatch, tmp_path):
+def test_item_manifest_mismatch_is_not_reused(monkeypatch, tmp_path):
     cache = tmp_path / "tile_water.osm.bz2"
     manifest = tmp_path / "tile_water.osm.bz2.manifest.json"
     query = 'way["natural"="water"]'
@@ -1192,16 +1344,23 @@ def test_grouped_manifest_partition_mismatch_is_not_reused(monkeypatch, tmp_path
     assert OSM.OSM_queries_to_OSM_layer(
         [query], OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_COMPLETE
-    saved = json.loads(manifest.read_text(encoding="utf-8"))
-    saved["request_plan"]["groups"][0]["queries"] = [
+    aggregate_saved = json.loads(manifest.read_text(encoding="utf-8"))
+    aggregate_saved["bbox"] = [31.0, 130.0, 32.0, 131.0]
+    manifest.write_text(json.dumps(aggregate_saved), encoding="utf-8")
+    _, item_cache, item_manifest = OSM._osm_query_cache_paths(
+        30, 130, "water", query, []
+    )
+    item_saved = json.loads(Path(item_manifest).read_text(encoding="utf-8"))
+    item_saved["request_plan"]["groups"][0]["queries"] = [
         'way["waterway"="dock"]'
     ]
-    manifest.write_text(json.dumps(saved), encoding="utf-8")
+    Path(item_manifest).write_text(json.dumps(item_saved), encoding="utf-8")
 
     assert OSM.OSM_queries_to_OSM_layer(
         [query], OSM.OSM_layer(), 30, 130, [], cached_suffix="water"
     ) == OSM.OSM_COMPLETE
     assert len(calls) == 2
+    assert Path(item_cache).exists()
 
 
 def test_overpass_request_coordinator_serializes_separate_threads(tmp_path):

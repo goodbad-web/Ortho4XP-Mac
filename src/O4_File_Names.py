@@ -365,6 +365,20 @@ def osm_cache_manifest(lat, lon, cached_suffix):
     return osm_cached(lat, lon, cached_suffix) + ".manifest.json"
 
 
+def osm_query_cached(lat, lon, cached_suffix, query_signature):
+    """Return the stable cache path for one logical OSM query."""
+    return os.path.join(
+        OSM_dir,
+        long_latlon(lat, lon),
+        short_latlon(lat, lon)
+        + "_"
+        + str(cached_suffix)
+        + "_q_"
+        + str(query_signature)
+        + ".osm.bz2",
+    )
+
+
 def osm_old_cached(lat, lon, query):
     subtags = query.split('"')
     return os.path.join(
