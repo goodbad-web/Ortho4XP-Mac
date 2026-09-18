@@ -30,6 +30,14 @@ GSIの原本ZIPは、既定の`Elevation_data/GSI/input/`へ取り込み、生�
 .venv/bin/python make_gsi_dem.py build --hgt-tile N35E139 --overwrite
 ```
 
+GeoTIFFは既定で`compact_int16`（0.25m刻み、scale/offset付き、ZSTD優先）として生成される。旧形式を明示的に生成する場合は次を指定する。
+
+```sh
+.venv/bin/python make_gsi_dem.py build --mesh-code 52326600 --storage-format float32_legacy --overwrite
+```
+
+`compact_int16`の値が表現範囲を超える場合はクリップせず失敗する。ZSTD非対応環境ではDEFLATEへフォールバックし、manifestへ実際の圧縮方式を記録する。
+
 HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
 
 GSI関連の限定検証はリポジトリルートから実行する。

@@ -1192,6 +1192,22 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
         self.import_dir = tk.StringVar()
         self.output_dir = tk.StringVar(value=str(defaults.output_dir))
         self.resolution = tk.StringVar(value="auto")
+        self.storage_format_labels = {
+            "compact_int16": _ui_text(
+                "Compact Int16 (0.25m)", "軽量Int16（0.25m）"
+            ),
+            "float32_legacy": _ui_text(
+                "Float32 legacy", "従来Float32"
+            ),
+        }
+        configured_storage_format = getattr(
+            CFG, "gsi_dem_storage_format", "compact_int16"
+        )
+        self.storage_format = tk.StringVar(
+            value=self.storage_format_labels.get(
+                configured_storage_format, self.storage_format_labels["compact_int16"]
+            )
+        )
         self.hgt_tiles = tk.StringVar()
         self.make_vrt = tk.BooleanVar(value=True)
         self.overwrite = tk.BooleanVar(value=False)
@@ -1289,19 +1305,29 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
             state="readonly",
             width=10,
         ).grid(row=1, column=1, padx=3, pady=3, sticky=W)
+        ttk.Label(build_frame, text=_ui_text("Storage format", "保存形式")).grid(
+            row=2, column=0, padx=5, pady=3, sticky=E
+        )
+        ttk.Combobox(
+            build_frame,
+            textvariable=self.storage_format,
+            values=tuple(self.storage_format_labels.values()),
+            state="readonly",
+            width=24,
+        ).grid(row=2, column=1, padx=3, pady=3, sticky=W)
         ttk.Label(
             build_frame,
             text=_ui_text("HGT tiles (optional, comma-separated)", "HGTタイル（任意、カンマ区切り）"),
-        ).grid(row=2, column=0, padx=5, pady=3, sticky=E)
+        ).grid(row=3, column=0, padx=5, pady=3, sticky=E)
         ttk.Entry(build_frame, textvariable=self.hgt_tiles).grid(
-            row=2, column=1, padx=3, pady=3, sticky=E + W
+            row=3, column=1, padx=3, pady=3, sticky=E + W
         )
         ttk.Label(
             build_frame,
             text=_ui_text("BBox S W N E (optional)", "矩形 S W N E（任意）"),
-        ).grid(row=3, column=0, padx=5, pady=3, sticky=E)
+        ).grid(row=4, column=0, padx=5, pady=3, sticky=E)
         bbox_frame = ttk.Frame(build_frame)
-        bbox_frame.grid(row=3, column=1, columnspan=2, padx=3, pady=3, sticky=W)
+        bbox_frame.grid(row=4, column=1, columnspan=2, padx=3, pady=3, sticky=W)
         for index, variable in enumerate(self.bbox_vars):
             ttk.Entry(bbox_frame, textvariable=variable, width=10).grid(
                 row=0, column=index, padx=(0, 3)
@@ -1310,12 +1336,12 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
             build_frame,
             text=_ui_text("Create VRT", "VRTを作成"),
             variable=self.make_vrt,
-        ).grid(row=4, column=1, padx=3, pady=3, sticky=W)
+        ).grid(row=5, column=1, padx=3, pady=3, sticky=W)
         ttk.Checkbutton(
             build_frame,
             text=_ui_text("Allow overwrite", "上書きを許可"),
             variable=self.overwrite,
-        ).grid(row=4, column=2, padx=3, pady=3, sticky=W)
+        ).grid(row=5, column=2, padx=3, pady=3, sticky=W)
 
         self.progress_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(
@@ -1469,6 +1495,14 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
             for value in self.hgt_tiles.get().split(",")
             if value.strip()
         )
+        storage_format = next(
+            (
+                value
+                for value, label in self.storage_format_labels.items()
+                if label == self.storage_format.get()
+            ),
+            "compact_int16",
+        )
         return GSI.GSIOptions(
             input_dir=Path(self.input_dir.get()),
             output_dir=Path(self.output_dir.get()),
@@ -1478,6 +1512,7 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
             make_vrt=bool(self.make_vrt.get()),
             hgt_tiles=hgt_tiles,
             overwrite=bool(self.overwrite.get()),
+            storage_format=storage_format,
         )
 
     def build_dem(self):
@@ -1519,7 +1554,21 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
                     self.progress_var.set(
                         (completed / total * 100.0) if total else 0.0
                     )
-                    self.status_var.set(f"{stage}: {message}")
+                    stage_labels = {
+                        "import": ("Import", "取り込み"),
+                        "scan": ("Scan", "スキャン"),
+                        "build": ("Build", "生成"),
+                        "complete": ("Complete", "完了"),
+                    }
+                    english_stage, japanese_stage = stage_labels.get(
+                        stage, (stage, stage)
+                    )
+                    self.status_var.set(
+                        _ui_text(
+                            f"{english_stage}: {message}",
+                            f"{japanese_stage}: {message}",
+                        )
+                    )
                 elif kind == "result":
                     self._set_running(False)
                     if isinstance(value, GSI.GSIScanResult):

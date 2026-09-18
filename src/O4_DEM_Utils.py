@@ -606,24 +606,32 @@ def read_elevation_from_file(
         try:
             ds = gdal.Open(file_name)
             rs = ds.GetRasterBand(1)
+            raw_nodata = rs.GetNoDataValue()
+            scale = rs.GetScale()
+            offset = rs.GetOffset()
+            scale = 1.0 if scale is None else numpy.float32(scale)
+            offset = 0.0 if offset is None else numpy.float32(offset)
             if not info_only:
                 alt_dem = rs.ReadAsArray().astype(numpy.float32)
+                nodata_mask = (
+                    alt_dem == numpy.float32(raw_nodata)
+                    if raw_nodata is not None
+                    else numpy.zeros(alt_dem.shape, dtype=bool)
+                )
+                if scale != 1.0 or offset != 0.0:
+                    alt_dem = alt_dem * scale + offset
+                if raw_nodata is not None:
+                    alt_dem[nodata_mask] = -32768
             (nxdem, nydem) = (ds.RasterXSize, ds.RasterYSize)
-            nodata = rs.GetNoDataValue()
-            if nodata is None:
+            nodata = raw_nodata
+            if raw_nodata is None:
                 UI.vprint(
                     1,
                     "    WARNING: raster DEM does not advertise its no_data ",
                     "value, assuming -32768.",
                 )
                 nodata = -32768
-            else:  
-                # elevations being stored as float32, we push the nodata to that 
-                # framework too, and then replace no_data values by -32768 
-                # anyway for uniformity
-                nodata = numpy.float32(nodata)
-                if not info_only:
-                    alt_dem[alt_dem == nodata] = -32768
+            else:
                 nodata = -32768
             try:
                 epsg = int(ds.GetProjection().split('"')[-2])

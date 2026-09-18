@@ -58,4 +58,6 @@ Elevation_data/GSI/
 
 `src/O4_GSI_DEM_Utils.py` がCLIとSupportのGSIダイアログから共有される境界であり、`scan_gsi_input()`、`import_gsi_archives()`、`build_gsi_dem()`が公開APIである。catalogはZIPのSHA-256、検査時点のサイズ、製品種別、作成年月日、メッシュコード、状態を記録し、一時ファイルから原子的に置換する。`build`は状態が`ready`で、catalog記録から変更されていないZIPだけを読む。
 
+既定のGeoTIFF出力は`compact_int16`で、Int16のraw値にscale=0.25、offset=0.0を適用し、NoData=-32768として保存する。ZSTD圧縮を優先し、利用できないGDALではDEFLATEへフォールバックする。VRTへ束ねるGeoTIFFは同じdtype、scale、offset、NoData契約でなければならない。既存のFloat32 GeoTIFF/VRTとHGTは`float32_legacy`または従来経路として読み込める。
+
 入力ZIPの分類優先度はDEM1A、DEM5A、DEM5B、DEM5C、DEM10A、DEM10Bの順である。JGD2000、JGD2011、JGD2024、WGS84はWGS84地理座標へ変換するが、未知のCRSは`--source-crs`を明示しない限り拒否する。JGD2024のPROJ定義がない環境では近似処理を行わずエラーにする。既存の`make_gsi_geotiff_5m.py`、`make_gsi_hgt.py`、`Ortho4XP.cfg`はこの経路から変更しない。

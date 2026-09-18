@@ -551,6 +551,14 @@ too low to grab these details.",
         "default": True,
         "hint": "When set, the no_data values in the raster will be filled by a nearest neighbour algorithm. If unset, they are turned into zero (can be useful for rasters with no_data over the whole oceanic part or partial LIDAR data).",
     },
+    "gsi_dem_storage_format": {
+        "type": str,
+        "default": "compact_int16",
+        "values": ("compact_int16", "float32_legacy"),
+        "short_name": "GSI DEM storage",
+        "short_name_japanese": "GSI DEM保存形式",
+        "hint": "Storage format used by the GSI DEM generator. compact_int16 stores elevations at 0.25 m steps with GeoTIFF scale/offset metadata; float32_legacy preserves the previous Float32 output.",
+    },
     "write_build_log": {
         "module": "UI",
         "type": bool,
@@ -758,7 +766,7 @@ list_dsf_vars = [
     "write_build_log",
     "build_overlays_in_all_in_one",
 ]
-list_other_vars = ["custom_dem", "fill_nodata"]
+list_other_vars = ["custom_dem", "fill_nodata", "gsi_dem_storage_format"]
 list_performance_vars = [
     "enable_streaming_conversion",
     "conversion_queue_size",
@@ -1273,6 +1281,22 @@ class Ortho4XP_Config(tk.Toplevel):
             style="O4.TCombobox",
         )
         self.entry_[item].grid(row=row, column=7, padx=2, pady=2, sticky=W)
+        item = "gsi_dem_storage_format"
+        ttk.Button(
+            self.frame_cfg,
+            text=_config_short_name(item),
+            takefocus=False,
+            command=lambda item=item: self.popup(item, cfg_vars[item]["hint"]),
+        ).grid(row=row, column=0, padx=2, pady=2, sticky=E + W)
+        self.entry_[item] = ttk.Combobox(
+            self.frame_cfg,
+            values=_config_widget_values(item),
+            textvariable=self.v_[item],
+            width=18,
+            state="readonly",
+            style="O4.TCombobox",
+        )
+        self.entry_[item].grid(row=row, column=1, padx=2, pady=2, sticky=W)
         row += 1
 
         ttk.Separator(self.frame_cfg, orient=tk.HORIZONTAL).grid(

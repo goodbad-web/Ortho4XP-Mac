@@ -61,8 +61,13 @@ RESOLUTION_NAMES = {
     "DEM10B": "10m",
 }
 RESOLUTION_ARCSEC = {"1m": 0.04, "5m": 0.20, "10m": 0.40}
+STORAGE_FORMATS = ("compact_int16", "float32_legacy")
+DEFAULT_STORAGE_FORMAT = "compact_int16"
+COMPACT_SCALE = 0.25
+COMPACT_OFFSET = 0.0
+COMPACT_NO_DATA = -32768
 CATALOG_VERSION = 1
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 NO_DATA = -9999.0
 HGT_NO_DATA = -32768
 
@@ -110,6 +115,7 @@ class GSIOptions:
     hgt_tiles: tuple[str, ...] = ()
     overwrite: bool = False
     source_crs: Optional[str] = None
+    storage_format: str = DEFAULT_STORAGE_FORMAT
 
 
 @dataclass
@@ -295,6 +301,40 @@ def _parse_metadata(xml_bytes: bytes, archive_name: str = "") -> Optional[dict]:
     }
 
 
+def _validate_metadata_payload(metadata: dict) -> None:
+    """Validate the data payload without retaining a second raster array."""
+    tuple_element = next(iter(_children(metadata["root"], "tupleList")), None)
+    if tuple_element is None or not tuple_element.text:
+        raise GSIError("GSI XML has no tupleList")
+
+    value_count = 0
+    for raw_line in tuple_element.text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        value_count += 1
+        if "," in line:
+            kind, value_text = line.rsplit(",", 1)
+        else:
+            kind, value_text = "", line
+        try:
+            float(value_text.strip())
+        except ValueError as exc:
+            if kind.strip() not in ("データなし", "データ無し") and (
+                value_text.strip() not in ("データなし", "データ無し")
+            ):
+                raise GSIError(f"GSI XML has an invalid elevation tuple: {line}") from exc
+    if value_count == 0:
+        raise GSIError("GSI XML has an empty tupleList")
+
+    expected = metadata["width"] * metadata["height"]
+    start = metadata["start_y"] * metadata["width"] + metadata["start_x"]
+    if start < 0 or start >= expected:
+        raise GSIError("GSI XML startPoint is outside the grid")
+    if value_count > expected - start:
+        raise GSIError("GSI XML tupleList exceeds the declared grid")
+
+
 def _parse_values(metadata: dict) -> np.ndarray:
     tuple_element = next(iter(_children(metadata["root"], "tupleList")), None)
     if tuple_element is None or not tuple_element.text:
@@ -441,7 +481,8 @@ def _archive_metadata(path: Path) -> dict:
             xml_count += 1
             metadata = _parse_metadata(archive.read(name), path.name)
             if metadata is None:
-                continue
+                raise GSIError(f"ZIP contains unsupported or incomplete XML: {name}")
+            _validate_metadata_payload(metadata)
             products.add(metadata["product"])
             dates.add(metadata["date"])
             meshes.update(metadata["mesh_codes"])
@@ -545,6 +586,64 @@ def _catalog_entry(
     return entry
 
 
+def _apply_catalog_integrity(
+    entry: dict, previous: Optional[dict], digest: Optional[str], size: int
+) -> bool:
+    """Keep modified entries blocked until their expected bytes return."""
+    if not previous or not digest:
+        return False
+
+    previous_status = previous.get("status")
+    previous_digest = previous.get("sha256")
+    previous_size = previous.get("size")
+    expected_digest = previous.get("expected_sha256") or previous_digest
+    expected_size = previous.get("expected_size")
+    if expected_size is None:
+        expected_size = previous_size
+
+    if previous_status == "modified":
+        if expected_digest == digest and (
+            expected_size is None or expected_size == size
+        ):
+            entry.pop("expected_sha256", None)
+            entry.pop("expected_size", None)
+            return False
+        entry["status"] = "modified"
+        entry["reason"] = "file changed since the previous catalog scan"
+        if expected_digest:
+            entry["expected_sha256"] = expected_digest
+        if expected_size is not None:
+            entry["expected_size"] = expected_size
+        return True
+
+    if previous_status == "missing":
+        if expected_digest == digest and (
+            expected_size is None or expected_size == size
+        ):
+            entry.pop("expected_sha256", None)
+            entry.pop("expected_size", None)
+            return False
+        entry["status"] = "modified"
+        entry["reason"] = "file changed since the previous catalog scan"
+        if previous_digest:
+            entry["expected_sha256"] = previous_digest
+        if previous_size is not None:
+            entry["expected_size"] = previous_size
+        return True
+
+    if previous_status in {"ready", "duplicate"} and (
+        previous_digest != digest or previous_size != size
+    ):
+        entry["status"] = "modified"
+        entry["reason"] = "file changed since the previous catalog scan"
+        if previous_digest:
+            entry["expected_sha256"] = previous_digest
+        if previous_size is not None:
+            entry["expected_size"] = previous_size
+        return True
+    return False
+
+
 def scan_gsi_input(
     input_dir: Path,
     write_catalog: bool = True,
@@ -607,9 +706,7 @@ def scan_gsi_input(
                     metadata,
                     source_path=Path(source_path) if source_path else None,
                 )
-            if changed:
-                entry["status"] = "modified"
-                entry["reason"] = "file changed since the previous catalog scan"
+            _apply_catalog_integrity(entry, previous, digest, path.stat().st_size)
         except Exception as exc:
             if not previous or not changed:
                 invalid += 1
@@ -633,6 +730,7 @@ def scan_gsi_input(
                 ),
                 "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
+            _apply_catalog_integrity(entry, previous, digest, entry["size"])
         entries.append(entry)
 
     current_paths = {entry["path"] for entry in entries}
@@ -641,21 +739,24 @@ def scan_gsi_input(
             continue
         if previous.get("status") not in {"ready", "duplicate", "modified", "missing"}:
             continue
-        entries.append(
-            {
-                "path": relative,
-                "sha256": previous.get("sha256"),
-                "size": previous.get("size"),
-                "product": previous.get("product"),
-                "date": previous.get("date"),
-                "mesh_codes": previous.get("mesh_codes", []),
-                "xml_count": previous.get("xml_count", 0),
-                "status": "missing",
-                "reason": "catalog input is missing",
-                "source_path": previous.get("source_path"),
-                "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            }
-        )
+        missing_entry = {
+            "path": relative,
+            "sha256": previous.get("sha256"),
+            "size": previous.get("size"),
+            "product": previous.get("product"),
+            "date": previous.get("date"),
+            "mesh_codes": previous.get("mesh_codes", []),
+            "xml_count": previous.get("xml_count", 0),
+            "status": "missing",
+            "reason": "catalog input is missing",
+            "source_path": previous.get("source_path"),
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        if previous.get("expected_sha256"):
+            missing_entry["expected_sha256"] = previous["expected_sha256"]
+        if previous.get("expected_size") is not None:
+            missing_entry["expected_size"] = previous["expected_size"]
+        entries.append(missing_entry)
 
     latest_dates: dict[tuple[str, str], str] = {}
     for entry in entries:
@@ -778,6 +879,38 @@ def _quarantine_destination(directory: Path, filename: str, digest: str) -> Path
     return directory / f"{Path(filename).stem}_{digest[:8]}{Path(filename).suffix}"
 
 
+def _catalog_archive_state(
+    entries: Iterable[dict], input_dir: Path, digest: str
+) -> tuple[str, Optional[Path]]:
+    """Return whether a digest exists, or which catalog path can be repaired."""
+    repair_path: Optional[Path] = None
+    for entry in entries:
+        expected_digest = entry.get("expected_sha256") or entry.get("sha256")
+        if expected_digest != digest or not entry.get("path"):
+            continue
+        managed_path = input_dir / str(entry["path"])
+        if "_quarantine" in managed_path.relative_to(input_dir).parts:
+            if managed_path.is_file():
+                try:
+                    if _sha256(managed_path) == digest:
+                        return "existing", managed_path
+                except OSError:
+                    pass
+            continue
+        if managed_path.is_file():
+            try:
+                if _sha256(managed_path) == digest:
+                    return "existing", managed_path
+            except OSError:
+                pass
+            repair_path = repair_path or managed_path
+        else:
+            repair_path = repair_path or managed_path
+    if repair_path is not None:
+        return "repair", repair_path
+    return "new", None
+
+
 def _copy_atomic(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -792,6 +925,25 @@ def _copy_atomic(source: Path, destination: Path) -> None:
             os.unlink(temp_name)
         except FileNotFoundError:
             pass
+
+
+def _restore_catalog_archive(
+    source: Path, destination: Path, input_dir: Path, digest: str
+) -> Optional[Path]:
+    """Restore a catalog path while preserving changed managed bytes."""
+    preserved_path: Optional[Path] = None
+    if destination.exists():
+        current_digest = _sha256(destination)
+        if current_digest == digest:
+            return None
+        quarantine_dir = input_dir / "_quarantine"
+        preserved_path = _quarantine_destination(
+            quarantine_dir, destination.name, current_digest
+        )
+        if not preserved_path.exists():
+            _copy_atomic(destination, preserved_path)
+    _copy_atomic(source, destination)
+    return preserved_path
 
 
 def import_gsi_archives(
@@ -809,29 +961,49 @@ def import_gsi_archives(
     result = GSIImportResult()
     source_paths: dict[str, str] = {}
     quarantine_reasons: dict[str, str] = {}
-    existing_hashes = {
-        entry.get("sha256")
-        for entry in load_catalog(input_dir / "catalog.json").get("entries", [])
-        if entry.get("sha256")
-    }
+    catalog_entries = load_catalog(input_dir / "catalog.json").get("entries", [])
+    registered_hashes: set[str] = set()
 
     try:
         for index, source_path in enumerate(paths, 1):
             _check_cancel(cancel_event)
             _report(progress, "import", index, len(paths), source_path.name)
             digest = _sha256(source_path)
-            if digest in existing_hashes:
+            if digest in registered_hashes:
+                result.skipped_duplicates += 1
+                continue
+            archive_state, repair_path = _catalog_archive_state(
+                catalog_entries, input_dir, digest
+            )
+            if archive_state == "existing":
                 result.skipped_duplicates += 1
                 continue
             try:
                 metadata = _archive_metadata(source_path)
+                if archive_state == "repair" and repair_path is not None:
+                    preserved_path = _restore_catalog_archive(
+                        source_path, repair_path, input_dir, digest
+                    )
+                    if preserved_path is not None:
+                        preserved_relative = str(
+                            preserved_path.relative_to(input_dir)
+                        )
+                        source_paths[preserved_relative] = str(repair_path)
+                        quarantine_reasons[preserved_relative] = (
+                            "previous managed file preserved during re-import"
+                        )
+                    relative = str(repair_path.relative_to(input_dir))
+                    source_paths[relative] = str(source_path)
+                    registered_hashes.add(digest)
+                    result.imported += 1
+                    continue
                 destination_dir = input_dir / metadata["product"] / metadata["date"]
                 destination = _unique_destination(
                     destination_dir, source_path.name, digest
                 )
                 if not destination.exists():
                     _copy_atomic(source_path, destination)
-                existing_hashes.add(digest)
+                registered_hashes.add(digest)
                 source_paths[str(destination.relative_to(input_dir))] = str(source_path)
                 result.imported += 1
             except Exception as exc:
@@ -875,6 +1047,23 @@ def mesh_code_bounds(mesh_code: str) -> tuple[float, float, float, float]:
     south += int(code[6]) * 30.0 / 3600.0
     west += int(code[7]) * 45.0 / 3600.0
     return (south, west, south + 30.0 / 3600.0, west + 45.0 / 3600.0)
+
+
+def _catalog_mesh_bounds(mesh_code: str) -> Optional[tuple[float, float, float, float]]:
+    code = str(mesh_code).strip()
+    if len(code) >= 8 and code[:8].isdigit():
+        return mesh_code_bounds(code[:8])
+    if len(code) == 6 and code.isdigit():
+        first_lat = int(code[0:2]) / 1.5
+        first_lon = 100.0 + int(code[2:4])
+        south = first_lat + int(code[4]) * 5.0 / 60.0
+        west = first_lon + int(code[5]) * 7.5 / 60.0
+        return (south, west, south + 5.0 / 60.0, west + 7.5 / 60.0)
+    if len(code) == 4 and code.isdigit():
+        south = int(code[0:2]) / 1.5
+        west = 100.0 + int(code[2:4])
+        return (south, west, south + 40.0 / 60.0, west + 1.0)
+    return None
 
 
 def _region_for_mesh(code: str) -> GSIRegion:
@@ -923,12 +1112,23 @@ def _overlaps(
 
 
 def _record_may_contain(entry: dict, region: GSIRegion) -> bool:
-    if not region.mesh_code:
+    if region.mesh_code:
+        requested = region.mesh_code
+        for value in entry.get("mesh_codes", []):
+            value = str(value)
+            if requested.startswith(value) or value.startswith(requested[:6]):
+                return True
+        return False
+
+    mesh_codes = entry.get("mesh_codes", [])
+    if not mesh_codes:
         return True
-    requested = region.mesh_code
-    for value in entry.get("mesh_codes", []):
-        value = str(value)
-        if requested.startswith(value) or value.startswith(requested[:6]):
+    for value in mesh_codes:
+        mesh_bounds = _catalog_mesh_bounds(value)
+        if mesh_bounds is None:
+            # An unknown catalog code must not cause valid input to be omitted.
+            return True
+        if _overlaps(mesh_bounds, region.bounds):
             return True
     return False
 
@@ -948,7 +1148,8 @@ def _archive_blocks(
             xml_bytes = archive.read(xml_name)
             metadata = _parse_metadata(xml_bytes, path.name)
             if metadata is None:
-                continue
+                raise GSIError(f"ZIP contains unsupported or incomplete XML: {xml_name}")
+            _validate_metadata_payload(metadata)
             source_bounds = (
                 metadata["south"],
                 metadata["west"],
@@ -1095,59 +1296,143 @@ def write_geotiff(
     region: GSIRegion,
     resolution_deg: float,
     overwrite: bool = False,
-) -> None:
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
+) -> dict:
     _require_gdal()
+    if storage_format not in STORAGE_FORMATS:
+        raise GSIError(f"Unsupported GSI storage format: {storage_format}")
+
+    compact = storage_format == "compact_int16"
+    valid = np.isfinite(raster)
+    if compact:
+        encoded = np.rint((raster[valid] - COMPACT_OFFSET) / COMPACT_SCALE)
+        if encoded.size and (
+            encoded.min() < np.iinfo(np.int16).min + 1
+            or encoded.max() > np.iinfo(np.int16).max
+        ):
+            minimum = float(raster[valid].min())
+            maximum = float(raster[valid].max())
+            raise GSIError(
+                "DEM values exceed compact_int16 range "
+                f"[-8191.75, 8191.75] m: min={minimum}, max={maximum}"
+            )
+        data_type = gdal.GDT_Int16
+        nodata = COMPACT_NO_DATA
+        predictor = 2
+        compression_candidates = ("ZSTD", "DEFLATE")
+    else:
+        data_type = gdal.GDT_Float32
+        nodata = NO_DATA
+        predictor = 3
+        compression_candidates = ("DEFLATE",)
+
     path = Path(path)
     temp_path = _atomic_output_path(path, overwrite)
     if temp_path.exists():
         temp_path.unlink()
+    fallback_reason = None
     try:
         driver = gdal.GetDriverByName("GTiff")
-        dataset = driver.Create(
-            str(temp_path),
-            raster.shape[1],
-            raster.shape[0],
-            1,
-            gdal.GDT_Float32,
-            options=[
-                "TILED=YES",
-                "BLOCKXSIZE=512",
-                "BLOCKYSIZE=512",
-                "COMPRESS=DEFLATE",
-                "PREDICTOR=3",
-                "ZLEVEL=6",
-                "BIGTIFF=IF_SAFER",
-                "NUM_THREADS=ALL_CPUS",
-            ],
-        )
-        if dataset is None:
-            raise GSIError(f"Could not create GeoTIFF: {temp_path}")
-        dataset.SetGeoTransform(
-            (region.west, resolution_deg, 0.0, region.north, 0.0, -resolution_deg)
-        )
-        spatial_ref = _spatial_reference("EPSG:4326")
-        dataset.SetProjection(spatial_ref.ExportToWkt())
-        band = dataset.GetRasterBand(1)
-        band.SetNoDataValue(NO_DATA)
-        for row_start in range(0, raster.shape[0], 512):
-            row_end = min(raster.shape[0], row_start + 512)
-            values = np.where(
-                np.isfinite(raster[row_start:row_end]),
-                raster[row_start:row_end],
-                NO_DATA,
-            ).astype(np.float32)
-            band.WriteArray(values, xoff=0, yoff=row_start)
-        band.FlushCache()
-        dataset.FlushCache()
-        dataset = None
+        if driver is None:
+            raise GSIError("GDAL GTiff driver is unavailable")
+        for compression in compression_candidates:
+            try:
+                options = [
+                    "TILED=YES",
+                    "BLOCKXSIZE=512",
+                    "BLOCKYSIZE=512",
+                    f"COMPRESS={compression}",
+                    f"PREDICTOR={predictor}",
+                    "ZLEVEL=6",
+                    "ZSTD_LEVEL=9",
+                    "BIGTIFF=IF_SAFER",
+                    "NUM_THREADS=ALL_CPUS",
+                ]
+                dataset = driver.Create(
+                    str(temp_path),
+                    raster.shape[1],
+                    raster.shape[0],
+                    1,
+                    data_type,
+                    options=options,
+                )
+                if dataset is None:
+                    raise GSIError(f"Could not create GeoTIFF: {temp_path}")
+                dataset.SetGeoTransform(
+                    (region.west, resolution_deg, 0.0, region.north, 0.0, -resolution_deg)
+                )
+                spatial_ref = _spatial_reference("EPSG:4326")
+                dataset.SetProjection(spatial_ref.ExportToWkt())
+                band = dataset.GetRasterBand(1)
+                band.SetNoDataValue(nodata)
+                if compact:
+                    band.SetScale(COMPACT_SCALE)
+                    band.SetOffset(COMPACT_OFFSET)
+                for row_start in range(0, raster.shape[0], 512):
+                    row_end = min(raster.shape[0], row_start + 512)
+                    if compact:
+                        values = np.full(
+                            (row_end - row_start, raster.shape[1]),
+                            COMPACT_NO_DATA,
+                            dtype=np.int16,
+                        )
+                        rows = raster[row_start:row_end]
+                        row_valid = np.isfinite(rows)
+                        values[row_valid] = np.rint(
+                            (rows[row_valid] - COMPACT_OFFSET) / COMPACT_SCALE
+                        ).astype(np.int16)
+                    else:
+                        values = np.where(
+                            np.isfinite(raster[row_start:row_end]),
+                            raster[row_start:row_end],
+                            NO_DATA,
+                        ).astype(np.float32)
+                    band.WriteArray(values, xoff=0, yoff=row_start)
+                band.FlushCache()
+                dataset.FlushCache()
+                dataset = None
 
-        check = gdal.Open(str(temp_path), gdal.GA_ReadOnly)
-        if check is None:
-            raise GSIError(f"GDAL could not reopen GeoTIFF: {temp_path}")
-        if (check.RasterXSize, check.RasterYSize) != (raster.shape[1], raster.shape[0]):
-            raise GSIError("Generated GeoTIFF dimensions do not match the raster")
-        check = None
-        os.replace(temp_path, path)
+                check = gdal.Open(str(temp_path), gdal.GA_ReadOnly)
+                if check is None:
+                    raise GSIError(f"GDAL could not reopen GeoTIFF: {temp_path}")
+                if (check.RasterXSize, check.RasterYSize) != (raster.shape[1], raster.shape[0]):
+                    raise GSIError("Generated GeoTIFF dimensions do not match the raster")
+                actual_compression = check.GetMetadataItem(
+                    "COMPRESSION", "IMAGE_STRUCTURE"
+                )
+                if actual_compression != compression:
+                    check = None
+                    temp_path.unlink(missing_ok=True)
+                    if compression == "ZSTD":
+                        fallback_reason = (
+                            f"GDAL did not produce ZSTD (reported {actual_compression!r})"
+                        )
+                        continue
+                    raise GSIError(
+                        f"GeoTIFF compression verification failed: "
+                        f"requested={compression}, actual={actual_compression}"
+                    )
+                check = None
+                os.replace(temp_path, path)
+                return {
+                    "storage_format": storage_format,
+                    "data_type": "Int16" if compact else "Float32",
+                    "scale": COMPACT_SCALE if compact else 1.0,
+                    "offset": COMPACT_OFFSET if compact else 0.0,
+                    "nodata": nodata,
+                    "compression": compression,
+                    "predictor": predictor,
+                    "quantization_max_error": 0.125 if compact else 0.0,
+                    "compression_fallback_reason": fallback_reason,
+                }
+            except Exception as error:
+                if temp_path.exists():
+                    temp_path.unlink()
+                if compression == "ZSTD" and compact:
+                    fallback_reason = str(error)
+                    continue
+                raise
+        raise GSIError("Could not create a verified compressed GeoTIFF")
     finally:
         try:
             temp_path.unlink()
@@ -1177,15 +1462,41 @@ def write_hgt(
             pass
 
 
-def _build_vrt(path: Path, sources: list[Path], overwrite: bool) -> None:
+def _raster_contract(path: Path) -> dict:
+    dataset = gdal.Open(str(path), gdal.GA_ReadOnly)
+    if dataset is None:
+        raise GSIError(f"Could not open VRT source: {path}")
+    band = dataset.GetRasterBand(1)
+    scale = band.GetScale()
+    offset = band.GetOffset()
+    contract = {
+        "data_type": gdal.GetDataTypeName(band.DataType),
+        "scale": 1.0 if scale is None else float(scale),
+        "offset": 0.0 if offset is None else float(offset),
+        "nodata": band.GetNoDataValue(),
+    }
+    dataset = None
+    return contract
+
+
+def _build_vrt(path: Path, sources: list[Path], overwrite: bool) -> dict:
     _require_gdal()
     if not sources:
         raise GSIError("Cannot create VRT without GeoTIFF sources")
+    contracts = [_raster_contract(source) for source in sources]
+    first_contract = contracts[0]
+    if any(contract != first_contract for contract in contracts[1:]):
+        raise GSIError(
+            "Cannot create VRT from GeoTIFFs with different data type, "
+            "scale, offset, or NoData contracts"
+        )
+    if first_contract["nodata"] is None:
+        raise GSIError("VRT sources must advertise a NoData value")
     temp_path = _atomic_output_path(path, overwrite)
     try:
         options = gdal.BuildVRTOptions(
-            srcNodata=NO_DATA,
-            VRTNodata=NO_DATA,
+            srcNodata=first_contract["nodata"],
+            VRTNodata=first_contract["nodata"],
             resampleAlg="nearest",
         )
         dataset = gdal.BuildVRT(str(temp_path), [str(source) for source in sources], options=options)
@@ -1193,7 +1504,23 @@ def _build_vrt(path: Path, sources: list[Path], overwrite: bool) -> None:
             raise GSIError(f"Could not create VRT: {path}")
         dataset.FlushCache()
         dataset = None
+        check = gdal.Open(str(temp_path), gdal.GA_ReadOnly)
+        if check is None:
+            raise GSIError(f"Could not reopen generated VRT: {temp_path}")
+        band = check.GetRasterBand(1)
+        actual_contract = {
+            "data_type": gdal.GetDataTypeName(band.DataType),
+            "scale": 1.0 if band.GetScale() is None else float(band.GetScale()),
+            "offset": 0.0 if band.GetOffset() is None else float(band.GetOffset()),
+            "nodata": band.GetNoDataValue(),
+        }
+        check = None
+        if actual_contract != first_contract:
+            raise GSIError(
+                "Generated VRT does not preserve the common raster contract"
+            )
         os.replace(temp_path, path)
+        return first_contract
     finally:
         try:
             temp_path.unlink()
@@ -1271,16 +1598,28 @@ def _build_region(
     valid = np.isfinite(raster)
     output_name = f"{region.label}_GSI_{resolution_name}.tif"
     output_path = options.output_dir / output_name
+    output_metadata = {
+        "storage_format": "hgt_legacy",
+        "data_type": "Int16",
+        "scale": 1.0,
+        "offset": 0.0,
+        "nodata": HGT_NO_DATA,
+        "compression": "none",
+        "predictor": None,
+        "quantization_max_error": 0.5,
+        "compression_fallback_reason": None,
+    }
     if point_grid:
         output_path = options.output_dir / "hgt" / f"{region.label}.hgt"
         write_hgt(output_path, raster, overwrite=options.overwrite)
     else:
-        write_geotiff(
+        output_metadata = write_geotiff(
             output_path,
             raster,
             region,
             resolution_deg,
             overwrite=options.overwrite,
+            storage_format=options.storage_format,
         )
     return output_path, {
         "region": asdict(region),
@@ -1299,7 +1638,7 @@ def _build_region(
             }
         ),
         "crs": "EPSG:4326",
-        "nodata": HGT_NO_DATA if point_grid else NO_DATA,
+        **output_metadata,
     }
 
 
@@ -1308,6 +1647,8 @@ def build_gsi_dem(
     progress: Optional[ProgressCallback] = None,
     cancel_event=None,
 ) -> GSIBuildResult:
+    if options.storage_format not in STORAGE_FORMATS:
+        raise GSIError(f"Unsupported GSI storage format: {options.storage_format}")
     options.input_dir = Path(options.input_dir).resolve()
     options.output_dir = Path(options.output_dir).resolve()
     options.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +1676,7 @@ def build_gsi_dem(
     result = GSIBuildResult()
     manifest_results: list[dict] = []
     output_paths: list[Path] = []
+    vrt_contract = None
 
     jobs: list[tuple[GSIRegion, bool, Optional[str]]] = [
         (region, False, None) for region in regions
@@ -1368,7 +1710,7 @@ def build_gsi_dem(
     if options.make_vrt and tif_outputs:
         try:
             vrt_path = options.output_dir / "gsi_dem.vrt"
-            _build_vrt(vrt_path, tif_outputs, options.overwrite)
+            vrt_contract = _build_vrt(vrt_path, tif_outputs, options.overwrite)
             result.vrt = str(vrt_path)
         except Exception as exc:
             result.failures.append({"stage": "vrt", "error": str(exc)})
@@ -1386,10 +1728,12 @@ def build_gsi_dem(
             "make_vrt": options.make_vrt,
             "hgt_tiles": list(options.hgt_tiles),
             "source_crs": options.source_crs,
+            "storage_format": options.storage_format,
         },
         "results": manifest_results,
         "outputs": result.outputs,
         "vrt": result.vrt,
+        "vrt_contract": vrt_contract,
         "failures": result.failures,
         "cancelled": result.cancelled,
     }

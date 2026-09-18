@@ -67,6 +67,12 @@ def _add_build_arguments(parser):
         help="Output resolution; auto keeps the highest available source",
     )
     parser.add_argument(
+        "--storage-format",
+        choices=GSI.STORAGE_FORMATS,
+        default=GSI.DEFAULT_STORAGE_FORMAT,
+        help="GeoTIFF storage format (default: compact_int16)",
+    )
+    parser.add_argument(
         "--hgt-tile",
         action="append",
         dest="hgt_tiles",
@@ -191,6 +197,7 @@ def main(argv=None):
             hgt_tiles=tuple(args.hgt_tiles or ()),
             overwrite=args.overwrite,
             source_crs=args.source_crs,
+            storage_format=args.storage_format,
         )
         result = GSI.build_gsi_dem(
             options,
