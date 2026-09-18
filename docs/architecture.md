@@ -19,6 +19,7 @@
 | `O4_Imagery_Utils` | 画像取得、前処理、アップスケール、DDS変換 |
 | `O4_Vector_Map` / `O4_Vector_Utils` | OSM・空港情報からのベクター形状処理 |
 | `O4_DEM_Utils` / `O4_Mesh_Utils` | 標高データ取得と `Triangle4XP` によるメッシュ生成 |
+| `O4_GSI_DEM_Utils` | GSI DEM ZIPの検査・管理、catalog、GeoTIFF/VRT/HGT生成 |
 | `O4_Mask_Utils` | 水面等のマスク生成。NumPy、OpenCV、scikit-fmmを使用 |
 | `O4_Tile_Utils` / `O4_DSF_Utils` | タイル生成、テクスチャ・DSF出力 |
 | `O4_GUI_Utils` / `O4_UI_Utils` | GUIと進捗・ログ・UI設定 |
@@ -37,3 +38,24 @@
 ## 生成データ
 
 `Elevation_data/`、`OSM_data/`、`Orthophotos/`、`Masks/`、`Tiles/`、`tmp/` 等は入力または生成キャッシュを含む。コード変更の検証でこれらを一括削除・上書きしない。対象を限定し、必要ならユーザーに確認する。
+
+## GSI DEMの入力と生成物
+
+GSIの原本ZIPと生成物は、次の専用領域で分離する。`input/` はダウンロード元を変更せずに取り込んだZIPの管理場所、`output/` はOrtho4XPで利用する生成物の場所である。
+
+```text
+Elevation_data/GSI/
+├── input/
+│   ├── catalog.json
+│   ├── DEM1A/YYYYMMDD/*.zip
+│   ├── DEM5A/  DEM5B/  DEM5C/
+│   ├── DEM10A/ DEM10B/
+│   └── _quarantine/
+└── output/
+    ├── *.tif  *.vrt  *.json
+    └── hgt/*.hgt
+```
+
+`src/O4_GSI_DEM_Utils.py` がCLIとSupportのGSIダイアログから共有される境界であり、`scan_gsi_input()`、`import_gsi_archives()`、`build_gsi_dem()`が公開APIである。catalogはZIPのSHA-256、検査時点のサイズ、製品種別、作成年月日、メッシュコード、状態を記録し、一時ファイルから原子的に置換する。`build`は状態が`ready`で、catalog記録から変更されていないZIPだけを読む。
+
+入力ZIPの分類優先度はDEM1A、DEM5A、DEM5B、DEM5C、DEM10A、DEM10Bの順である。JGD2000、JGD2011、JGD2024、WGS84はWGS84地理座標へ変換するが、未知のCRSは`--source-crs`を明示しない限り拒否する。JGD2024のPROJ定義がない環境では近似処理を行わずエラーにする。既存の`make_gsi_geotiff_5m.py`、`make_gsi_hgt.py`、`Ortho4XP.cfg`はこの経路から変更しない。

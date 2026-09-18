@@ -13,6 +13,34 @@
 
 `GDAL`等のネイティブ依存関係はHomebrew側のバージョンとの整合が必要である。OS別の利用者向け説明は `Install_Instructions.txt` に残すが、起動ファイルは実在する `Ortho4XP.py` を使う。
 
+## GSI DEM入力管理と生成
+
+GSIの原本ZIPは、既定の`Elevation_data/GSI/input/`へ取り込み、生成物は`Elevation_data/GSI/output/`へ分離する。入力元のDownloads等は変更されない。ローカルZIPの再帰検出、分類、SHA-256重複排除、隔離、catalog再構築は次で行う。
+
+```sh
+.venv/bin/python make_gsi_dem.py import --from /path/to/downloads
+.venv/bin/python make_gsi_dem.py scan
+```
+
+生成対象は3次メッシュコードまたは緯度経度の矩形で指定する。`auto`は利用可能な最高解像度を選び、1m出力では1mを優先し、欠損部分を低解像度入力で補完する。VRTは任意、manifestは必須である。
+
+```sh
+.venv/bin/python make_gsi_dem.py build --mesh-code 52326600 --resolution auto --make-vrt
+.venv/bin/python make_gsi_dem.py build --bbox 35.0 139.0 35.1 139.1 --resolution 5m
+.venv/bin/python make_gsi_dem.py build --hgt-tile N35E139 --overwrite
+```
+
+HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
+
+GSI関連の限定検証はリポジトリルートから実行する。
+
+```sh
+./.venv/bin/python -m py_compile make_gsi_dem.py src/O4_GSI_DEM_Utils.py
+./.venv/bin/python -m pytest -q tests/test_gsi_dem.py
+```
+
+合成ZIPの分類・重複・隔離、catalogの再スキャン、欠落入力の検出、1m GeoTIFF/VRT/manifest、HGTバイト順を自動検証する。GUIの表示・キャンセル・明示Applyと、実X-Plane上の視覚確認は別途手動受入とする。JGD2024のPROJ定義が利用できない環境では、変換結果を推測せず、明示エラーになることを確認する。
+
 ## Cユーティリティ
 
 ネイティブmacOSビルドはリポジトリのルートから実行する。

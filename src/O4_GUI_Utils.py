@@ -5,6 +5,7 @@ import locale
 from math import floor, cos, pi
 import queue
 import threading
+from pathlib import Path
 import tkinter as tk
 from tkinter import (
     RIDGE,
@@ -36,6 +37,7 @@ import O4_Tile_Utils as TILE
 import O4_UI_Utils as UI
 import O4_Config_Utils as CFG
 import O4_Overlay_Utils as OVL
+import O4_GSI_DEM_Utils as GSI
 
 # Set OsX=True if you prefer the OsX way of drawing existing tiles but 
 # are on Linux or Windows.
@@ -370,7 +372,7 @@ class Ortho4XP_GUI(tk.Tk):
             self.frame_aux, border=0, padx=0, pady=0, bg=UI.BG_COLOR
         )
         self.frame_aux_main.grid(row=1, column=0, sticky=N + S + W + E)
-        for i in range(7):
+        for i in range(8):
             self.frame_aux_main.columnconfigure(i, weight=1)
         ttk.Button(
             self.frame_aux_main,
@@ -417,10 +419,17 @@ class Ortho4XP_GUI(tk.Tk):
         ttk.Button(
             self.frame_aux_main,
             takefocus=False,
+            text="GSI DEM",
+            command=self.open_gsi_dem_window,
+            style="Compact.TButton",
+        ).grid(row=0, column=6, padx=3, pady=0, sticky=N + S + E + W)
+        ttk.Button(
+            self.frame_aux_main,
+            takefocus=False,
             text="Exit",
             command=self.exit_prg,
             style="Compact.TButton",
-        ).grid(row=0, column=6, padx=3, pady=0, sticky=N + S + E + W)
+        ).grid(row=0, column=7, padx=3, pady=0, sticky=N + S + E + W)
 
         # Fourth row (Progress bars and controls)
         # Label(self.frame_left,anchor=W,text="DSF/Masks progress",
@@ -843,18 +852,34 @@ class Ortho4XP_GUI(tk.Tk):
             self.imagery_cache_window = Ortho4XP_Imagery_Cache(self)
             return 1
 
+    def open_gsi_dem_window(self):
+        try:
+            self.gsi_dem_window.lift()
+            return 1
+        except Exception:
+            self.gsi_dem_window = Ortho4XP_GSI_DEM(self)
+            return 1
+
     def set_red_flag(self):
         cache_window = getattr(self, "imagery_cache_window", None)
         cache_running = bool(
             cache_window is not None and getattr(cache_window, "running", False)
         )
+        gsi_window = getattr(self, "gsi_dem_window", None)
+        gsi_running = bool(
+            gsi_window is not None
+            and getattr(gsi_window, "worker_thread", None) is not None
+            and gsi_window.worker_thread.is_alive()
+        )
         if cache_running:
             cache_window.request_cancel()
+        if gsi_running:
+            gsi_window.request_cancel()
         worker = getattr(self, "working_thread", None)
         worker_running = worker is not None and worker.is_alive()
         if worker_running:
             UI.cancel_operation("user")
-        if cache_running or worker_running:
+        if cache_running or gsi_running or worker_running:
             self.status_var.set(
                 _ui_text(
                     "Stop requested. Waiting for the current process to stop...",
@@ -1067,8 +1092,16 @@ class Ortho4XP_GUI(tk.Tk):
             if cache_window is not None
             else None
         )
+        gsi_window = self.__dict__.get("gsi_dem_window")
+        gsi_worker = (
+            getattr(gsi_window, "worker_thread", None)
+            if gsi_window is not None
+            else None
+        )
         if (worker is not None and worker.is_alive()) or (
             cache_worker is not None and cache_worker.is_alive()
+        ) or (
+            gsi_worker is not None and gsi_worker.is_alive()
         ):
             self.status_var.set(
                 _ui_text(
@@ -1096,11 +1129,19 @@ class Ortho4XP_GUI(tk.Tk):
         self._save_gui_params()
         worker = getattr(self, "working_thread", None)
         cache_window = getattr(self, "imagery_cache_window", None)
+        gsi_window = getattr(self, "gsi_dem_window", None)
         cache_running = bool(
             cache_window is not None and getattr(cache_window, "running", False)
         )
+        gsi_running = bool(
+            gsi_window is not None
+            and getattr(gsi_window, "worker_thread", None) is not None
+            and gsi_window.worker_thread.is_alive()
+        )
         if cache_running:
             cache_window.request_cancel()
+        if gsi_running:
+            gsi_window.request_cancel()
         if worker is not None and worker.is_alive():
             UI.cancel_operation("exit")
         cache_worker = (
@@ -1108,10 +1149,17 @@ class Ortho4XP_GUI(tk.Tk):
             if cache_window is not None
             else None
         )
+        gsi_worker = (
+            getattr(gsi_window, "worker_thread", None)
+            if gsi_window is not None
+            else None
+        )
         if (
             (worker is not None and worker.is_alive())
             or cache_running
             or (cache_worker is not None and cache_worker.is_alive())
+            or gsi_running
+            or (gsi_worker is not None and gsi_worker.is_alive())
         ):
             self._exit_requested = True
             self.status_var.set(
@@ -1123,6 +1171,413 @@ class Ortho4XP_GUI(tk.Tk):
             self._exit_poll_id = self.after(100, self._finish_exit)
             return
         self._finish_exit()
+
+################################################################################
+class Ortho4XP_GSI_DEM(tk.Toplevel):
+    """Manage local GSI archives and build custom DEM rasters."""
+
+    def __init__(self, parent):
+        tk.Toplevel.__init__(self, parent)
+        self.parent = parent
+        self.title(_ui_text("GSI DEM", "GSI DEM"))
+        self.resizable(True, True)
+        self.minsize(720, 520)
+        self.worker_thread = None
+        self.cancel_event = None
+        self.result_queue = queue.Queue()
+        self.last_build_result = None
+
+        defaults = GSI.default_paths(os.path.abspath(FNAMES.Ortho4XP_dir))
+        self.input_dir = tk.StringVar(value=str(defaults.input_dir))
+        self.import_dir = tk.StringVar()
+        self.output_dir = tk.StringVar(value=str(defaults.output_dir))
+        self.resolution = tk.StringVar(value="auto")
+        self.hgt_tiles = tk.StringVar()
+        self.make_vrt = tk.BooleanVar(value=True)
+        self.overwrite = tk.BooleanVar(value=False)
+        self.bbox_vars = [tk.StringVar() for _ in range(4)]
+        self.status_var = tk.StringVar(value=_ui_text("Idle", "待機中"))
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(4, weight=1)
+
+        ttk.Label(
+            self,
+            text=_ui_text("GSI input management", "GSI入力データ管理"),
+        ).grid(row=0, column=0, columnspan=3, padx=8, pady=(8, 3), sticky=W)
+        ttk.Label(self, text=_ui_text("Input folder", "入力フォルダ")).grid(
+            row=1, column=0, padx=8, pady=3, sticky=E
+        )
+        ttk.Entry(self, textvariable=self.input_dir).grid(
+            row=1, column=1, padx=3, pady=3, sticky=E + W
+        )
+        ttk.Button(
+            self,
+            text=_ui_text("Choose", "選択"),
+            command=self.choose_input_dir,
+        ).grid(row=1, column=2, padx=8, pady=3, sticky=W)
+
+        ttk.Label(self, text=_ui_text("Import from", "取り込み元")).grid(
+            row=2, column=0, padx=8, pady=3, sticky=E
+        )
+        ttk.Entry(self, textvariable=self.import_dir).grid(
+            row=2, column=1, padx=3, pady=3, sticky=E + W
+        )
+        ttk.Button(
+            self,
+            text=_ui_text("Import ZIPs", "ZIPを取り込む"),
+            command=self.choose_import_dir,
+        ).grid(row=2, column=2, padx=8, pady=3, sticky=W)
+
+        management_frame = ttk.Frame(self)
+        management_frame.grid(row=3, column=0, columnspan=3, padx=8, pady=5, sticky=E + W)
+        management_frame.columnconfigure(1, weight=1)
+        ttk.Button(
+            management_frame,
+            text=_ui_text("Scan input", "入力をスキャン"),
+            command=self.scan_input,
+        ).grid(row=0, column=0, padx=(0, 6), sticky=W)
+        self.summary_label = ttk.Label(
+            management_frame,
+            text=_ui_text("No catalog scan yet", "まだcatalogをスキャンしていません"),
+        )
+        self.summary_label.grid(row=0, column=1, sticky=W)
+
+        list_frame = ttk.Frame(self)
+        list_frame.grid(row=4, column=0, columnspan=3, padx=8, pady=3, sticky=N + S + E + W)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        ttk.Label(
+            list_frame,
+            text=_ui_text(
+                "Third-level mesh codes (multiple selection)",
+                "3次メッシュコード（複数選択可）",
+            ),
+        ).grid(row=0, column=0, columnspan=2, sticky=W)
+        self.mesh_list = tk.Listbox(list_frame, selectmode="extended", height=8)
+        self.mesh_list.grid(row=1, column=0, sticky=N + S + E + W)
+        mesh_scroll = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.mesh_list.yview
+        )
+        mesh_scroll.grid(row=1, column=1, sticky=N + S)
+        self.mesh_list.configure(yscrollcommand=mesh_scroll.set)
+
+        build_frame = ttk.LabelFrame(
+            self,
+            text=_ui_text("Build", "生成"),
+        )
+        build_frame.grid(row=5, column=0, columnspan=3, padx=8, pady=5, sticky=E + W)
+        build_frame.columnconfigure(1, weight=1)
+        ttk.Label(build_frame, text=_ui_text("Output folder", "出力フォルダ")).grid(
+            row=0, column=0, padx=5, pady=3, sticky=E
+        )
+        ttk.Entry(build_frame, textvariable=self.output_dir).grid(
+            row=0, column=1, padx=3, pady=3, sticky=E + W
+        )
+        ttk.Button(
+            build_frame,
+            text=_ui_text("Choose", "選択"),
+            command=self.choose_output_dir,
+        ).grid(row=0, column=2, padx=5, pady=3, sticky=W)
+        ttk.Label(build_frame, text=_ui_text("Resolution", "解像度")).grid(
+            row=1, column=0, padx=5, pady=3, sticky=E
+        )
+        ttk.Combobox(
+            build_frame,
+            textvariable=self.resolution,
+            values=("auto", "1m", "5m", "10m"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=1, padx=3, pady=3, sticky=W)
+        ttk.Label(
+            build_frame,
+            text=_ui_text("HGT tiles (optional, comma-separated)", "HGTタイル（任意、カンマ区切り）"),
+        ).grid(row=2, column=0, padx=5, pady=3, sticky=E)
+        ttk.Entry(build_frame, textvariable=self.hgt_tiles).grid(
+            row=2, column=1, padx=3, pady=3, sticky=E + W
+        )
+        ttk.Label(
+            build_frame,
+            text=_ui_text("BBox S W N E (optional)", "矩形 S W N E（任意）"),
+        ).grid(row=3, column=0, padx=5, pady=3, sticky=E)
+        bbox_frame = ttk.Frame(build_frame)
+        bbox_frame.grid(row=3, column=1, columnspan=2, padx=3, pady=3, sticky=W)
+        for index, variable in enumerate(self.bbox_vars):
+            ttk.Entry(bbox_frame, textvariable=variable, width=10).grid(
+                row=0, column=index, padx=(0, 3)
+            )
+        ttk.Checkbutton(
+            build_frame,
+            text=_ui_text("Create VRT", "VRTを作成"),
+            variable=self.make_vrt,
+        ).grid(row=4, column=1, padx=3, pady=3, sticky=W)
+        ttk.Checkbutton(
+            build_frame,
+            text=_ui_text("Allow overwrite", "上書きを許可"),
+            variable=self.overwrite,
+        ).grid(row=4, column=2, padx=3, pady=3, sticky=W)
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(
+            self,
+            variable=self.progress_var,
+            maximum=100,
+        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(3, 0), sticky=E + W)
+        ttk.Label(self, textvariable=self.status_var).grid(
+            row=7, column=0, columnspan=3, padx=8, pady=3, sticky=W
+        )
+        button_frame = ttk.Frame(self)
+        button_frame.grid(row=8, column=0, columnspan=3, padx=8, pady=(3, 8), sticky=E + W)
+        self.build_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Build GSI DEM", "GSI DEMを生成"),
+            command=self.build_dem,
+        )
+        self.build_button.pack(side="left", padx=3)
+        self.apply_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Use as custom_dem", "custom_demに適用"),
+            command=self.apply_custom_dem,
+            state="disabled",
+        )
+        self.apply_button.pack(side="left", padx=3)
+        self.cancel_button = ttk.Button(
+            button_frame,
+            text=_ui_text("Cancel", "キャンセル"),
+            command=self.request_cancel,
+            state="disabled",
+        )
+        self.cancel_button.pack(side="left", padx=3)
+        ttk.Button(
+            button_frame,
+            text=_ui_text("Close", "閉じる"),
+            command=self.close,
+        ).pack(side="right", padx=3)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._poll_queue()
+        self._refresh_mesh_codes()
+
+    def choose_input_dir(self):
+        selected = filedialog.askdirectory(parent=self, title=_ui_text("Choose GSI input folder", "GSI入力フォルダを選択"))
+        if selected:
+            self.input_dir.set(selected)
+            self._refresh_mesh_codes()
+
+    def choose_import_dir(self):
+        selected = filedialog.askdirectory(parent=self, title=_ui_text("Choose source folder", "取り込み元フォルダを選択"))
+        if selected:
+            self.import_dir.set(selected)
+            self.import_zips()
+
+    def choose_output_dir(self):
+        selected = filedialog.askdirectory(parent=self, title=_ui_text("Choose output folder", "出力フォルダを選択"))
+        if selected:
+            self.output_dir.set(selected)
+
+    def _refresh_mesh_codes(self):
+        try:
+            catalog = GSI.load_catalog(Path(self.input_dir.get()) / "catalog.json")
+        except Exception:
+            return
+        codes = sorted(
+            {
+                str(code)
+                for entry in catalog.get("entries", [])
+                if entry.get("status") == "ready"
+                for code in entry.get("mesh_codes", [])
+                if len(str(code)) == 8
+            }
+        )
+        self.mesh_list.delete(0, END)
+        for code in codes:
+            self.mesh_list.insert(END, code)
+
+    def _set_running(self, running):
+        state = "disabled" if running else "normal"
+        for button in (self.build_button, self.apply_button):
+            if button is self.apply_button and self.last_build_result is None:
+                button_state = "disabled"
+            else:
+                button_state = state
+            button.configure(state=button_state)
+        self.cancel_button.configure(state="normal" if running else "disabled")
+
+    def _begin_worker(self, label, target, *args):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return 0
+        self.cancel_event = threading.Event()
+        self.last_build_result = None
+        self.apply_button.configure(state="disabled")
+        self._set_running(True)
+        self.progress_var.set(0)
+        self.status_var.set(_ui_text(f"Running: {label}", f"実行中: {label}"))
+
+        def worker():
+            try:
+                value = target(
+                    *args,
+                    progress=self._progress_callback,
+                    cancel_event=self.cancel_event,
+                )
+                self.result_queue.put(("result", value, None))
+            except GSI.GSICancelled:
+                self.result_queue.put(("cancelled", None, None))
+            except Exception as error:
+                self.result_queue.put(("error", None, error))
+
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+        return 1
+
+    def _progress_callback(self, stage, completed, total, message):
+        self.result_queue.put(("progress", (stage, completed, total, message), None))
+
+    def import_zips(self):
+        if not self.import_dir.get():
+            self.status_var.set(_ui_text("Choose an import folder first", "取り込み元フォルダを選択してください"))
+            return 0
+        return self._begin_worker(
+            "GSI import",
+            GSI.import_gsi_archives,
+            Path(self.import_dir.get()),
+            Path(self.input_dir.get()),
+        )
+
+    def scan_input(self):
+        return self._begin_worker(
+            "GSI scan",
+            GSI.scan_gsi_input,
+            Path(self.input_dir.get()),
+            True,
+        )
+
+    def _build_options(self):
+        selected = tuple(
+            self.mesh_list.get(index) for index in self.mesh_list.curselection()
+        )
+        bbox_values = [variable.get().strip() for variable in self.bbox_vars]
+        bbox = None
+        if any(bbox_values):
+            if not all(bbox_values):
+                raise GSI.GSIError("BBox requires south, west, north, and east")
+            try:
+                bbox = tuple(float(value) for value in bbox_values)
+            except ValueError as error:
+                raise GSI.GSIError("BBox values must be decimal degrees") from error
+        hgt_tiles = tuple(
+            value.strip().upper()
+            for value in self.hgt_tiles.get().split(",")
+            if value.strip()
+        )
+        return GSI.GSIOptions(
+            input_dir=Path(self.input_dir.get()),
+            output_dir=Path(self.output_dir.get()),
+            mesh_codes=selected,
+            bbox=bbox,
+            resolution=self.resolution.get(),
+            make_vrt=bool(self.make_vrt.get()),
+            hgt_tiles=hgt_tiles,
+            overwrite=bool(self.overwrite.get()),
+        )
+
+    def build_dem(self):
+        try:
+            options = self._build_options()
+        except Exception as error:
+            self.status_var.set(_ui_text(f"Invalid settings: {error}", f"設定が不正です: {error}"))
+            return 0
+        return self._begin_worker("GSI DEM build", GSI.build_gsi_dem, options)
+
+    def apply_custom_dem(self):
+        if self.last_build_result is None:
+            return 0
+        path = self.last_build_result.recommended_custom_dem
+        if not path:
+            self.status_var.set(_ui_text("No custom DEM output is available", "custom DEMの出力がありません"))
+            return 0
+        CFG.custom_dem = path
+        config_window = getattr(self.parent, "config_window", None)
+        if config_window is not None:
+            try:
+                config_window.v_["custom_dem"].set(path)
+            except Exception:
+                pass
+        self.status_var.set(_ui_text(f"custom_dem set to {path}", f"custom_demを設定しました: {path}"))
+        return 1
+
+    def request_cancel(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+            self.status_var.set(_ui_text("Cancellation requested...", "キャンセルを要求しました..."))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, value, error = self.result_queue.get_nowait()
+                if kind == "progress":
+                    stage, completed, total, message = value
+                    self.progress_var.set(
+                        (completed / total * 100.0) if total else 0.0
+                    )
+                    self.status_var.set(f"{stage}: {message}")
+                elif kind == "result":
+                    self._set_running(False)
+                    if isinstance(value, GSI.GSIScanResult):
+                        self.summary_label.configure(
+                            text=_ui_text(
+                                f"ZIPs {value.zip_count}; products {value.product_counts}; dates {value.date_counts}; candidate/unused/duplicate {value.selection_counts.get('candidate', 0)}/{value.selection_counts.get('unused', 0)}/{value.selection_counts.get('duplicate', 0)}; quarantine {value.quarantined}; invalid {value.invalid}; modified {value.modified}; missing {value.missing}",
+                                f"ZIP {value.zip_count}件、製品 {value.product_counts}、日付 {value.date_counts}、候補/未使用/重複 {value.selection_counts.get('candidate', 0)}/{value.selection_counts.get('unused', 0)}/{value.selection_counts.get('duplicate', 0)}、隔離 {value.quarantined}、不正 {value.invalid}、変更 {value.modified}、欠落 {value.missing}",
+                            )
+                        )
+                        self._refresh_mesh_codes()
+                        self.status_var.set(_ui_text("Scan completed", "スキャン完了"))
+                    elif isinstance(value, GSI.GSIImportResult):
+                        self.summary_label.configure(
+                            text=_ui_text(
+                                f"ZIPs {value.zip_count}; products {value.product_counts}; dates {value.date_counts}; imported {value.imported}; duplicates {value.skipped_duplicates}; quarantine {value.quarantined}",
+                                f"ZIP {value.zip_count}件、製品 {value.product_counts}、日付 {value.date_counts}、取り込み {value.imported}、重複 {value.skipped_duplicates}、隔離 {value.quarantined}",
+                            )
+                        )
+                        self._refresh_mesh_codes()
+                        self.status_var.set(
+                            _ui_text(
+                                "Import cancelled (partial results saved)" if value.cancelled else "Import completed",
+                                "取り込みをキャンセルしました（部分結果を保存済み）" if value.cancelled else "取り込み完了",
+                            )
+                        )
+                    elif isinstance(value, GSI.GSIBuildResult):
+                        self.last_build_result = value
+                        self.apply_button.configure(
+                            state="normal" if value.recommended_custom_dem else "disabled"
+                        )
+                        self.status_var.set(
+                            _ui_text(
+                                f"Build cancelled: {len(value.outputs)} output(s) saved" if value.cancelled else f"Build completed: {len(value.outputs)} output(s), {len(value.failures)} failure(s)",
+                                f"生成をキャンセルしました: 出力 {len(value.outputs)}件を保存済み" if value.cancelled else f"生成完了: 出力 {len(value.outputs)}件、失敗 {len(value.failures)}件",
+                            )
+                        )
+                elif kind == "cancelled":
+                    self._set_running(False)
+                    self.status_var.set(_ui_text("Cancelled", "キャンセルしました"))
+                elif kind == "error":
+                    self._set_running(False)
+                    self.status_var.set(_ui_text(f"Failed: {error}", f"失敗: {error}"))
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def close(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.request_cancel()
+            self.status_var.set(
+                _ui_text(
+                    "Waiting for the current GSI operation to stop...",
+                    "GSI処理の停止を待っています...",
+                )
+            )
+            self.after(100, self.close)
+            return
+        self.destroy()
 
 ################################################################################
 class Ortho4XP_Custom_ZL(tk.Toplevel):
