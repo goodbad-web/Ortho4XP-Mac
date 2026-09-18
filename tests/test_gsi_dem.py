@@ -224,6 +224,27 @@ def test_build_uses_existing_catalog_without_full_scan(tmp_path, monkeypatch):
     assert not result.failures
 
 
+def test_incremental_scan_reuses_unchanged_catalog_entries(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    archive = input_dir / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive, "DEM5A")
+    first = GSI.scan_gsi_input(input_dir)
+    assert first.ready == 1
+    assert first.entries[0]["mtime_ns"] == archive.stat().st_mtime_ns
+
+    def unexpected_read(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("unchanged archive should be reused")
+
+    monkeypatch.setattr(GSI, "_sha256", unexpected_read)
+    monkeypatch.setattr(GSI, "_archive_metadata", unexpected_read)
+    second = GSI.scan_gsi_input(input_dir, incremental=True)
+
+    assert second.ready == 1
+    assert second.entries[0]["sha256"] == first.entries[0]["sha256"]
+
+
 def test_build_rejects_changed_candidate_archive(tmp_path):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"

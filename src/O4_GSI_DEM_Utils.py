@@ -73,7 +73,8 @@ CATALOG_VERSION = 1
 MANIFEST_VERSION = 2
 GSI_CACHE_VERSION = 1
 GSI_CACHE_DIRNAME = ".gsi_cache"
-GSI_MAX_ARCHIVE_WORKERS = 4
+GSI_MAX_ARCHIVE_WORKERS = 10
+GSI_MAX_SCAN_WORKERS = 8
 NO_DATA = -9999.0
 HGT_NO_DATA = -32768
 
@@ -598,11 +599,14 @@ def _catalog_entry(
     status: str = "ready",
     reason: Optional[str] = None,
     source_path: Optional[Path] = None,
+    stat_result=None,
 ) -> dict:
+    stat_result = stat_result or path.stat()
     entry = {
         "path": str(path.relative_to(input_dir)),
         "sha256": digest,
-        "size": path.stat().st_size,
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
         "product": metadata.get("product"),
         "date": metadata.get("date"),
         "mesh_codes": metadata.get("mesh_codes", []),
@@ -614,6 +618,104 @@ def _catalog_entry(
     if reason:
         entry["reason"] = reason
     return entry
+
+
+def _catalog_entry_reusable(previous: Optional[dict], stat_result) -> bool:
+    """Return whether an incremental scan can trust a previous entry.
+
+    The normal catalog path has an exact nanosecond mtime.  Older catalogs did
+    not record it, so use their per-entry checked_at timestamp as a one-way
+    compatibility fallback.  This function is used only by the GUI's
+    incremental scan; the CLI scan remains strict and always rereads bytes.
+    """
+    if not previous or not previous.get("sha256"):
+        return False
+    if previous.get("size") != stat_result.st_size:
+        return False
+    previous_mtime = previous.get("mtime_ns")
+    if previous_mtime is not None:
+        try:
+            return int(previous_mtime) == stat_result.st_mtime_ns
+        except (TypeError, ValueError):
+            return False
+    checked_at = previous.get("checked_at")
+    if not checked_at:
+        return False
+    try:
+        checked_ns = int(datetime.fromisoformat(str(checked_at)).timestamp() * 1e9)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return stat_result.st_mtime_ns <= checked_ns
+
+
+def _scan_archive_worker(path_string: str) -> dict:
+    """Hash and validate one archive in an isolated process."""
+    path = Path(path_string)
+    stat_result = path.stat()
+    digest = None
+    try:
+        digest = _sha256(path)
+        metadata = _archive_metadata(path)
+        return {
+            "ok": True,
+            "digest": digest,
+            "metadata": metadata,
+            "size": stat_result.st_size,
+            "mtime_ns": stat_result.st_mtime_ns,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "digest": digest,
+            "error": str(exc),
+            "size": stat_result.st_size,
+            "mtime_ns": stat_result.st_mtime_ns,
+        }
+
+
+def _scan_archive_records(
+    pending: list[tuple[Path, object]], cancel_event
+) -> dict[str, dict]:
+    """Scan uncached archives concurrently while retaining serial fallback."""
+    if not pending:
+        return {}
+
+    def serial_records() -> dict[str, dict]:
+        records = {}
+        for path, _stat_result in pending:
+            _check_cancel(cancel_event)
+            records[str(path)] = _scan_archive_worker(str(path))
+        return records
+
+    worker_count = _gsi_scan_worker_count(len(pending))
+    if worker_count <= 1:
+        return serial_records()
+
+    context = multiprocessing.get_context("spawn")
+    executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
+    futures = {
+        executor.submit(_scan_archive_worker, str(path)): path
+        for path, _stat_result in pending
+    }
+    try:
+        records = {}
+        for future in as_completed(futures):
+            _check_cancel(cancel_event)
+            path = futures[future]
+            records[str(path)] = future.result()
+        executor.shutdown(wait=True)
+        return records
+    except GSICancelled:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    except BrokenProcessPool:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return serial_records()
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
 
 
 def _apply_catalog_integrity(
@@ -681,6 +783,7 @@ def scan_gsi_input(
     cancel_event=None,
     source_paths: Optional[dict[str, str]] = None,
     quarantine_reasons: Optional[dict[str, str]] = None,
+    incremental: bool = False,
 ) -> GSIScanResult:
     input_dir = Path(input_dir).resolve()
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -700,24 +803,59 @@ def scan_gsi_input(
     entries: list[dict] = []
     seen_hashes: dict[str, str] = {}
     invalid = 0
+    cached_entries: dict[str, dict] = {}
+    pending: list[tuple[Path, object]] = []
 
     for index, path in enumerate(paths, 1):
         _check_cancel(cancel_event)
-        _report(progress, "scan", index, len(paths), path.name)
+        stat_result = path.stat()
+        relative = str(path.relative_to(input_dir))
+        previous = previous_entries.get(relative)
+        if incremental and _catalog_entry_reusable(previous, stat_result):
+            entry = dict(previous)
+            entry["size"] = stat_result.st_size
+            entry["mtime_ns"] = stat_result.st_mtime_ns
+            cached_entries[relative] = entry
+            _report(progress, "scan", index, len(paths), f"cached: {path.name}")
+        else:
+            pending.append((path, stat_result))
+
+    archive_records = _scan_archive_records(pending, cancel_event)
+
+    for index, path in enumerate(paths, 1):
+        _check_cancel(cancel_event)
+        stat_result = path.stat()
         digest = None
         relative = str(path.relative_to(input_dir))
         previous = previous_entries.get(relative)
         changed = False
+        if relative in cached_entries:
+            entry = cached_entries[relative]
+            digest = entry.get("sha256")
+            if entry.get("status") in {"ready", "duplicate"}:
+                if digest in seen_hashes:
+                    entry["status"] = "duplicate"
+                    entry["reason"] = f"same content as {seen_hashes[digest]}"
+                else:
+                    seen_hashes[digest] = relative
+                    entry["status"] = "ready"
+                    entry.pop("reason", None)
+            entries.append(entry)
+            continue
+        _report(progress, "scan", index, len(paths), path.name)
         try:
-            digest = _sha256(path)
+            record = archive_records[str(path)]
+            digest = record.get("digest")
             changed = bool(
                 previous
                 and (
                     previous.get("sha256") != digest
-                    or previous.get("size") != path.stat().st_size
+                    or previous.get("size") != stat_result.st_size
                 )
             )
-            metadata = _archive_metadata(path)
+            if not record.get("ok"):
+                raise GSIError(record.get("error") or "archive scan failed")
+            metadata = record["metadata"]
             source_path = source_paths.get(relative)
             if not source_path and previous:
                 source_path = previous.get("source_path")
@@ -730,6 +868,7 @@ def scan_gsi_input(
                     status="duplicate",
                     reason=f"same content as {seen_hashes[digest]}",
                     source_path=Path(source_path) if source_path else None,
+                    stat_result=stat_result,
                 )
             else:
                 seen_hashes[digest] = relative
@@ -739,15 +878,17 @@ def scan_gsi_input(
                     digest,
                     metadata,
                     source_path=Path(source_path) if source_path else None,
+                    stat_result=stat_result,
                 )
-            _apply_catalog_integrity(entry, previous, digest, path.stat().st_size)
+            _apply_catalog_integrity(entry, previous, digest, stat_result.st_size)
         except Exception as exc:
             if not previous or not changed:
                 invalid += 1
             entry = {
                 "path": relative,
                 "sha256": digest,
-                "size": path.stat().st_size,
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
                 "product": None,
                 "date": None,
                 "mesh_codes": [],
@@ -831,11 +972,13 @@ def scan_gsi_input(
             digest = _sha256(path)
         except OSError:
             digest = None
+        stat_result = path.stat()
         entries.append(
             {
                 "path": relative,
                 "sha256": digest,
-                "size": path.stat().st_size,
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
                 "product": None,
                 "date": None,
                 "mesh_codes": [],
@@ -2025,7 +2168,16 @@ def _gsi_archive_worker_count(candidate_count: int) -> int:
     return min(
         max(1, candidate_count),
         GSI_MAX_ARCHIVE_WORKERS,
-        max(1, cpu_count // 4),
+        max(1, cpu_count),
+    )
+
+
+def _gsi_scan_worker_count(pending_count: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    return min(
+        max(1, pending_count),
+        GSI_MAX_SCAN_WORKERS,
+        max(1, cpu_count // 2),
     )
 
 

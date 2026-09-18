@@ -35,6 +35,10 @@ GSIの原本ZIPは、既定の`Elevation_data/GSI/input/`へ取り込み、生�
 .venv/bin/python make_gsi_dem.py scan
 ```
 
+Supportの`Scan input`は増分スキャンとして動作し、catalogに記録されたサイズ・更新時刻が一致するZIPのSHA-256/XML検査を再利用する。新規・変更ZIPだけを厳密検査するため、同じ入力をGUIから再スキャンする場合のI/Oを抑えられる。全ZIPを毎回厳密検査する場合は、上記CLIの`scan`を実行する。
+
+増分スキャンで検査が必要なZIPは最大8プロセスで並列処理する。DEM build側のcandidate ZIP処理は最大10プロセスで並列化する。
+
 生成対象は3次メッシュコードまたは緯度経度の矩形で指定する。`auto`は利用可能な最高解像度を選び、1m出力では1mを優先し、欠損部分を低解像度入力で補完する。VRTは任意、manifestは必須である。
 
 ```sh

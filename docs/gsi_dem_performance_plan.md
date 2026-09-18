@@ -136,7 +136,7 @@ commit/pushは別途明示依頼があるまで行わない。
 
 ### CPU並列化
 
-candidate ZIP単位でspawn型`ProcessPoolExecutor`を使用する。worker数はCPU数の1/4を上限とし、最大4、候補数未満に制限する。M5 Max 16 CPUでは最大4 workerとなる。worker結果は既存のproduct/date/path/XML順に再整列し、入力エラーは伝播させる。spawn不能時のみ逐次経路へfallbackする。
+candidate ZIP単位でspawn型`ProcessPoolExecutor`を使用する。worker数はCPU数を上限とし、最大10、候補数未満に制限する。M5 Max 16 CPUでは最大10 workerとなる。worker結果は既存のproduct/date/path/XML順に再整列し、入力エラーは伝播させる。spawn不能時のみ逐次経路へfallbackする。
 
 ### Metal raster配置PoC
 

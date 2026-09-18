@@ -1477,7 +1477,8 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
             "GSI scan",
             GSI.scan_gsi_input,
             Path(self.input_dir.get()),
-            True,
+            write_catalog=True,
+            incremental=True,
         )
 
     def _build_options(self):
