@@ -107,6 +107,42 @@ def test_import_quarantines_archive_with_malformed_xml(tmp_path):
     assert [entry["status"] for entry in catalog["entries"]] == ["quarantined"]
 
 
+def test_import_and_build_ignore_macos_appledouble_xml(tmp_path):
+    source = tmp_path / "downloads"
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    source.mkdir()
+    archive = source / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive, "DEM5A")
+    with zipfile.ZipFile(archive, "a") as managed_archive:
+        managed_archive.writestr(
+            "__MACOSX/FG-GML-523266-DEM5A-20250101/._data.xml",
+            b"AppleDouble metadata, not GSI XML",
+        )
+
+    imported = GSI.import_gsi_archives(source, input_dir)
+
+    assert imported.imported == 1
+    assert imported.quarantined == 0
+    bbox = (
+        35.166666667,
+        132.75,
+        35.166666667 + 2 * 0.2 / 3600.0,
+        132.75 + 2 * 0.2 / 3600.0,
+    )
+    built = GSI.build_gsi_dem(
+        GSI.GSIOptions(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            bbox=bbox,
+            resolution="auto",
+        )
+    )
+
+    assert built.outputs
+    assert not built.failures
+
+
 def test_build_one_meter_output_uses_lower_resolution_only_for_nodata(tmp_path):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"

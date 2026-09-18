@@ -200,6 +200,12 @@ def _children(root: ET.Element, name: str) -> list[ET.Element]:
     return [element for element in root.iter() if _local_name(element.tag) == name]
 
 
+def _is_auxiliary_xml_member(name: str) -> bool:
+    """Ignore macOS archive metadata, not actual GSI data XML."""
+    parts = [part for part in name.replace("\\", "/").split("/") if part]
+    return "__MACOSX" in parts or bool(parts and parts[-1].startswith("._"))
+
+
 def _first_text(root: ET.Element, name: str) -> Optional[str]:
     for element in _children(root, name):
         if element.text and element.text.strip():
@@ -476,7 +482,11 @@ def _archive_metadata(path: Path) -> dict:
     dates: set[str] = set()
     xml_count = 0
     with zipfile.ZipFile(path) as archive:
-        names = [name for name in archive.namelist() if name.lower().endswith(".xml")]
+        names = [
+            name
+            for name in archive.namelist()
+            if name.lower().endswith(".xml") and not _is_auxiliary_xml_member(name)
+        ]
         for name in names:
             xml_count += 1
             metadata = _parse_metadata(archive.read(name), path.name)
@@ -1143,7 +1153,9 @@ def _archive_blocks(
     with zipfile.ZipFile(path) as archive:
         for xml_name in archive.namelist():
             _check_cancel(cancel_event)
-            if not xml_name.lower().endswith(".xml"):
+            if not xml_name.lower().endswith(".xml") or _is_auxiliary_xml_member(
+                xml_name
+            ):
                 continue
             xml_bytes = archive.read(xml_name)
             metadata = _parse_metadata(xml_bytes, path.name)
