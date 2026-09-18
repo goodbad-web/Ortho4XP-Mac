@@ -341,7 +341,7 @@ def _validate_metadata_payload(metadata: dict) -> None:
         raise GSIError("GSI XML tupleList exceeds the declared grid")
 
 
-def _parse_values(metadata: dict) -> np.ndarray:
+def _parse_values(metadata: dict, validate: bool = False) -> np.ndarray:
     tuple_element = next(iter(_children(metadata["root"], "tupleList")), None)
     if tuple_element is None or not tuple_element.text:
         raise GSIError("GSI XML has no tupleList")
@@ -357,7 +357,13 @@ def _parse_values(metadata: dict) -> np.ndarray:
             kind, value_text = "", line
         try:
             value = float(value_text.strip())
-        except ValueError:
+        except ValueError as exc:
+            if validate and kind.strip() not in ("データなし", "データ無し") and (
+                value_text.strip() not in ("データなし", "データ無し")
+            ):
+                raise GSIError(
+                    f"GSI XML has an invalid elevation tuple: {line}"
+                ) from exc
             value = np.nan
         if kind.strip() in ("データなし", "データ無し") or value <= -9990:
             value = np.nan
@@ -371,6 +377,8 @@ def _parse_values(metadata: dict) -> np.ndarray:
     start = metadata["start_y"] * metadata["width"] + metadata["start_x"]
     if start < 0 or start >= expected:
         raise GSIError("GSI XML startPoint is outside the grid")
+    if validate and len(values) > expected - start:
+        raise GSIError("GSI XML tupleList exceeds the declared grid")
     count = min(values_array.size, expected - start)
     result[start : start + count] = values_array[:count]
     return result.reshape((metadata["height"], metadata["width"]))
@@ -443,8 +451,10 @@ def parse_gsi_xml(
     source_path: Path,
     xml_name: str,
     source_crs: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    values: Optional[np.ndarray] = None,
 ) -> GSIBlock:
-    metadata = _parse_metadata(xml_bytes, source_path.name)
+    metadata = metadata or _parse_metadata(xml_bytes, source_path.name)
     if metadata is None:
         raise GSIError(f"Unsupported or incomplete GSI XML: {xml_name}")
     source_ref, source_label = _resolve_source_crs(
@@ -467,7 +477,7 @@ def parse_gsi_xml(
         west=bounds[1],
         north=bounds[2],
         east=bounds[3],
-        values=_parse_values(metadata),
+        values=values if values is not None else _parse_values(metadata),
         source_path=source_path,
         xml_name=xml_name,
         source_crs=source_label,
@@ -1143,36 +1153,82 @@ def _record_may_contain(entry: dict, region: GSIRegion) -> bool:
     return False
 
 
+def _metadata_summary(metadata: dict) -> dict:
+    """Keep only small, XML-tree-independent metadata for a build cache."""
+    return {
+        key: metadata[key]
+        for key in (
+            "product",
+            "date",
+            "mesh_codes",
+            "south",
+            "west",
+            "north",
+            "east",
+            "width",
+            "height",
+            "start_x",
+            "start_y",
+            "srs_name",
+        )
+    }
+
+
 def _archive_blocks(
     path: Path,
     region: GSIRegion,
     source_crs: Optional[str],
     cancel_event=None,
+    metadata_cache: Optional[dict[str, tuple[tuple[str, dict], ...]]] = None,
 ) -> list[GSIBlock]:
     blocks: list[GSIBlock] = []
+    cache_key = str(Path(path).resolve())
+    indexed_members = metadata_cache.get(cache_key) if metadata_cache is not None else None
+    if indexed_members is None:
+        indexed: list[tuple[str, dict]] = []
+        with zipfile.ZipFile(path) as archive:
+            for xml_name in archive.namelist():
+                _check_cancel(cancel_event)
+                if not xml_name.lower().endswith(".xml") or _is_auxiliary_xml_member(
+                    xml_name
+                ):
+                    continue
+                metadata = _parse_metadata(archive.read(xml_name), path.name)
+                if metadata is None:
+                    raise GSIError(
+                        f"ZIP contains unsupported or incomplete XML: {xml_name}"
+                    )
+                indexed.append((xml_name, _metadata_summary(metadata)))
+        indexed_members = tuple(indexed)
+        if metadata_cache is not None:
+            metadata_cache[cache_key] = indexed_members
+
     with zipfile.ZipFile(path) as archive:
-        for xml_name in archive.namelist():
+        for xml_name, summary in indexed_members:
             _check_cancel(cancel_event)
-            if not xml_name.lower().endswith(".xml") or _is_auxiliary_xml_member(
-                xml_name
-            ):
-                continue
-            xml_bytes = archive.read(xml_name)
-            metadata = _parse_metadata(xml_bytes, path.name)
-            if metadata is None:
-                raise GSIError(f"ZIP contains unsupported or incomplete XML: {xml_name}")
-            _validate_metadata_payload(metadata)
             source_bounds = (
-                metadata["south"],
-                metadata["west"],
-                metadata["north"],
-                metadata["east"],
+                summary["south"],
+                summary["west"],
+                summary["north"],
+                summary["east"],
             )
             # Bounds are geographic in the GSI GML.  The CRS transform is
             # repeated by parse_gsi_xml only for blocks that intersect.
             if not _overlaps(source_bounds, region.bounds):
                 continue
-            block = parse_gsi_xml(xml_bytes, path, xml_name, source_crs)
+            xml_bytes = archive.read(xml_name)
+            metadata = _parse_metadata(xml_bytes, path.name)
+            if metadata is None:
+                raise GSIError(f"ZIP contains unsupported or incomplete XML: {xml_name}")
+            values = _parse_values(metadata, validate=True)
+            block = parse_gsi_xml(
+                xml_bytes,
+                path,
+                xml_name,
+                source_crs,
+                metadata=metadata,
+                values=values,
+            )
             if _overlaps(block.bounds, region.bounds):
                 blocks.append(block)
     return blocks
@@ -1184,6 +1240,110 @@ def _candidate_entries(scan: GSIScanResult, region: GSIRegion) -> list[dict]:
         for entry in scan.entries
         if entry.get("status") == "ready" and _record_may_contain(entry, region)
     ]
+
+
+def _scan_result_from_catalog(input_dir: Path) -> GSIScanResult:
+    catalog_path = Path(input_dir) / "catalog.json"
+    payload = load_catalog(catalog_path)
+    entries = list(payload.get("entries", []))
+    return GSIScanResult(
+        entries=entries,
+        ready=sum(entry.get("status") == "ready" for entry in entries),
+        duplicates=sum(entry.get("status") == "duplicate" for entry in entries),
+        quarantined=sum(entry.get("status") == "quarantined" for entry in entries),
+        invalid=sum(entry.get("status") == "invalid" for entry in entries),
+        modified=sum(entry.get("status") == "modified" for entry in entries),
+        missing=sum(entry.get("status") == "missing" for entry in entries),
+        catalog_path=str(catalog_path),
+        zip_count=len(entries),
+        product_counts=_count_field(entries, "product", {"ready", "duplicate"}),
+        date_counts=_count_field(entries, "date", {"ready", "duplicate"}),
+        selection_counts=_count_field(entries, "selection"),
+    )
+
+
+def _catalog_archive_paths(entries: Iterable[dict]) -> set[str]:
+    return {
+        str(entry.get("path"))
+        for entry in entries
+        if entry.get("path") and "_quarantine" not in Path(str(entry["path"])).parts
+    }
+
+
+def _catalog_matches_input(input_dir: Path, entries: Iterable[dict]) -> bool:
+    actual = {
+        str(path.relative_to(input_dir))
+        for path in _iter_archives(input_dir)
+    }
+    return actual == _catalog_archive_paths(entries)
+
+
+def _load_build_scan(
+    input_dir: Path,
+    progress: Optional[ProgressCallback],
+    cancel_event,
+) -> GSIScanResult:
+    """Load a catalog cheaply, falling back to the strict scan when needed."""
+    catalog_path = Path(input_dir) / "catalog.json"
+    if not catalog_path.is_file():
+        return scan_gsi_input(
+            input_dir,
+            write_catalog=True,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
+    try:
+        scan = _scan_result_from_catalog(input_dir)
+        if not _catalog_matches_input(Path(input_dir), scan.entries):
+            return scan_gsi_input(
+                input_dir,
+                write_catalog=True,
+                progress=progress,
+                cancel_event=cancel_event,
+            )
+        return scan
+    except GSICancelled:
+        raise
+    except GSIError:
+        return scan_gsi_input(
+            input_dir,
+            write_catalog=True,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
+
+
+def _verify_build_entries(
+    entries: Iterable[dict],
+    input_dir: Path,
+    progress: Optional[ProgressCallback],
+    cancel_event,
+) -> None:
+    unique_entries = {
+        str(entry["path"]): entry
+        for entry in entries
+        if entry.get("path")
+    }
+    total = len(unique_entries)
+    for index, entry in enumerate(unique_entries.values(), 1):
+        _check_cancel(cancel_event)
+        relative = str(entry["path"])
+        path = Path(input_dir) / relative
+        if entry.get("status") != "ready":
+            raise GSIError(
+                f"Catalog input is not ready for build: {relative} "
+                f"({entry.get('status')})"
+            )
+        if not path.is_file():
+            raise GSIError(f"Catalog input is missing: {path}")
+        size = path.stat().st_size
+        expected_size = entry.get("size")
+        if expected_size is not None and int(expected_size) != size:
+            raise GSIError(f"Catalog input size changed: {path}")
+        _report(progress, "verify", index, total, path.name)
+        digest = _sha256(path)
+        if entry.get("sha256") and digest != entry["sha256"]:
+            raise GSIError(f"Catalog input digest changed: {path}")
 
 
 def _check_cancel(cancel_event) -> None:
@@ -1256,6 +1416,39 @@ def _insert_block(
         row_end = min(height - 1, int(np.ceil((region.north - source_south) / resolution_deg)) - 1)
     if col_end < col_start or row_end < row_start:
         return 0
+
+    if not point_grid and np.isclose(dlon, resolution_deg) and np.isclose(
+        dlat, resolution_deg
+    ):
+        source_col = (source_west - region.west) / resolution_deg
+        source_row = (region.north - source_north) / resolution_deg
+        source_col0 = int(round(source_col))
+        source_row0 = int(round(source_row))
+        if np.isclose(source_col, source_col0) and np.isclose(
+            source_row, source_row0
+        ):
+            output_col0 = max(0, source_col0)
+            output_col1 = min(width, source_col0 + src_width)
+            output_row0 = max(0, source_row0)
+            output_row1 = min(height, source_row0 + src_height)
+            if output_col1 <= output_col0 or output_row1 <= output_row0:
+                return 0
+            source_col_slice = slice(
+                output_col0 - source_col0,
+                output_col1 - source_col0,
+            )
+            source_row_slice = slice(
+                output_row0 - source_row0,
+                output_row1 - source_row0,
+            )
+            sampled = block.values[source_row_slice, source_col_slice]
+            good = np.isfinite(sampled)
+            if not np.any(good):
+                return 0
+            destination = output[output_row0:output_row1, output_col0:output_col1]
+            destination[good] = sampled[good]
+            output[output_row0:output_row1, output_col0:output_col1] = destination
+            return int(np.count_nonzero(good))
 
     cols = np.arange(col_start, col_end + 1, dtype=np.int32)
     rows = np.arange(row_start, row_end + 1, dtype=np.int32)
@@ -1569,6 +1762,7 @@ def _build_region(
     options: GSIOptions,
     progress: Optional[ProgressCallback],
     cancel_event,
+    metadata_cache: Optional[dict[str, tuple[tuple[str, dict], ...]]] = None,
     target_resolution: Optional[str] = None,
     point_grid: bool = False,
 ) -> tuple[Path, dict]:
@@ -1581,7 +1775,13 @@ def _build_region(
             raise GSIError(f"Catalog input is missing: {archive_path}")
         _report(progress, "build", index, candidate_total, f"{region.label}: {archive_path.name}")
         blocks.extend(
-            _archive_blocks(archive_path, region, options.source_crs, cancel_event)
+            _archive_blocks(
+                archive_path,
+                region,
+                options.source_crs,
+                cancel_event,
+                metadata_cache=metadata_cache,
+            )
         )
     if not blocks:
         raise GSIError(f"No GSI blocks found for {region.label}")
@@ -1668,20 +1868,13 @@ def build_gsi_dem(
     if not regions and not options.hgt_tiles:
         raise GSIError("Specify at least one --mesh-code, --bbox, or --hgt-tile")
     try:
-        scan = scan_gsi_input(
+        scan = _load_build_scan(
             options.input_dir,
-            write_catalog=True,
             progress=progress,
             cancel_event=cancel_event,
         )
     except GSICancelled:
         return GSIBuildResult(cancelled=True)
-    if scan.modified or scan.missing:
-        changed = scan.modified + scan.missing
-        raise GSIError(
-            f"GSI catalog integrity check failed for {changed} input archive(s); "
-            "run scan after restoring or re-importing the original files."
-        )
     if not scan.ready:
         raise GSIError(f"No ready GSI ZIP files found in {options.input_dir}")
 
@@ -1694,10 +1887,27 @@ def build_gsi_dem(
         (region, False, None) for region in regions
     ]
     jobs.extend((_hgt_region(tile), True, "1arcsec") for tile in options.hgt_tiles)
+    job_entries: list[list[dict]] = []
+    all_candidates: list[dict] = []
+    for region, _point_grid, _forced_resolution in jobs:
+        candidates = _candidate_entries(scan, region)
+        job_entries.append(candidates)
+        all_candidates.extend(candidates)
+    try:
+        _verify_build_entries(
+            all_candidates,
+            options.input_dir,
+            progress,
+            cancel_event,
+        )
+    except GSICancelled:
+        return GSIBuildResult(cancelled=True)
+
+    metadata_cache: dict[str, tuple[tuple[str, dict], ...]] = {}
     for index, (region, point_grid, forced_resolution) in enumerate(jobs, 1):
         _check_cancel(cancel_event)
         try:
-            entries = _candidate_entries(scan, region)
+            entries = job_entries[index - 1]
             path, metadata = _build_region(
                 region,
                 entries,
@@ -1705,6 +1915,7 @@ def build_gsi_dem(
                 options,
                 progress,
                 cancel_event,
+                metadata_cache=metadata_cache,
                 target_resolution=forced_resolution,
                 point_grid=point_grid,
             )

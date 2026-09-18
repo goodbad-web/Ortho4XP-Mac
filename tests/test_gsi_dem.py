@@ -197,6 +197,79 @@ def test_build_one_meter_output_uses_lower_resolution_only_for_nodata(tmp_path):
     }
 
 
+def test_build_uses_existing_catalog_without_full_scan(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    archive = input_dir / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive, "DEM5A")
+    GSI.scan_gsi_input(input_dir)
+
+    def unexpected_full_scan(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("build should use the existing catalog")
+
+    monkeypatch.setattr(GSI, "scan_gsi_input", unexpected_full_scan)
+    result = GSI.build_gsi_dem(
+        GSI.GSIOptions(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            bbox=(35.166666667, 132.75, 35.166666667 + 2 * 0.2 / 3600.0, 132.75 + 2 * 0.2 / 3600.0),
+            resolution="auto",
+        )
+    )
+
+    assert result.outputs
+    assert not result.failures
+
+
+def test_build_rejects_changed_candidate_archive(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    archive = input_dir / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive, "DEM5A")
+    GSI.scan_gsi_input(input_dir)
+    archive.write_bytes(archive.read_bytes() + b"changed")
+
+    with pytest.raises(GSI.GSIError, match="digest changed|size changed"):
+        GSI.build_gsi_dem(
+            GSI.GSIOptions(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                bbox=(35.166666667, 132.75, 35.166666667 + 2 * 0.2 / 3600.0, 132.75 + 2 * 0.2 / 3600.0),
+                resolution="auto",
+            )
+        )
+
+
+def test_aligned_insert_block_matches_source_cells():
+    region = GSI.GSIRegion("aligned", 35.0, 132.0, 35.0002, 132.0002)
+    block = GSI.GSIBlock(
+        product="DEM5A",
+        date="20250101",
+        mesh_code="52326600",
+        south=35.0,
+        west=132.0,
+        north=35.0002,
+        east=132.0002,
+        values=np.asarray([[1.0, 2.0], [np.nan, 4.0]], dtype=np.float32),
+        source_path=Path("source.zip"),
+        xml_name="source.xml",
+        source_crs="JGD2024",
+    )
+    output = np.full((2, 2), np.nan, dtype=np.float32)
+
+    inserted = GSI._insert_block(output, block, region, 0.0001)
+
+    assert inserted == 3
+    assert np.array_equal(
+        output,
+        np.asarray([[1.0, 2.0], [np.nan, 4.0]], dtype=np.float32),
+        equal_nan=True,
+    )
+
+
 def _write_test_geotiff(path, region, values, storage_format="compact_int16"):
     return GSI.write_geotiff(
         path,
