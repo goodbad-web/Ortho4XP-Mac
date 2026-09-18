@@ -26,6 +26,7 @@ def _gsi_xml(
     rows=2,
     cols=2,
     values=None,
+    srs_name="fguuid:jgd2024.bl",
 ):
     step = 0.04 / 3600.0 if product == "DEM1A" else 0.2 / 3600.0
     north = south + rows * step
@@ -41,7 +42,7 @@ def _gsi_xml(
     <lfSpanFr><gml:timePosition>{date[:4]}-{date[4:6]}-{date[6:]}</gml:timePosition></lfSpanFr>
     <coverage>
       <gml:boundedBy>
-        <gml:Envelope srsName="fguuid:jgd2024.bl">
+        <gml:Envelope srsName="{srs_name}">
           <gml:lowerCorner>{south} {west}</gml:lowerCorner>
           <gml:upperCorner>{north} {east}</gml:upperCorner>
         </gml:Envelope>
@@ -243,6 +244,59 @@ def test_build_rejects_changed_candidate_archive(tmp_path):
         )
 
 
+def test_build_rebuilds_catalog_when_catalog_is_malformed(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    _zip(input_dir / "FG-GML-523266-DEM5A-20250101.zip", "DEM5A")
+    (input_dir / "catalog.json").write_text("[]", encoding="utf-8")
+
+    result = GSI.build_gsi_dem(
+        GSI.GSIOptions(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            bbox=(35.166666667, 132.75, 35.166666667 + 2 * 0.2 / 3600.0, 132.75 + 2 * 0.2 / 3600.0),
+            resolution="auto",
+        )
+    )
+
+    assert result.outputs
+    assert not result.failures
+    catalog = json.loads((input_dir / "catalog.json").read_text(encoding="utf-8"))
+    assert catalog["version"] == GSI.CATALOG_VERSION
+    assert catalog["entries"][0]["status"] == "ready"
+
+
+def test_archive_blocks_transforms_projected_crs_before_overlap(tmp_path):
+    archive_path = tmp_path / "FG-GML-523266-DEM5A-20250101.zip"
+    source_south, source_west = 4163881.0, 14750000.0
+    xml = _gsi_xml(
+        "DEM5A",
+        south=source_south,
+        west=source_west,
+        srs_name="EPSG:3857",
+    )
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("data.xml", xml)
+
+    metadata = GSI._parse_metadata(xml, archive_path.name)
+    source_ref = GSI._spatial_reference("EPSG:3857")
+    region_bounds = GSI._transform_bounds(
+        (
+            metadata["south"],
+            metadata["west"],
+            metadata["north"],
+            metadata["east"],
+        ),
+        source_ref,
+    )
+    region = GSI.GSIRegion("projected", *region_bounds)
+
+    blocks = GSI._archive_blocks(archive_path, region, "EPSG:3857")
+
+    assert len(blocks) == 1
+
+
 def test_aligned_insert_block_matches_source_cells():
     region = GSI.GSIRegion("aligned", 35.0, 132.0, 35.0002, 132.0002)
     block = GSI.GSIBlock(
@@ -410,6 +464,11 @@ def test_cli_config_and_gui_storage_format_contract():
         ["build", "--bbox", "35", "132", "36", "133"]
     )
     assert default_args.storage_format == "compact_int16"
+    tile_args = make_gsi_dem.build_parser().parse_args(
+        ["build", "--bbox", "34", "132"]
+    )
+    make_gsi_dem._validate_build_args(tile_args)
+    assert make_gsi_dem._normalize_bbox(tile_args.bbox) == (34.0, 132.0, 35.0, 133.0)
 
     import O4_Config_Utils as CFG
     import O4_GUI_Utils as GUI
@@ -448,6 +507,10 @@ def test_cli_config_and_gui_storage_format_contract():
     dialog.overwrite = Value(False)
     options = dialog._build_options()
     assert options.storage_format == "float32_legacy"
+
+    dialog.bbox_vars = [Value("34"), Value("132"), Value(""), Value("")]
+    tile_options = dialog._build_options()
+    assert tile_options.bbox == (34.0, 132.0, 35.0, 133.0)
 
 
 def test_scan_reports_duplicate_and_invalid_managed_archives(tmp_path):

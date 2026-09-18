@@ -13,6 +13,19 @@
 
 `GDAL`等のネイティブ依存関係はHomebrew側のバージョンとの整合が必要である。OS別の利用者向け説明は `Install_Instructions.txt` に残すが、起動ファイルは実在する `Ortho4XP.py` を使う。
 
+## MUXP処理
+
+MUXP処理はタイル設定の`muxp_enabled=True`で明示的に有効化する。入力はプロジェクト直下の`MUXP/**/*.muxp`（またはグローバル設定`muxp_folder`で指定したフォルダ）で、タイルの`tile`ヘッダーが完全一致するファイルだけが対象になる。副作用コマンドを含むMUXPは、タイル設定の`muxp_allow_side_effects=True`も必要とする。
+
+関連する限定検証は次で実行する。
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q tests/test_muxp_engine.py
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m py_compile src/O4_MUXP_Utils.py src/muxp_engine/*.py
+```
+
+実タイルでの受入では、ユーザー提供の既存`.muxp`を`MUXP/`へ配置し、生成DSFの構造、`Ortho4XP_muxp.json`、freshなX-Plane `Log.txt`、実画面を別々に確認する。合成MUXPやDSFラウンドトリップの成功だけでは、X-Plane上の表示を保証しない。
+
 ## GSI DEM入力管理と生成
 
 GSIの原本ZIPは、既定の`Elevation_data/GSI/input/`へ取り込み、生成物は`Elevation_data/GSI/output/`へ分離する。入力元のDownloads等は変更されない。ローカルZIPの再帰検出、分類、SHA-256重複排除、隔離、catalog再構築は次で行う。

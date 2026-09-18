@@ -55,10 +55,13 @@ def _add_build_arguments(parser):
     )
     parser.add_argument(
         "--bbox",
-        nargs=4,
+        nargs="+",
         type=float,
-        metavar=("SOUTH", "WEST", "NORTH", "EAST"),
-        help="One geographic rectangle in decimal degrees",
+        metavar="COORD",
+        help=(
+            "Geographic rectangle as SOUTH WEST NORTH EAST, or SOUTH WEST "
+            "for a one-degree tile"
+        ),
     )
     parser.add_argument(
         "--resolution",
@@ -130,6 +133,17 @@ def _validate_build_args(args):
     if args.bbox and args.mesh_codes:
         # Both are useful in a batch, so this is intentionally allowed.
         pass
+    if args.bbox and len(args.bbox) not in (2, 4):
+        raise GSI.GSIError("--bbox requires either SOUTH WEST or SOUTH WEST NORTH EAST")
+
+
+def _normalize_bbox(values):
+    if values is None:
+        return None
+    if len(values) == 2:
+        south, west = values
+        return (south, west, south + 1.0, west + 1.0)
+    return tuple(values)
 
 
 def main(argv=None):
@@ -191,7 +205,7 @@ def main(argv=None):
             input_dir=input_dir,
             output_dir=output_dir,
             mesh_codes=tuple(args.mesh_codes or ()),
-            bbox=tuple(args.bbox) if args.bbox else None,
+            bbox=_normalize_bbox(args.bbox),
             resolution=args.resolution,
             make_vrt=args.make_vrt,
             hgt_tiles=tuple(args.hgt_tiles or ()),

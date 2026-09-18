@@ -28,6 +28,12 @@
 
 `Ortho4XP.py` では、他モジュールの変数を変更し得る `O4_Config_Utils` を最後にimportする既存順序を維持する。
 
+## MUXPメッシュ更新
+
+タイル設定で`muxp_enabled=True`を明示した場合、`MUXP/`（グローバル設定の`muxp_folder`で変更可能）を再帰検索し、MUXPヘッダーの`tile`が一致する`.muxp`だけを決定的な相対パス順で選択する。同一IDは数値的に最新versionを使い、同一versionで内容が異なる場合は失敗する。MUXP処理は`src/muxp_engine/`に固定取り込みしたヘッドレスエンジンで行う。
+
+Build Imagery/DSFとBuild Allの両方で、生成DSFを`.dsf.tmp`として作成した後、公開直前の同じトランザクション境界でMUXPを適用する。strict検証、source_dsf互換性、コマンド処理、DSF再書き込み、manifest作成のいずれかに失敗した場合はDSFを公開しない。処理結果はタイル内の`Ortho4XP_muxp.json`とビルドログへ記録し、MUXP適用前のDSFは`muxp_backups/`に世代保存する。
+
 ## 外部実行ファイルとの境界
 
 - `Utils/{lin,mac,win}/` に `Triangle4XP`、`DSFTool`、DDS変換ツール等の実行ファイルを配置する。

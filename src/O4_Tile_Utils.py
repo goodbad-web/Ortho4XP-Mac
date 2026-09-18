@@ -25,6 +25,7 @@ import O4_Overlay_Utils as OVL
 import O4_DSF_Budget as DSF_BUDGET
 import O4_Performance_Utils as PERF
 import O4_Shared_Memory as SHMEM
+import O4_MUXP_Utils as MUXP
 from O4_Parallel_Utils import (
     parallel_launch,
     parallel_join,
@@ -540,6 +541,9 @@ class _BuildTransaction:
         for path in (dsf_base, dsf_base + ".bak", dsf_base + ".tmp"):
             if os.path.isfile(path):
                 paths.append(("tile", path))
+        muxp_manifest = os.path.join(self.build_dir, "Ortho4XP_muxp.json")
+        if os.path.isfile(muxp_manifest):
+            paths.append(("tile", muxp_manifest))
 
         terrain_dir = os.path.join(self.build_dir, "terrain")
         if os.path.isdir(terrain_dir):
@@ -4205,13 +4209,18 @@ def _build_tile(tile, persist_config=True):
         FNAMES.long_latlon(tile.lat, tile.lon) + ".dsf",
     )
     try:
+        if MUXP.enabled(tile):
+            MUXP.apply_to_staged_dsf(tile, dsf_file_name + ".tmp")
+            MUXP.backup_existing_dsf(tile, dsf_file_name)
         if performance_metrics is None:
             _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
         else:
             with performance_metrics.stage("DSF activation"):
                 _activate_dsf(dsf_file_name + ".tmp", dsf_file_name)
+        if MUXP.enabled(tile):
+            MUXP.publish_manifest(tile)
     except Exception as error:
-        UI.vprint(0, "ERROR: could not activate DSF file; existing tile was preserved:", error)
+        UI.vprint(0, "ERROR: could not activate DSF/MUXP output; existing tile was preserved:", error)
         try:
             os.remove(dsf_file_name + ".tmp")
         except OSError:

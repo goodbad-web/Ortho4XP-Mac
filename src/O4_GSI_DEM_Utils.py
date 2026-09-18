@@ -573,8 +573,12 @@ def load_catalog(path: Path) -> dict:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise GSIError(f"Could not read catalog {path}: {exc}") from exc
-    if payload.get("version") != CATALOG_VERSION or not isinstance(
-        payload.get("entries"), list
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != CATALOG_VERSION
+        or not isinstance(entries, list)
+        or any(not isinstance(entry, dict) for entry in entries)
     ):
         raise GSIError(f"Unsupported catalog format: {path}")
     return payload
@@ -675,9 +679,13 @@ def scan_gsi_input(
     input_dir = Path(input_dir).resolve()
     input_dir.mkdir(parents=True, exist_ok=True)
     catalog_path = input_dir / "catalog.json"
+    try:
+        previous_catalog = load_catalog(catalog_path)
+    except GSIError:
+        previous_catalog = {"entries": []}
     previous_entries = {
         str(entry.get("path")): entry
-        for entry in load_catalog(catalog_path).get("entries", [])
+        for entry in previous_catalog.get("entries", [])
         if entry.get("path")
     }
     source_paths = source_paths or {}
@@ -1174,6 +1182,26 @@ def _metadata_summary(metadata: dict) -> dict:
     }
 
 
+def _metadata_bounds_in_wgs84(
+    metadata: dict, source_crs: Optional[str]
+) -> tuple[float, float, float, float]:
+    """Return cached metadata bounds in the same CRS as GSIRegion."""
+    transformed_cache = metadata.setdefault("_bounds_wgs84", {})
+    cache_key = source_crs or ""
+    if cache_key not in transformed_cache:
+        source_ref, _ = _resolve_source_crs(metadata["srs_name"], source_crs)
+        transformed_cache[cache_key] = _transform_bounds(
+            (
+                metadata["south"],
+                metadata["west"],
+                metadata["north"],
+                metadata["east"],
+            ),
+            source_ref,
+        )
+    return transformed_cache[cache_key]
+
+
 def _archive_blocks(
     path: Path,
     region: GSIRegion,
@@ -1206,14 +1234,8 @@ def _archive_blocks(
     with zipfile.ZipFile(path) as archive:
         for xml_name, summary in indexed_members:
             _check_cancel(cancel_event)
-            source_bounds = (
-                summary["south"],
-                summary["west"],
-                summary["north"],
-                summary["east"],
-            )
-            # Bounds are geographic in the GSI GML.  The CRS transform is
-            # repeated by parse_gsi_xml only for blocks that intersect.
+            source_bounds = _metadata_bounds_in_wgs84(summary, source_crs)
+            # Region bounds and parse_gsi_xml() output are both WGS84.
             if not _overlaps(source_bounds, region.bounds):
                 continue
             xml_bytes = archive.read(xml_name)

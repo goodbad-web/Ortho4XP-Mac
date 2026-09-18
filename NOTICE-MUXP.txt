@@ -1,0 +1,13 @@
+MUXP engine attribution
+=======================
+
+Ortho4XP embeds the headless MUXP mesh-update engine based on the
+muxp-mac repository at commit 251d09e036f3b24d46c87da33119f5b05e1ea326.
+
+Upstream project: https://github.com/nofaceinbook/muxp/
+Upstream license: GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)
+
+The vendored files under src/muxp_engine/ retain their upstream copyright and
+license notices. Changes made for this integration are limited to package
+imports, the headless application boundary, and preservation of unknown DSF
+atoms during a read/modify/write cycle.

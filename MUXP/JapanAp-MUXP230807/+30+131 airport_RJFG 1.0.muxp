@@ -1,0 +1,21 @@
+muxp_version: 0.32
+id: airport_RJFG
+version: 1.0
+description: flattening of New Tanegashima
+author: muxp_auto_creation_from_apt.dat
+tile: +30+131
+area: 30.59736983 30.60256708 131.00000000 131.00267355
+source_dsf: *Ortho4XP
+
+cut_polygon.bound_Airport_Boundary_235m-2:
+   elevation: 235
+   coordinates:
+   - 30.59786983 131.00000000
+   - 30.59969825 131.00131579
+   - 30.60087066 131.00217355
+   - 30.60206708 131.00002331
+   - 30.59786983 131.00000000
+
+
+unflatten_default_apt:
+   name: RJFG

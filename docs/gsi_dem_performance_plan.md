@@ -135,7 +135,7 @@ commit/pushは別途明示依頼があるまで行わない。
 
 ## 実装後の検証結果
 
-- `tests/test_gsi_dem.py`: 19 passed
+- `tests/test_gsi_dem.py`: 22 passed
 - `py_compile`: 成功
 - 実GSI入力の`51320000`: candidate 3 ZIPだけを検証して一時outputへ1m GeoTIFF/VRT/manifestを生成、約13.68秒
 - canonical `Elevation_data/GSI/output`は変更していない

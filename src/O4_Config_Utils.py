@@ -304,6 +304,27 @@ a particular server.",
         "default": "",
         "hint": "The directory containing the sceneries with the overlays you would like to extract. You need to select the level of directory just _ABOVE_ Earth nav data.",
     },
+    "muxp_folder": {
+        "type": str,
+        "default": "MUXP",
+        "short_name": "MUXP folder",
+        "short_name_japanese": "MUXPフォルダ",
+        "hint": "Project-relative folder searched recursively for .muxp files. The default is MUXP/.",
+    },
+    "muxp_enabled": {
+        "type": bool,
+        "default": False,
+        "short_name": "Enable MUXP",
+        "short_name_japanese": "MUXPを有効化",
+        "hint": "Apply matching MUXP files to this tile during Build Imagery/DSF and Build All. Disabled by default.",
+    },
+    "muxp_allow_side_effects": {
+        "type": bool,
+        "default": False,
+        "short_name": "MUXP side effects",
+        "short_name_japanese": "MUXP副作用を許可",
+        "hint": "Allow MUXP commands that write external apt.dat or OBJ files. Use only when explicitly intended.",
+    },
     # Vector
     "apt_smoothing_pix": {
         "type": int,
@@ -700,6 +721,7 @@ list_app_vars = [
     "ovl_exclude_net",
     "custom_scenery_dir",
     "custom_overlay_src",
+    "muxp_folder",
 ]
 gui_app_vars_short = list_app_vars[:-2]
 gui_app_vars_long = list_app_vars[-2:]
@@ -765,6 +787,8 @@ list_dsf_vars = [
     "use_decal_on_terrain",
     "write_build_log",
     "build_overlays_in_all_in_one",
+    "muxp_enabled",
+    "muxp_allow_side_effects",
 ]
 list_other_vars = ["custom_dem", "fill_nodata", "gsi_dem_storage_format"]
 list_performance_vars = [
@@ -916,6 +940,7 @@ class Tile:
         state.pop("_performance_metrics", None)
         state.pop("_ashelper_jsonl_server", None)
         state.pop("_cancel_event", None)
+        state.pop("_muxp_result", None)
         return state
 
     def make_dirs(self):

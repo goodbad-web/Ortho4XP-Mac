@@ -1324,7 +1324,10 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
         )
         ttk.Label(
             build_frame,
-            text=_ui_text("BBox S W N E (optional)", "矩形 S W N E（任意）"),
+            text=_ui_text(
+                "BBox S W N E (optional; S W = one-degree tile)",
+                "矩形 S W N E（任意、S Wのみで1度四方）",
+            ),
         ).grid(row=4, column=0, padx=5, pady=3, sticky=E)
         bbox_frame = ttk.Frame(build_frame)
         bbox_frame.grid(row=4, column=1, columnspan=2, padx=3, pady=3, sticky=W)
@@ -1484,10 +1487,16 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
         bbox_values = [variable.get().strip() for variable in self.bbox_vars]
         bbox = None
         if any(bbox_values):
-            if not all(bbox_values):
-                raise GSI.GSIError("BBox requires south, west, north, and east")
+            if not bbox_values[0] or not bbox_values[1]:
+                raise GSI.GSIError("BBox requires south and west")
+            if any(bbox_values[2:]) and not all(bbox_values):
+                raise GSI.GSIError("BBox requires north and east together")
             try:
-                bbox = tuple(float(value) for value in bbox_values)
+                south, west = (float(value) for value in bbox_values[:2])
+                if all(bbox_values[2:]):
+                    bbox = tuple(float(value) for value in bbox_values)
+                else:
+                    bbox = (south, west, south + 1.0, west + 1.0)
             except ValueError as error:
                 raise GSI.GSIError("BBox values must be decimal degrees") from error
         hgt_tiles = tuple(
