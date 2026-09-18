@@ -11,6 +11,7 @@ from collections import defaultdict
 import struct
 import hashlib
 import time
+import tempfile
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Mask_Utils as MASK
@@ -719,32 +720,43 @@ def extract_elevation_and_bathymetry_data(lat, lon):
             )
         return None
 
-    tmp_file = os.path.join(
-        FNAMES.Tmp_dir, FNAMES.short_latlon(lat, lon) + ".dsf"
-    )
-    archive_path = tmp_file + ".7z"
+    work_dir = None
+    tmp_file = None
+    archive_path = None
     try:
         os.makedirs(FNAMES.Tmp_dir, exist_ok=True)
-    except OSError:
-        pass
-    UI.vprint(2, "     Making a copy of the Global Scenery DSF in tmp dir")
-    try:
-        shutil.copy(global_scenery_dsf, tmp_file)
-    except Exception as error:
+        work_dir = tempfile.mkdtemp(
+            prefix="." + FNAMES.short_latlon(lat, lon) + "-dsf-",
+            dir=FNAMES.Tmp_dir,
+        )
+        tmp_file = os.path.join(
+            work_dir, FNAMES.short_latlon(lat, lon) + ".dsf"
+        )
+        archive_path = tmp_file + ".7z"
+    except OSError as error:
         UI.exit_message_and_bottom_line(
-            "     ERROR: could not copy Global Scenery DSF:",
+            "     ERROR: could not create Global Scenery DSF temporary workspace:",
             error,
         )
         return None
-
+    UI.vprint(2, "     Making a copy of the Global Scenery DSF in tmp dir")
     try:
+        try:
+            shutil.copy(global_scenery_dsf, tmp_file)
+        except Exception as error:
+            UI.exit_message_and_bottom_line(
+                "     ERROR: could not copy Global Scenery DSF:",
+                error,
+            )
+            return None
+
         with open(tmp_file, "rb") as source:
             magic = source.read(2)
         if magic == b"7z":
             UI.vprint(2, "     The original DSF is a 7z archive, uncompressing...")
             os.replace(tmp_file, archive_path)
             unzip_result = subprocess.run(
-                [OVL.unzip_cmd.strip(), "e", "-y", "-o" + FNAMES.Tmp_dir, archive_path],
+                [OVL.unzip_cmd.strip(), "e", "-y", "-o" + work_dir, archive_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -756,6 +768,15 @@ def extract_elevation_and_bathymetry_data(lat, lon):
                 for line in unzip_result.stdout.splitlines():
                     UI.vprint(2, "     " + line)
             if unzip_result.returncode != 0 or not os.path.isfile(tmp_file):
+                UI.logprint(
+                    "Global Scenery DSF extraction failed:",
+                    "returncode=",
+                    unzip_result.returncode,
+                    "output_exists=",
+                    os.path.isfile(tmp_file),
+                    "output=",
+                    repr((unzip_result.stdout or "")[-2000:]),
+                )
                 UI.exit_message_and_bottom_line(
                     "     ERROR: could not uncompress Global Scenery DSF."
                 )
@@ -844,9 +865,9 @@ def extract_elevation_and_bathymetry_data(lat, lon):
         )
         return None
     finally:
-        for path in (tmp_file, archive_path):
+        if work_dir is not None:
             try:
-                os.remove(path)
+                shutil.rmtree(work_dir)
             except OSError:
                 pass
 
