@@ -144,6 +144,32 @@ def test_import_and_build_ignore_macos_appledouble_xml(tmp_path):
     assert not built.failures
 
 
+def test_build_progress_is_monotonic_and_finalizes_after_output(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    _zip(input_dir / "a.zip", "DEM5A")
+    _zip(input_dir / "b.zip", "DEM5B")
+    monkeypatch.setattr(GSI, "_gsi_archive_worker_count", lambda count: 1)
+    progress = []
+    bbox = (35.166666667, 132.75, 35.166666667 + 2 * 0.2 / 3600.0, 132.75 + 2 * 0.2 / 3600.0)
+
+    result = GSI.build_gsi_dem(
+        GSI.GSIOptions(input_dir=input_dir, output_dir=output_dir, bbox=bbox),
+        progress=lambda stage, completed, total, message: progress.append(
+            (stage, completed, total, message)
+        ),
+    )
+
+    build_progress = [
+        (completed, total) for stage, completed, total, _message in progress if stage == "build"
+    ]
+    assert result.outputs
+    assert not result.failures
+    assert build_progress == sorted(build_progress)
+    assert build_progress[-1][0] == build_progress[-1][1]
+
+
 def test_build_one_meter_output_uses_lower_resolution_only_for_nodata(tmp_path):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
@@ -243,6 +269,59 @@ def test_incremental_scan_reuses_unchanged_catalog_entries(tmp_path, monkeypatch
 
     assert second.ready == 1
     assert second.entries[0]["sha256"] == first.entries[0]["sha256"]
+
+
+def test_incremental_scan_counts_cached_invalid_entries(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    archive = input_dir / "invalid.zip"
+    archive.write_bytes(b"not a zip")
+
+    first = GSI.scan_gsi_input(input_dir)
+    second = GSI.scan_gsi_input(input_dir, incremental=True)
+
+    assert first.invalid == 1
+    assert second.invalid == 1
+    assert second.entries[0]["status"] == "invalid"
+
+
+def test_scan_falls_back_to_serial_when_pool_setup_fails(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "a.zip").write_bytes(b"a")
+    (input_dir / "b.zip").write_bytes(b"b")
+
+    def fail_pool(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("spawn blocked")
+
+    monkeypatch.setattr(GSI, "_gsi_scan_worker_count", lambda count: 2)
+    monkeypatch.setattr(GSI, "ProcessPoolExecutor", fail_pool)
+
+    result = GSI.scan_gsi_input(input_dir)
+
+    assert result.invalid == 2
+
+
+def test_incremental_scan_progress_does_not_regress(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _zip(input_dir / "z-existing.zip", "DEM5A")
+    GSI.scan_gsi_input(input_dir)
+    _zip(input_dir / "a-new.zip", "DEM5B")
+    progress = []
+
+    GSI.scan_gsi_input(
+        input_dir,
+        incremental=True,
+        progress=lambda _stage, completed, total, _message: progress.append(
+            (completed, total)
+        ),
+    )
+
+    assert progress
+    assert progress == sorted(progress)
+    assert progress[-1] == (2, 2)
 
 
 def test_build_rejects_changed_candidate_archive(tmp_path):

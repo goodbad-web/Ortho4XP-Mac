@@ -674,47 +674,70 @@ def _scan_archive_worker(path_string: str) -> dict:
 
 
 def _scan_archive_records(
-    pending: list[tuple[Path, object]], cancel_event
+    pending: list[tuple[Path, object]],
+    cancel_event,
+    progress: Optional[ProgressCallback] = None,
+    progress_offset: int = 0,
+    progress_total: Optional[int] = None,
 ) -> dict[str, dict]:
     """Scan uncached archives concurrently while retaining serial fallback."""
     if not pending:
         return {}
 
+    total = progress_total if progress_total is not None else progress_offset + len(pending)
+    records: dict[str, dict] = {}
+
+    def store_record(path: Path, record: dict) -> None:
+        records[str(path)] = record
+        _report(
+            progress,
+            "scan",
+            progress_offset + len(records),
+            total,
+            path.name,
+        )
+
     def serial_records() -> dict[str, dict]:
-        records = {}
         for path, _stat_result in pending:
             _check_cancel(cancel_event)
-            records[str(path)] = _scan_archive_worker(str(path))
+            if str(path) in records:
+                continue
+            store_record(path, _scan_archive_worker(str(path)))
         return records
 
     worker_count = _gsi_scan_worker_count(len(pending))
     if worker_count <= 1:
         return serial_records()
 
-    context = multiprocessing.get_context("spawn")
-    executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
-    futures = {
-        executor.submit(_scan_archive_worker, str(path)): path
-        for path, _stat_result in pending
-    }
+    executor = None
+    futures = {}
     try:
-        records = {}
+        context = multiprocessing.get_context("spawn")
+        executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
+        futures = {
+            executor.submit(_scan_archive_worker, str(path)): path
+            for path, _stat_result in pending
+        }
         for future in as_completed(futures):
             _check_cancel(cancel_event)
             path = futures[future]
-            records[str(path)] = future.result()
+            store_record(path, future.result())
         executor.shutdown(wait=True)
+        executor = None
         return records
     except GSICancelled:
         for future in futures:
             future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         raise
-    except BrokenProcessPool:
-        executor.shutdown(wait=False, cancel_futures=True)
+    except (BrokenProcessPool, OSError, RuntimeError, ValueError):
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         return serial_records()
     except Exception:
-        executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         raise
 
 
@@ -816,11 +839,19 @@ def scan_gsi_input(
             entry["size"] = stat_result.st_size
             entry["mtime_ns"] = stat_result.st_mtime_ns
             cached_entries[relative] = entry
-            _report(progress, "scan", index, len(paths), f"cached: {path.name}")
         else:
             pending.append((path, stat_result))
 
-    archive_records = _scan_archive_records(pending, cancel_event)
+    cached_count = len(cached_entries)
+    if cached_count:
+        _report(progress, "scan", cached_count, len(paths), "cached archives")
+    archive_records = _scan_archive_records(
+        pending,
+        cancel_event,
+        progress=progress,
+        progress_offset=cached_count,
+        progress_total=len(paths),
+    )
 
     for index, path in enumerate(paths, 1):
         _check_cancel(cancel_event)
@@ -832,6 +863,8 @@ def scan_gsi_input(
         if relative in cached_entries:
             entry = cached_entries[relative]
             digest = entry.get("sha256")
+            if entry.get("status") == "invalid":
+                invalid += 1
             if entry.get("status") in {"ready", "duplicate"}:
                 if digest in seen_hashes:
                     entry["status"] = "duplicate"
@@ -842,7 +875,6 @@ def scan_gsi_input(
                     entry.pop("reason", None)
             entries.append(entry)
             continue
-        _report(progress, "scan", index, len(paths), path.name)
         try:
             record = archive_records[str(path)]
             digest = record.get("digest")
@@ -1198,14 +1230,19 @@ def import_gsi_archives(
     except GSICancelled:
         result.cancelled = True
 
-    scan = scan_gsi_input(
-        input_dir,
-        write_catalog=True,
-        progress=progress,
-        cancel_event=None,
-        source_paths=source_paths,
-        quarantine_reasons=quarantine_reasons,
-    )
+    try:
+        scan = scan_gsi_input(
+            input_dir,
+            write_catalog=True,
+            progress=progress,
+            cancel_event=cancel_event,
+            source_paths=source_paths,
+            quarantine_reasons=quarantine_reasons,
+        )
+    except GSICancelled:
+        result.cancelled = True
+        result.catalog_path = str(input_dir / "catalog.json")
+        return result
     result.catalog_path = scan.catalog_path
     result.zip_count = scan.zip_count
     result.product_counts = scan.product_counts
@@ -2188,11 +2225,15 @@ def _archive_blocks_parallel(
     source_crs: Optional[str],
     payload_cache_root: Path,
     cancel_event,
+    progress: Optional[ProgressCallback] = None,
+    progress_offset: int = 0,
+    progress_total: Optional[int] = None,
 ) -> list[GSIBlock]:
+    total = progress_total if progress_total is not None else len(entries)
     worker_count = _gsi_archive_worker_count(len(entries))
     if worker_count <= 1:
         blocks: list[GSIBlock] = []
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
             _check_cancel(cancel_event)
             blocks.extend(
                 _archive_blocks(
@@ -2204,10 +2245,17 @@ def _archive_blocks_parallel(
                     archive_digest=entry.get("sha256"),
                 )
             )
+            _report(
+                progress,
+                "build",
+                progress_offset + index,
+                total,
+                f"{region.label}: {Path(entry['path']).name}",
+            )
         return blocks
 
     context = multiprocessing.get_context("spawn")
-    futures = []
+    futures = {}
     executor = None
     try:
         executor = ProcessPoolExecutor(
@@ -2215,20 +2263,27 @@ def _archive_blocks_parallel(
             mp_context=context,
         )
         for entry in entries:
-            futures.append(
-                executor.submit(
-                    _archive_blocks_worker,
-                    str(input_dir / entry["path"]),
-                    region,
-                    source_crs,
-                    str(payload_cache_root),
-                    entry.get("sha256"),
-                )
+            _check_cancel(cancel_event)
+            future = executor.submit(
+                _archive_blocks_worker,
+                str(input_dir / entry["path"]),
+                region,
+                source_crs,
+                str(payload_cache_root),
+                entry.get("sha256"),
             )
+            futures[future] = entry
         blocks = []
-        for future in as_completed(futures):
+        for index, future in enumerate(as_completed(futures), 1):
             _check_cancel(cancel_event)
             blocks.extend(future.result())
+            _report(
+                progress,
+                "build",
+                progress_offset + index,
+                total,
+                f"{region.label}: {Path(futures[future]['path']).name}",
+            )
         executor.shutdown(wait=True)
         executor = None
         return blocks
@@ -2244,7 +2299,7 @@ def _archive_blocks_parallel(
         # A process pool is an optimization only. Retry serially so a spawn
         # or native-runtime limitation never changes the GSI result contract.
         blocks = []
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
             _check_cancel(cancel_event)
             blocks.extend(
                 _archive_blocks(
@@ -2255,6 +2310,13 @@ def _archive_blocks_parallel(
                     payload_cache_root=payload_cache_root,
                     archive_digest=entry.get("sha256"),
                 )
+            )
+            _report(
+                progress,
+                "build",
+                progress_offset + index,
+                total,
+                f"{region.label}: {Path(entry['path']).name}",
             )
         return blocks
     except Exception:
@@ -2274,6 +2336,8 @@ def _build_region(
     payload_cache_root: Optional[Path] = None,
     target_resolution: Optional[str] = None,
     point_grid: bool = False,
+    progress_offset: int = 0,
+    progress_total: Optional[int] = None,
 ) -> tuple[Path, dict]:
     blocks: list[GSIBlock] = []
     candidate_total = len(entries)
@@ -2281,15 +2345,8 @@ def _build_region(
         archive_path = input_dir / entry["path"]
         if not archive_path.is_file():
             raise GSIError(f"Catalog input is missing: {archive_path}")
+    report_total = progress_total if progress_total is not None else candidate_total
     if candidate_total > 1 and payload_cache_root is not None:
-        for index, entry in enumerate(entries, 1):
-            _report(
-                progress,
-                "build",
-                index,
-                candidate_total,
-                f"{region.label}: {Path(entry['path']).name}",
-            )
         blocks.extend(
             _archive_blocks_parallel(
                 entries,
@@ -2298,19 +2355,15 @@ def _build_region(
                 options.source_crs,
                 payload_cache_root,
                 cancel_event,
+                progress=progress,
+                progress_offset=progress_offset,
+                progress_total=report_total,
             )
         )
     else:
         for index, entry in enumerate(entries, 1):
             _check_cancel(cancel_event)
             archive_path = input_dir / entry["path"]
-            _report(
-                progress,
-                "build",
-                index,
-                candidate_total,
-                f"{region.label}: {archive_path.name}",
-            )
             blocks.extend(
                 _archive_blocks(
                     archive_path,
@@ -2321,6 +2374,13 @@ def _build_region(
                     payload_cache_root=payload_cache_root,
                     archive_digest=entry.get("sha256"),
                 )
+            )
+            _report(
+                progress,
+                "build",
+                progress_offset + index,
+                report_total,
+                f"{region.label}: {archive_path.name}",
             )
     if not blocks:
         raise GSIError(f"No GSI blocks found for {region.label}")
@@ -2432,11 +2492,28 @@ def build_gsi_dem(
         candidates = _candidate_entries(scan, region)
         job_entries.append(candidates)
         all_candidates.extend(candidates)
+
+    verify_total = len(
+        {
+            str(entry["path"]): entry
+            for entry in all_candidates
+            if entry.get("path")
+        }
+    )
+    archive_total = sum(len(entries) for entries in job_entries)
+    overall_total = verify_total + archive_total + len(jobs) + 1
+
+    def report_overall(completed: int, message: str) -> None:
+        _report(progress, "build", completed, overall_total, message)
+
+    def report_verify(_stage: str, completed: int, _total: int, message: str) -> None:
+        report_overall(completed, f"Verify: {message}")
+
     try:
         _verify_build_entries(
             all_candidates,
             options.input_dir,
-            progress,
+            report_verify,
             cancel_event,
         )
     except GSICancelled:
@@ -2444,31 +2521,47 @@ def build_gsi_dem(
 
     metadata_cache: dict[str, tuple[tuple[str, dict], ...]] = {}
     payload_cache_root = _gsi_cache_root(options.input_dir)
+    overall_done = verify_total
     for index, (region, point_grid, forced_resolution) in enumerate(jobs, 1):
         _check_cancel(cancel_event)
+        entries = job_entries[index - 1]
+        archive_offset = overall_done
+
+        def report_region(
+            _stage: str,
+            completed: int,
+            _total: int,
+            message: str,
+        ) -> None:
+            report_overall(archive_offset + completed, f"Build: {message}")
+
         try:
-            entries = job_entries[index - 1]
             path, metadata = _build_region(
                 region,
                 entries,
                 options.input_dir,
                 options,
-                progress,
+                report_region,
                 cancel_event,
                 metadata_cache=metadata_cache,
                 payload_cache_root=payload_cache_root,
                 target_resolution=forced_resolution,
                 point_grid=point_grid,
+                progress_offset=0,
+                progress_total=len(entries),
             )
             output_paths.append(path)
             result.outputs.append(str(path))
             manifest_results.append(metadata)
-            _report(progress, "complete", index, len(jobs), str(path))
+            overall_done = archive_offset + len(entries) + 1
+            report_overall(overall_done, f"Complete: {path}")
         except GSICancelled:
             result.cancelled = True
             break
         except Exception as exc:
             result.failures.append({"region": region.label, "error": str(exc)})
+            overall_done = archive_offset + len(entries) + 1
+            report_overall(overall_done, f"Failed: {region.label}")
 
     tif_outputs = [path for path in output_paths if path.suffix.lower() == ".tif"]
     if options.make_vrt and tif_outputs:
@@ -2506,6 +2599,9 @@ def build_gsi_dem(
         result.manifest = str(manifest_path)
     except Exception as exc:
         result.failures.append({"stage": "manifest", "error": str(exc)})
+
+    if not result.cancelled:
+        report_overall(overall_total, "Finalized")
 
     if result.vrt:
         result.recommended_custom_dem = result.vrt

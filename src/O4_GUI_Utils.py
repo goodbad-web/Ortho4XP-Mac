@@ -1573,10 +1573,27 @@ class Ortho4XP_GSI_DEM(tk.Toplevel):
                     english_stage, japanese_stage = stage_labels.get(
                         stage, (stage, stage)
                     )
+                    english_message = str(message)
+                    japanese_message = english_message
+                    localized_prefix = False
+                    for prefix, japanese_prefix in (
+                        ("Verify: ", "検証: "),
+                        ("Build: ", "生成: "),
+                        ("Complete: ", "完了: "),
+                        ("Failed: ", "失敗: "),
+                    ):
+                        if english_message.startswith(prefix):
+                            japanese_message = (
+                                japanese_prefix + english_message[len(prefix) :]
+                            )
+                            localized_prefix = True
+                            break
+                    if not localized_prefix and english_message == "Finalized":
+                        japanese_message = "最終処理完了"
                     self.status_var.set(
                         _ui_text(
-                            f"{english_stage}: {message}",
-                            f"{japanese_stage}: {message}",
+                            f"{english_stage}: {english_message}",
+                            f"{japanese_stage}: {japanese_message}",
                         )
                     )
                 elif kind == "result":
