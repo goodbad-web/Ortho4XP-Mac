@@ -5,7 +5,7 @@ description: flattening of Kisarazu AB
 author: muxp_auto_creation_from_apt.dat
 tile: +35+139
 area: 35.38671005 35.413248540000005 139.90061643 139.92526131
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_3.0m:
    elevation: 3

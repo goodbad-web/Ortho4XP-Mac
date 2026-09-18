@@ -5,7 +5,7 @@ description: flattening of Mt. Fuji Shizuoka
 author: muxp_auto_creation_from_apt.dat
 tile: +34+138
 area: 34.78452918 34.80995158 138.14976587 138.21754029
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_138m:
    type: smooth

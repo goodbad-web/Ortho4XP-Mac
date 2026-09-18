@@ -5,7 +5,7 @@ description: flattening of Noto
 author: muxp_auto_creation_from_apt.dat
 tile: +37+136
 area: 37.28703838 37.300014350000005 136.94763519 136.97501560999999
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_219m:
    type: smooth

@@ -5,7 +5,7 @@ description: flattening of Hida
 author: muxp_auto_creation_from_apt.dat
 tile: +36+137
 area: 36.17551663 36.1836082 137.30294009000002 137.32394275
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Apron_Boundary_715m:
    type: smooth

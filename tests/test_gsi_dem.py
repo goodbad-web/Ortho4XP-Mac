@@ -297,6 +297,85 @@ def test_archive_blocks_transforms_projected_crs_before_overlap(tmp_path):
     assert len(blocks) == 1
 
 
+def test_archive_blocks_persistent_payload_cache_skips_warm_xml_parse(
+    tmp_path, monkeypatch
+):
+    archive_path = tmp_path / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive_path, "DEM5A", [1.0, 2.0, 3.0, 4.0])
+    cache_root = tmp_path / ".gsi_cache" / "v1"
+    digest = GSI._sha256(archive_path)
+    region = GSI.GSIRegion(
+        "test",
+        35.166666667,
+        132.75,
+        35.166666667 + 2 * 0.2 / 3600.0,
+        132.75 + 2 * 0.2 / 3600.0,
+    )
+
+    cold = GSI._archive_blocks(
+        archive_path,
+        region,
+        None,
+        payload_cache_root=cache_root,
+        archive_digest=digest,
+    )
+    assert len(cold) == 1
+    cache_index = cache_root / "archives" / digest / "index.json"
+    assert cache_index.is_file()
+    assert list((cache_root / "archives" / digest / "values").glob("*.npy"))
+
+    def unexpected_parse(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("warm payload cache should not parse XML")
+
+    monkeypatch.setattr(GSI, "_parse_metadata", unexpected_parse)
+    warm = GSI._archive_blocks(
+        archive_path,
+        region,
+        None,
+        payload_cache_root=cache_root,
+        archive_digest=digest,
+    )
+
+    assert len(warm) == 1
+    assert np.array_equal(cold[0].values, warm[0].values, equal_nan=True)
+
+
+def test_archive_blocks_rebuilds_corrupt_payload_cache(tmp_path):
+    archive_path = tmp_path / "FG-GML-523266-DEM5A-20250101.zip"
+    _zip(archive_path, "DEM5A", [1.0, 2.0, 3.0, 4.0])
+    cache_root = tmp_path / ".gsi_cache" / "v1"
+    digest = GSI._sha256(archive_path)
+    region = GSI.GSIRegion(
+        "test",
+        35.166666667,
+        132.75,
+        35.166666667 + 2 * 0.2 / 3600.0,
+        132.75 + 2 * 0.2 / 3600.0,
+    )
+
+    GSI._archive_blocks(
+        archive_path,
+        region,
+        None,
+        payload_cache_root=cache_root,
+        archive_digest=digest,
+    )
+    payload_path = next((cache_root / "archives" / digest / "values").glob("*.npy"))
+    payload_path.write_bytes(b"not a numpy file")
+
+    rebuilt = GSI._archive_blocks(
+        archive_path,
+        region,
+        None,
+        payload_cache_root=cache_root,
+        archive_digest=digest,
+    )
+
+    assert len(rebuilt) == 1
+    assert np.allclose(rebuilt[0].values, [[1.0, 2.0], [3.0, 4.0]])
+
+
 def test_aligned_insert_block_matches_source_cells():
     region = GSI.GSIRegion("aligned", 35.0, 132.0, 35.0002, 132.0002)
     block = GSI.GSIBlock(

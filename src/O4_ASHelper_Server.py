@@ -316,6 +316,12 @@ class ASHelperJSONLServer:
     ) -> Dict[str, Any]:
         return raster_batch(self, "dem_smooth_batch", tasks)
 
+    def gsi_raster_batch(
+        self,
+        tasks: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        return raster_batch(self, "gsi_raster_batch", tasks)
+
     def disable_gpu(self) -> None:
         with self._lock:
             self._gpu_disabled = True

@@ -5,7 +5,7 @@ description: flattening of Shizuhama
 author: muxp_auto_creation_from_apt.dat
 tile: +34+138
 area: 34.80627146 34.817176350000004 138.28386259 138.31040525
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_6.7m:
    elevation: 7

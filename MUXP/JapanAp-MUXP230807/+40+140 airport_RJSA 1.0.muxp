@@ -5,7 +5,7 @@ description: flattening of Aomori
 author: muxp_auto_creation_from_apt.dat
 tile: +40+140
 area: 40.72231307 40.74539139 140.67101063 140.70854813
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Boundary_198m:
    type: smooth

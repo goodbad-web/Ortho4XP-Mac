@@ -10,7 +10,10 @@ import logging
 import os
 from pathlib import Path
 import re
-import resource
+try:
+    import resource
+except ImportError:  # Windows does not provide the POSIX resource module.
+    resource = None
 import shutil
 import time
 from typing import Callable, Iterable
@@ -141,13 +144,19 @@ def _source_is_ortho4xp(source_dsf: str) -> bool:
     tokens = str(source_dsf or "").split()
     if not tokens:
         return True
-    packs = [token[5:] for token in tokens if token.startswith("pack=")]
+    packs = []
+    for token in tokens:
+        if token.startswith("pack="):
+            packs.append(token[5:])
+        elif token.casefold() in {"default", "*ortho4xp", "ortho4xp"}:
+            # Older MUXP files omit the pack= prefix.
+            packs.append(token)
     if not packs:
         return False
     # DEFAULT is allowed only as a legacy fallback after an explicit
     # Ortho4XP preference.  A DEFAULT-only source is intentionally rejected.
-    return any("Ortho4XP" in value for value in packs) and all(
-        "Ortho4XP" in value or value == "DEFAULT" for value in packs
+    return any("ortho4xp" in value.casefold() for value in packs) and all(
+        "ortho4xp" in value.casefold() or value.casefold() == "default" for value in packs
     )
 
 
@@ -271,6 +280,8 @@ def _add_update_property(properties: dict, update: dict):
 
 
 def _peak_rss_mb() -> float:
+    if resource is None:
+        return 0.0
     value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if os.sys.platform == "darwin":
         value /= 1024.0 * 1024.0

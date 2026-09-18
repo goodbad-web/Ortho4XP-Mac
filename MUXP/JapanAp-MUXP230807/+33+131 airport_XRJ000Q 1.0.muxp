@@ -5,7 +5,7 @@ description: flattening of Oitakenou
 author: muxp_auto_creation_from_apt.dat
 tile: +33+131
 area: 33.024025699999996 33.0290425 131.4992363 131.5115286
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound:
    type: smooth

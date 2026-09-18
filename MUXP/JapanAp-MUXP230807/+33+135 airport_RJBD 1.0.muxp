@@ -5,7 +5,7 @@ description: flattening of Nanki Shirahama
 author: muxp_auto_creation_from_apt.dat
 tile: +33+135
 area: 33.653483959999996 33.671847930000006 135.35174772000002 135.37397783
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Boundary_104m:
    type: smooth

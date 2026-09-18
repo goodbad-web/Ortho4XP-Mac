@@ -5,7 +5,7 @@ description: flattening of Iruma AB
 author: muxp_auto_creation_from_apt.dat
 tile: +35+139
 area: 35.82751338 35.85711707 139.38940581 139.42633109
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_89.9m:
    elevation: 90

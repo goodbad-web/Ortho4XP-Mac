@@ -5,7 +5,7 @@ description: flattening of Shonai
 author: muxp_auto_creation_from_apt.dat
 tile: +38+139
 area: 38.808478699999995 38.8167386 139.77069110000002 139.80242199999998
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound:
    elevation: 22

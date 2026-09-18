@@ -5,7 +5,7 @@ description: flattening of Tokunoshima
 author: muxp_auto_creation_from_apt.dat
 tile: +27+128
 area: 27.82377114 27.846928979999998 128.87878908000002 128.88534475999998
-source_dsf: *Ortho4xp
+source_dsf: *Ortho4XP
 
 cut_polygon.bound_Airport_Boundary_5.2m:
    elevation: 5.2

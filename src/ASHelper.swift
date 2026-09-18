@@ -4095,6 +4095,19 @@ struct RasterBlurParams {
     uint borderMode;
 };
 
+struct GSIRasterParams {
+    uint sourceWidth;
+    uint sourceHeight;
+    uint targetWidth;
+    uint targetHeight;
+    uint sourceStride;
+    uint targetStride;
+    float xBase;
+    float yBase;
+    float xStep;
+    float yStep;
+};
+
 inline int o4_reflect101(int coordinate, int limit) {
     if (limit <= 1) return 0;
     int value = coordinate;
@@ -4156,6 +4169,26 @@ kernel void o4_raster_blur_f32(
     }
     output[gid.y * params.stride + gid.x] = value;
 }
+
+kernel void o4_gsi_raster_f32(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant GSIRasterParams &params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.targetWidth || gid.y >= params.targetHeight) return;
+    float x = params.xBase + float(gid.x) * params.xStep;
+    float y = params.yBase + float(gid.y) * params.yStep;
+    uint outputIndex = gid.y * params.targetStride + gid.x;
+    if (x < -0.5 || x > float(params.sourceWidth) - 0.5 ||
+        y < -0.5 || y > float(params.sourceHeight) - 0.5) {
+        output[outputIndex] = NAN;
+        return;
+    }
+    int sourceX = clamp(int(rint(x)), 0, int(params.sourceWidth) - 1);
+    int sourceY = clamp(int(rint(y)), 0, int(params.sourceHeight) - 1);
+    output[outputIndex] = input[uint(sourceY) * params.sourceStride + uint(sourceX)];
+}
 """
 
 private enum RasterMetalError: Error, CustomStringConvertible {
@@ -4181,11 +4214,25 @@ private struct RasterBlurParams {
     var borderMode: UInt32
 }
 
+private struct GSIRasterParams {
+    var sourceWidth: UInt32
+    var sourceHeight: UInt32
+    var targetWidth: UInt32
+    var targetHeight: UInt32
+    var sourceStride: UInt32
+    var targetStride: UInt32
+    var xBase: Float
+    var yBase: Float
+    var xStep: Float
+    var yStep: Float
+}
+
 private final class RasterMetalRuntime {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let u8Pipeline: MTLComputePipelineState
     private let f32Pipeline: MTLComputePipelineState
+    private let gsiPipeline: MTLComputePipelineState
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -4197,14 +4244,17 @@ private final class RasterMetalRuntime {
         guard let library = try? device.makeLibrary(source: rasterMetalSource, options: nil),
               let u8Function = library.makeFunction(name: "o4_raster_blur_u8"),
               let f32Function = library.makeFunction(name: "o4_raster_blur_f32"),
+              let gsiFunction = library.makeFunction(name: "o4_gsi_raster_f32"),
               let u8Pipeline = try? device.makeComputePipelineState(function: u8Function),
-              let f32Pipeline = try? device.makeComputePipelineState(function: f32Function) else {
+              let f32Pipeline = try? device.makeComputePipelineState(function: f32Function),
+              let gsiPipeline = try? device.makeComputePipelineState(function: gsiFunction) else {
             throw RasterMetalError.unavailable("raster_pipelines")
         }
         self.device = device
         self.commandQueue = commandQueue
         self.u8Pipeline = u8Pipeline
         self.f32Pipeline = f32Pipeline
+        self.gsiPipeline = gsiPipeline
     }
 
     private func makeBuffer(data: Data) throws -> MTLBuffer {
@@ -4321,6 +4371,73 @@ private final class RasterMetalRuntime {
             bytes: outputBuffer.contents(),
             count: length
         )
+    }
+
+    func gsiRaster(
+        data: Data,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        sourceStride: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        targetStride: Int,
+        xBase: Float,
+        yBase: Float,
+        xStep: Float,
+        yStep: Float
+    ) throws -> Data {
+        guard sourceWidth > 0, sourceHeight > 0,
+              targetWidth > 0, targetHeight > 0,
+              sourceStride >= sourceWidth, targetStride >= targetWidth,
+              data.count >= sourceStride * sourceHeight * MemoryLayout<Float>.size else {
+            throw RasterMetalError.invalid("gsi_shape")
+        }
+        let outputLength = targetStride * targetHeight * MemoryLayout<Float>.size
+        guard let inputBuffer = try? makeBuffer(data: data),
+              let outputBuffer = device.makeBuffer(
+                  length: outputLength,
+                  options: .storageModeShared
+              ),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RasterMetalError.execution("gsi_resources")
+        }
+        var params = GSIRasterParams(
+            sourceWidth: UInt32(sourceWidth),
+            sourceHeight: UInt32(sourceHeight),
+            targetWidth: UInt32(targetWidth),
+            targetHeight: UInt32(targetHeight),
+            sourceStride: UInt32(sourceStride),
+            targetStride: UInt32(targetStride),
+            xBase: xBase,
+            yBase: yBase,
+            xStep: xStep,
+            yStep: yStep
+        )
+        encoder.setComputePipelineState(gsiPipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
+        encoder.setBytes(&params, length: MemoryLayout<GSIRasterParams>.size, index: 2)
+        let widthThreads = max(1, min(gsiPipeline.threadExecutionWidth, targetWidth))
+        let heightThreads = max(
+            1,
+            min(gsiPipeline.maxTotalThreadsPerThreadgroup / widthThreads, targetHeight)
+        )
+        encoder.dispatchThreads(
+            MTLSize(width: targetWidth, height: targetHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: widthThreads,
+                height: heightThreads,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            throw RasterMetalError.execution("gsi_command_status")
+        }
+        return Data(bytes: outputBuffer.contents(), count: outputLength)
     }
 
     func maskedDEM(
@@ -4462,10 +4579,40 @@ private func serverRawRasterBatch(
                 return serverTaskResult(taskID, success: false, backend: "metal", error: "invalid_raster_task")
             }
             do {
+                let startedAt = Date()
                 let inputData = try Data(contentsOf: URL(fileURLWithPath: input))
-                let kernel = serverKernel(task)
                 let outputData: Data
-                if operation == "dem_smooth_batch" {
+                if operation == "gsi_raster_batch" {
+                    guard let sourceWidth = (task["source_width"] as? NSNumber)?.intValue,
+                          let sourceHeight = (task["source_height"] as? NSNumber)?.intValue,
+                          let sourceStride = (task["source_stride"] as? NSNumber)?.intValue,
+                          let targetStride = (task["target_stride"] as? NSNumber)?.intValue,
+                          let xBase = (task["x_base"] as? NSNumber)?.floatValue,
+                          let yBase = (task["y_base"] as? NSNumber)?.floatValue,
+                          let xStep = (task["x_step"] as? NSNumber)?.floatValue,
+                          let yStep = (task["y_step"] as? NSNumber)?.floatValue else {
+                        return serverTaskResult(
+                            taskID,
+                            success: false,
+                            backend: "metal",
+                            error: "invalid_gsi_raster_task"
+                        )
+                    }
+                    outputData = try runtime.gsiRaster(
+                        data: inputData,
+                        sourceWidth: sourceWidth,
+                        sourceHeight: sourceHeight,
+                        sourceStride: sourceStride,
+                        targetWidth: width,
+                        targetHeight: height,
+                        targetStride: targetStride,
+                        xBase: xBase,
+                        yBase: yBase,
+                        xStep: xStep,
+                        yStep: yStep
+                    )
+                } else if operation == "dem_smooth_batch" {
+                    let kernel = serverKernel(task)
                     let maskPath = serverString(task, "mask")
                     if let maskPath {
                         let maskData = try Data(contentsOf: URL(fileURLWithPath: maskPath))
@@ -4491,6 +4638,7 @@ private func serverRawRasterBatch(
                         )
                     }
                 } else {
+                    let kernel = serverKernel(task)
                     outputData = try runtime.blur(
                         data: inputData,
                         width: width,
@@ -4506,7 +4654,11 @@ private func serverRawRasterBatch(
                     taskID,
                     success: true,
                     backend: "metal",
-                    extra: ["operation": operation]
+                    extra: [
+                        "operation": operation,
+                        "dispatch": operation == "gsi_raster_batch" ? "gsi_raster" : "raster",
+                        "duration_ms": Date().timeIntervalSince(startedAt) * 1000.0,
+                    ]
                 )
             } catch {
                 return serverTaskResult(
@@ -5044,7 +5196,7 @@ private func runJSONLRequest(_ request: [String: Any]) -> ([String: Any], Bool) 
             operation: operation,
             results: serverTensorOpsUpscaleBatch(request)
         ), false)
-    case "mask_blur_batch", "dem_smooth_batch":
+    case "mask_blur_batch", "dem_smooth_batch", "gsi_raster_batch":
         let results = serverRawRasterBatch(request, operation: operation)
         return (serverResponse(id: requestID, operation: operation, results: results), false)
     case "shutdown":

@@ -5,7 +5,7 @@ description: Fixing bridge section elevation problem when using orthos
 author: nekoeki
 tile: +35+139
 area: 35.520384799999995 35.5711966 139.7514773 139.82928139999999
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_flat_terrain_in_mesh.taxiway_west:
    elevation: 0.5

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +71,9 @@ COMPACT_OFFSET = 0.0
 COMPACT_NO_DATA = -32768
 CATALOG_VERSION = 1
 MANIFEST_VERSION = 2
+GSI_CACHE_VERSION = 1
+GSI_CACHE_DIRNAME = ".gsi_cache"
+GSI_MAX_ARCHIVE_WORKERS = 4
 NO_DATA = -9999.0
 HGT_NO_DATA = -32768
 
@@ -1202,58 +1208,295 @@ def _metadata_bounds_in_wgs84(
     return transformed_cache[cache_key]
 
 
+def _gsi_cache_root(input_dir: Path) -> Path:
+    return Path(input_dir) / GSI_CACHE_DIRNAME / f"v{GSI_CACHE_VERSION}"
+
+
+def _archive_cache_dir(cache_root: Path, archive_digest: str) -> Path:
+    return Path(cache_root) / "archives" / archive_digest
+
+
+def _archive_cache_index_path(cache_root: Path, archive_digest: str) -> Path:
+    return _archive_cache_dir(cache_root, archive_digest) / "index.json"
+
+
+def _cache_member_payload_name(xml_name: str) -> str:
+    return hashlib.sha256(xml_name.encode("utf-8")).hexdigest() + ".npy"
+
+
+def _zip_xml_infos(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    return [
+        info
+        for info in archive.infolist()
+        if info.filename.lower().endswith(".xml")
+        and not _is_auxiliary_xml_member(info.filename)
+    ]
+
+
+def _load_archive_cache(
+    cache_root: Optional[Path],
+    archive_digest: Optional[str],
+    infos: Iterable[zipfile.ZipInfo],
+) -> Optional[dict[str, dict]]:
+    if not cache_root or not archive_digest:
+        return None
+    try:
+        payload = json.loads(
+            _archive_cache_index_path(cache_root, archive_digest).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != GSI_CACHE_VERSION
+        or payload.get("archive_sha256") != archive_digest
+        or not isinstance(payload.get("members"), dict)
+    ):
+        return None
+    expected_names = {info.filename for info in infos}
+    members = payload["members"]
+    if set(members) != expected_names:
+        return None
+    for info in infos:
+        record = members.get(info.filename)
+        if not isinstance(record, dict):
+            return None
+        try:
+            valid_fingerprint = (
+                int(record.get("crc", -1)) == int(info.CRC)
+                and int(record.get("file_size", -1)) == int(info.file_size)
+                and int(record.get("compress_size", -1)) == int(info.compress_size)
+            )
+        except (TypeError, ValueError):
+            valid_fingerprint = False
+        if not valid_fingerprint or not isinstance(record.get("metadata"), dict):
+            return None
+    return members
+
+
+def _atomic_npy_write(path: Path, values: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(fd)
+    try:
+        with Path(temp_name).open("wb") as stream:
+            np.save(stream, np.asarray(values, dtype=np.float32), allow_pickle=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _load_cached_values(
+    cache_root: Optional[Path], archive_digest: Optional[str], record: dict
+) -> Optional[np.ndarray]:
+    if not cache_root or not archive_digest:
+        return None
+    payload_name = record.get("payload")
+    metadata = record.get("metadata")
+    if not isinstance(payload_name, str) or not isinstance(metadata, dict):
+        return None
+    payload_path = _archive_cache_dir(cache_root, archive_digest) / payload_name
+    try:
+        values = np.load(payload_path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    try:
+        expected_shape = (
+            int(metadata.get("height", -1)),
+            int(metadata.get("width", -1)),
+        )
+    except (TypeError, ValueError):
+        return None
+    if values.dtype != np.float32 or values.shape != expected_shape:
+        return None
+    return np.asarray(values, dtype=np.float32, order="C")
+
+
+def _write_archive_cache(
+    cache_root: Optional[Path],
+    archive_digest: Optional[str],
+    members: dict[str, dict],
+) -> None:
+    if not cache_root or not archive_digest:
+        return
+    _atomic_json_write(
+        _archive_cache_index_path(cache_root, archive_digest),
+        {
+            "version": GSI_CACHE_VERSION,
+            "archive_sha256": archive_digest,
+            "members": members,
+        },
+    )
+
+
+def _archive_block_from_values(
+    path: Path,
+    xml_name: str,
+    metadata: dict,
+    values: np.ndarray,
+    source_crs: Optional[str],
+) -> GSIBlock:
+    return parse_gsi_xml(
+        b"",
+        path,
+        xml_name,
+        source_crs,
+        metadata=metadata,
+        values=values,
+    )
+
+
 def _archive_blocks(
     path: Path,
     region: GSIRegion,
     source_crs: Optional[str],
     cancel_event=None,
     metadata_cache: Optional[dict[str, tuple[tuple[str, dict], ...]]] = None,
+    payload_cache_root: Optional[Path] = None,
+    archive_digest: Optional[str] = None,
+) -> list[GSIBlock]:
+    return _archive_blocks_fast(
+        path,
+        region,
+        source_crs,
+        cancel_event=cancel_event,
+        metadata_cache=metadata_cache,
+        payload_cache_root=payload_cache_root,
+        archive_digest=archive_digest,
+    )
+
+
+def _archive_blocks_fast(
+    path: Path,
+    region: GSIRegion,
+    source_crs: Optional[str],
+    cancel_event=None,
+    metadata_cache: Optional[dict[str, tuple[tuple[str, dict], ...]]] = None,
+    payload_cache_root: Optional[Path] = None,
+    archive_digest: Optional[str] = None,
 ) -> list[GSIBlock]:
     blocks: list[GSIBlock] = []
     cache_key = str(Path(path).resolve())
     indexed_members = metadata_cache.get(cache_key) if metadata_cache is not None else None
-    if indexed_members is None:
-        indexed: list[tuple[str, dict]] = []
-        with zipfile.ZipFile(path) as archive:
-            for xml_name in archive.namelist():
+
+    with zipfile.ZipFile(path) as archive:
+        infos = _zip_xml_infos(archive)
+        cache_members = _load_archive_cache(
+            payload_cache_root, archive_digest, infos
+        )
+
+        if indexed_members is None and cache_members is not None:
+            indexed_members = tuple(
+                (info.filename, cache_members[info.filename]["metadata"])
+                for info in infos
+            )
+
+        if indexed_members is None:
+            indexed: list[tuple[str, dict]] = []
+            cache_records: dict[str, dict] = {}
+            for info in infos:
                 _check_cancel(cancel_event)
-                if not xml_name.lower().endswith(".xml") or _is_auxiliary_xml_member(
-                    xml_name
-                ):
-                    continue
-                metadata = _parse_metadata(archive.read(xml_name), path.name)
+                xml_name = info.filename
+                xml_bytes = archive.read(info)
+                metadata = _parse_metadata(xml_bytes, path.name)
                 if metadata is None:
                     raise GSIError(
                         f"ZIP contains unsupported or incomplete XML: {xml_name}"
                     )
-                indexed.append((xml_name, _metadata_summary(metadata)))
-        indexed_members = tuple(indexed)
+                summary = _metadata_summary(metadata)
+                indexed.append((xml_name, summary))
+                record = {
+                    "crc": int(info.CRC),
+                    "file_size": int(info.file_size),
+                    "compress_size": int(info.compress_size),
+                    "metadata": summary,
+                }
+                source_bounds = _metadata_bounds_in_wgs84(summary, source_crs)
+                if _overlaps(source_bounds, region.bounds):
+                    values = _parse_values(metadata, validate=True)
+                    if payload_cache_root and archive_digest:
+                        payload_name = f"values/{_cache_member_payload_name(xml_name)}"
+                        _atomic_npy_write(
+                            _archive_cache_dir(payload_cache_root, archive_digest)
+                            / payload_name,
+                            values,
+                        )
+                        record["payload"] = payload_name
+                    block = _archive_block_from_values(
+                        path, xml_name, summary, values, source_crs
+                    )
+                    if _overlaps(block.bounds, region.bounds):
+                        blocks.append(block)
+                cache_records[xml_name] = record
+            indexed_members = tuple(indexed)
+            if metadata_cache is not None:
+                metadata_cache[cache_key] = indexed_members
+            _write_archive_cache(payload_cache_root, archive_digest, cache_records)
+            return blocks
+
         if metadata_cache is not None:
             metadata_cache[cache_key] = indexed_members
 
-    with zipfile.ZipFile(path) as archive:
         for xml_name, summary in indexed_members:
             _check_cancel(cancel_event)
             source_bounds = _metadata_bounds_in_wgs84(summary, source_crs)
-            # Region bounds and parse_gsi_xml() output are both WGS84.
             if not _overlaps(source_bounds, region.bounds):
                 continue
-            xml_bytes = archive.read(xml_name)
-            metadata = _parse_metadata(xml_bytes, path.name)
-            if metadata is None:
-                raise GSIError(f"ZIP contains unsupported or incomplete XML: {xml_name}")
-            values = _parse_values(metadata, validate=True)
-            block = parse_gsi_xml(
-                xml_bytes,
-                path,
-                xml_name,
-                source_crs,
-                metadata=metadata,
-                values=values,
+            record = cache_members.get(xml_name) if cache_members else None
+            values = _load_cached_values(
+                payload_cache_root, archive_digest, record or {}
+            )
+            if values is None:
+                xml_bytes = archive.read(xml_name)
+                metadata = _parse_metadata(xml_bytes, path.name)
+                if metadata is None:
+                    raise GSIError(
+                        f"Unsupported or incomplete GSI XML: {xml_name}"
+                    )
+                values = _parse_values(metadata, validate=True)
+                summary = _metadata_summary(metadata)
+                if record is not None and payload_cache_root and archive_digest:
+                    payload_name = f"values/{_cache_member_payload_name(xml_name)}"
+                    _atomic_npy_write(
+                        _archive_cache_dir(payload_cache_root, archive_digest)
+                        / payload_name,
+                        values,
+                    )
+                    record["payload"] = payload_name
+                    _write_archive_cache(
+                        payload_cache_root, archive_digest, cache_members
+                    )
+            block = _archive_block_from_values(
+                path, xml_name, summary, values, source_crs
             )
             if _overlaps(block.bounds, region.bounds):
                 blocks.append(block)
     return blocks
+
+
+def _archive_blocks_worker(
+    path: str,
+    region: GSIRegion,
+    source_crs: Optional[str],
+    payload_cache_root: Optional[str],
+    archive_digest: Optional[str],
+) -> list[GSIBlock]:
+    return _archive_blocks_fast(
+        Path(path),
+        region,
+        source_crs,
+        payload_cache_root=Path(payload_cache_root) if payload_cache_root else None,
+        archive_digest=archive_digest,
+    )
 
 
 def _candidate_entries(scan: GSIScanResult, region: GSIRegion) -> list[dict]:
@@ -1777,6 +2020,97 @@ def _relative_input(path: Path, input_dir: Path) -> str:
         return str(path)
 
 
+def _gsi_archive_worker_count(candidate_count: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    return min(
+        max(1, candidate_count),
+        GSI_MAX_ARCHIVE_WORKERS,
+        max(1, cpu_count // 4),
+    )
+
+
+def _archive_blocks_parallel(
+    entries: list[dict],
+    region: GSIRegion,
+    input_dir: Path,
+    source_crs: Optional[str],
+    payload_cache_root: Path,
+    cancel_event,
+) -> list[GSIBlock]:
+    worker_count = _gsi_archive_worker_count(len(entries))
+    if worker_count <= 1:
+        blocks: list[GSIBlock] = []
+        for entry in entries:
+            _check_cancel(cancel_event)
+            blocks.extend(
+                _archive_blocks(
+                    input_dir / entry["path"],
+                    region,
+                    source_crs,
+                    cancel_event=cancel_event,
+                    payload_cache_root=payload_cache_root,
+                    archive_digest=entry.get("sha256"),
+                )
+            )
+        return blocks
+
+    context = multiprocessing.get_context("spawn")
+    futures = []
+    executor = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=context,
+        )
+        for entry in entries:
+            futures.append(
+                executor.submit(
+                    _archive_blocks_worker,
+                    str(input_dir / entry["path"]),
+                    region,
+                    source_crs,
+                    str(payload_cache_root),
+                    entry.get("sha256"),
+                )
+            )
+        blocks = []
+        for future in as_completed(futures):
+            _check_cancel(cancel_event)
+            blocks.extend(future.result())
+        executor.shutdown(wait=True)
+        executor = None
+        return blocks
+    except GSICancelled:
+        for future in futures:
+            future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    except BrokenProcessPool:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        # A process pool is an optimization only. Retry serially so a spawn
+        # or native-runtime limitation never changes the GSI result contract.
+        blocks = []
+        for entry in entries:
+            _check_cancel(cancel_event)
+            blocks.extend(
+                _archive_blocks(
+                    input_dir / entry["path"],
+                    region,
+                    source_crs,
+                    cancel_event=cancel_event,
+                    payload_cache_root=payload_cache_root,
+                    archive_digest=entry.get("sha256"),
+                )
+            )
+        return blocks
+    except Exception:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+
+
 def _build_region(
     region: GSIRegion,
     entries: list[dict],
@@ -1785,26 +2119,57 @@ def _build_region(
     progress: Optional[ProgressCallback],
     cancel_event,
     metadata_cache: Optional[dict[str, tuple[tuple[str, dict], ...]]] = None,
+    payload_cache_root: Optional[Path] = None,
     target_resolution: Optional[str] = None,
     point_grid: bool = False,
 ) -> tuple[Path, dict]:
     blocks: list[GSIBlock] = []
     candidate_total = len(entries)
-    for index, entry in enumerate(entries, 1):
-        _check_cancel(cancel_event)
+    for entry in entries:
         archive_path = input_dir / entry["path"]
         if not archive_path.is_file():
             raise GSIError(f"Catalog input is missing: {archive_path}")
-        _report(progress, "build", index, candidate_total, f"{region.label}: {archive_path.name}")
+    if candidate_total > 1 and payload_cache_root is not None:
+        for index, entry in enumerate(entries, 1):
+            _report(
+                progress,
+                "build",
+                index,
+                candidate_total,
+                f"{region.label}: {Path(entry['path']).name}",
+            )
         blocks.extend(
-            _archive_blocks(
-                archive_path,
+            _archive_blocks_parallel(
+                entries,
                 region,
+                input_dir,
                 options.source_crs,
+                payload_cache_root,
                 cancel_event,
-                metadata_cache=metadata_cache,
             )
         )
+    else:
+        for index, entry in enumerate(entries, 1):
+            _check_cancel(cancel_event)
+            archive_path = input_dir / entry["path"]
+            _report(
+                progress,
+                "build",
+                index,
+                candidate_total,
+                f"{region.label}: {archive_path.name}",
+            )
+            blocks.extend(
+                _archive_blocks(
+                    archive_path,
+                    region,
+                    options.source_crs,
+                    cancel_event,
+                    metadata_cache=metadata_cache,
+                    payload_cache_root=payload_cache_root,
+                    archive_digest=entry.get("sha256"),
+                )
+            )
     if not blocks:
         raise GSIError(f"No GSI blocks found for {region.label}")
 
@@ -1926,6 +2291,7 @@ def build_gsi_dem(
         return GSIBuildResult(cancelled=True)
 
     metadata_cache: dict[str, tuple[tuple[str, dict], ...]] = {}
+    payload_cache_root = _gsi_cache_root(options.input_dir)
     for index, (region, point_grid, forced_resolution) in enumerate(jobs, 1):
         _check_cancel(cancel_event)
         try:
@@ -1938,6 +2304,7 @@ def build_gsi_dem(
                 progress,
                 cancel_event,
                 metadata_cache=metadata_cache,
+                payload_cache_root=payload_cache_root,
                 target_resolution=forced_resolution,
                 point_grid=point_grid,
             )

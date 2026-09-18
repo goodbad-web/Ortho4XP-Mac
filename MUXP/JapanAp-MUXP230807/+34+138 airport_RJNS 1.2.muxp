@@ -5,7 +5,7 @@ description: creating TIN for Mt. Fuji Shizuoka
 author: muxp_auto_creation_from_apt.dat
 tile: +34+138
 area: 34.78932106 34.80420919 138.16583354000002 138.20441767999998
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_ramp.bound_Airport_Base_144m-154m-156m:
    type: double_cut

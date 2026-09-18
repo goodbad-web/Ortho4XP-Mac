@@ -5,7 +5,7 @@ description: flattening of Okushiri
 author: muxp_auto_creation_from_apt.dat
 tile: +42+139
 area: 42.0661892 42.077418900000005 139.4221918 139.4434154
-source_dsf: DEFAULT
+source_dsf: *Ortho4XP
 
 cut_polygon.bound:
    type: smooth

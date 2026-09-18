@@ -97,6 +97,17 @@ def test_ortho4xp_source_with_default_fallback_is_allowed(tmp_path):
     assert len(files) == 1
 
 
+@pytest.mark.parametrize("source", ["*Ortho4XP", "*Ortho4xp", "*Ortho4XP DEFAULT"])
+def test_legacy_ortho4xp_source_forms_are_allowed(tmp_path, source):
+    root = tmp_path / "MUXP"
+    root.mkdir()
+    (root / "ortho.muxp").write_text(_muxp(source=source), encoding="utf-8")
+
+    files = discover_muxp_files(str(tmp_path), "MUXP", "+34+132")
+
+    assert len(files) == 1
+
+
 def test_side_effect_command_is_valid_but_gated_by_apply(tmp_path):
     root = tmp_path / "MUXP"
     root.mkdir()
