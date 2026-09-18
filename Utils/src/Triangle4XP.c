@@ -380,6 +380,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3571,6 +3572,7 @@ void parsecommandline(int argc, char **argv, struct behavior *b)
 double altitude(REAL x, REAL y)
 {
 	int nx, ny, nxp, nyp;
+	size_t row0, row1;
 	double z, rx, ry, px, py;
 	px = (x - X0) / xrange * (nxdem - 1);
 	py = (Y1 - y) / yrange * (nydem - 1);
@@ -3578,26 +3580,29 @@ double altitude(REAL x, REAL y)
 	ny = floor(py);
 	nxp = ((nx + 1) < (nxdem - 1)) ? (nx + 1) : (nxdem - 1);
 	nyp = ((ny + 1) < (nydem - 1)) ? (ny + 1) : (nydem - 1);
-	if (alt[ny * nxdem + nx] == no_data)
+	row0 = (size_t)ny * (size_t)nxdem;
+	row1 = (size_t)nyp * (size_t)nxdem;
+	if (alt[row0 + (size_t)nx] == no_data)
 		return no_data;
-	if (alt[nyp * nxdem + nx] == no_data)
+	if (alt[row1 + (size_t)nx] == no_data)
 		return no_data;
-	if (alt[ny * nxdem + nxp] == no_data)
+	if (alt[row0 + (size_t)nxp] == no_data)
 		return no_data;
-	if (alt[nyp * nxdem + nxp] == no_data)
+	if (alt[row1 + (size_t)nxp] == no_data)
 		return no_data;
 	rx = px - nx;
 	ry = py - ny;
-	z = alt[ny * nxdem + nx] * (1 - rx) * (1 - ry) +
-	    alt[ny * nxdem + nxp] * rx * (1 - ry) +
-	    alt[(nyp)*nxdem + nx] * (1 - rx) * ry +
-	    alt[(nyp)*nxdem + nxp] * rx * ry;
+	z = alt[row0 + (size_t)nx] * (1 - rx) * (1 - ry) +
+	    alt[row0 + (size_t)nxp] * rx * (1 - ry) +
+	    alt[row1 + (size_t)nx] * (1 - rx) * ry +
+	    alt[row1 + (size_t)nxp] * rx * ry;
 	return z;
 }
 
 void set_normal(REAL x, REAL y, REAL *u, REAL *v)
 {
 	int nx, ny;
+	size_t row, previous_row;
 	double rx, ry, px, py, normvector, gradx, grady;
 	if (x >= X1)
 		x = X1 - 0.0000001;
@@ -3609,19 +3614,21 @@ void set_normal(REAL x, REAL y, REAL *u, REAL *v)
 	ny = floor(py);
 	rx = px - nx;
 	ry = py - ny;
+	row = (size_t)((nydem - 1) - ny) * (size_t)nxdem;
+	previous_row = (size_t)((nydem - 1) - ny - 1) * (size_t)nxdem;
 	if (rx >= ry) {
-		gradx = (alt[((nydem - 1) - ny) * nxdem + nx + 1] -
-			 alt[((nydem - 1) - ny) * nxdem + nx]) *
+		gradx = (alt[row + (size_t)nx + 1] -
+			 alt[row + (size_t)nx]) *
 			inv_pix_x_m;
-		grady = (alt[((nydem - 1) - ny - 1) * nxdem + nx + 1] -
-			 alt[((nydem - 1) - ny) * nxdem + nx + 1]) *
+		grady = (alt[previous_row + (size_t)nx + 1] -
+			 alt[row + (size_t)nx + 1]) *
 			inv_pix_y_m;
 	} else {
-		grady = (alt[((nydem - 1) - ny - 1) * nxdem + nx] -
-			 alt[((nydem - 1) - ny) * nxdem + nx]) *
+		grady = (alt[previous_row + (size_t)nx] -
+			 alt[row + (size_t)nx]) *
 			inv_pix_y_m;
-		gradx = (alt[((nydem - 1) - ny - 1) * nxdem + nx + 1] -
-			 alt[((nydem - 1) - ny - 1) * nxdem + nx]) *
+		gradx = (alt[previous_row + (size_t)nx + 1] -
+			 alt[previous_row + (size_t)nx]) *
 			inv_pix_x_m;
 	}
 	normvector = sqrt(1 + gradx * gradx + grady * grady);
@@ -7308,7 +7315,8 @@ void testtriangle(struct mesh *m, struct behavior *b, struct otri *testtri)
 		float maxcurv = 0;
 		for (int i = imin; i <= imax; i++) {
 			for (int j = jmin; j <= jmax; j++) {
-				float tmp = hme[(nxdem - 2) * i + j];
+				float tmp = hme[(size_t)(nxdem - 2) * (size_t)i +
+				               (size_t)j];
 				maxcurv = (tmp > maxcurv) ? tmp : maxcurv;
 			}
 		}
@@ -16502,7 +16510,7 @@ int main(int argc, char **argv)
 	FILE *polyfile;
 	/* Start of : Added for Triangle4XP */
 	int i, j, k, l, dummy;
-	long offset;
+	size_t offset;
 	float aa, bb, cc, signe, w;
 	/* End of : Added for Triangle4XP */
 #endif /* not TRILIBRARY */
@@ -16527,7 +16535,12 @@ int main(int argc, char **argv)
 	/* Start of : Added for Triangle4XP */
 	printf("   Loading altitudes from DEM file.\n");
 	fflush(stdout);
-	alt = (float *)malloc(sizeof(float) * nxdem * nydem);
+	alt = (float *)malloc(sizeof(float) * (size_t)nxdem * (size_t)nydem);
+	if (alt == (float *)NULL) {
+		printf("   Error:  Cannot allocate DEM buffer (%d x %d).\n",
+		       nxdem, nydem);
+		triexit(1);
+	}
 	alt_file = fopen(b.alt_filename, "rb");
 	if (alt_file == (FILE *)NULL) {
 		printf("   Error:  Cannot access file %s.\n", b.alt_filename);
@@ -16535,7 +16548,8 @@ int main(int argc, char **argv)
 	}
 	for (i = 0; i < nydem; i++) {
 		for (j = 0; j < nxdem; j++) {
-			dummy = fread(&alt[nxdem * i + j], 4, 1, alt_file);
+			dummy = fread(&alt[(size_t)nxdem * (size_t)i + (size_t)j], 4, 1,
+			              alt_file);
 		}
 	}
 	fclose(alt_file);
@@ -16558,11 +16572,17 @@ int main(int argc, char **argv)
 
 	printf("   Computing curvatures from altitudes.\n");
 	fflush(stdout);
-	hme = (float *)malloc(sizeof(float) * (nxdem - 2) * (nydem - 2));
+	hme = (float *)malloc(sizeof(float) * (size_t)(nxdem - 2) *
+	                       (size_t)(nydem - 2));
+	if (hme == (float *)NULL) {
+		printf("   Error:  Cannot allocate curvature buffer (%d x %d).\n",
+		       nxdem - 2, nydem - 2);
+		triexit(1);
+	}
 	float limiter = CURV_LIMITER * inv_pix_x_m;
 	for (i = 1; i < (nydem - 1); i++) {
 		for (j = 1; j < (nxdem - 1); j++) {
-			offset = nxdem * i + j;
+			offset = (size_t)nxdem * (size_t)i + (size_t)j;
 			if ((b.refine) &&
 			    (alt[offset] == no_data ||
 			     alt[offset - 1] == no_data ||
@@ -16572,7 +16592,8 @@ int main(int argc, char **argv)
 			     alt[offset - nxdem + 1] == no_data ||
 			     alt[offset + nxdem + 1] == no_data ||
 			     alt[offset + nxdem - 1] == no_data)) {
-				hme[(nxdem - 2) * (i - 1) + (j - 1)] = 0;
+				hme[(size_t)(nxdem - 2) * (size_t)(i - 1) +
+				     (size_t)(j - 1)] = 0;
 				continue;
 			}
 			aa =
@@ -16597,7 +16618,8 @@ int main(int argc, char **argv)
 						       4 * pow(cc, 2))) /
 				     2.0 * w;
 			curv = curv > limiter ? limiter : curv;
-			hme[(nxdem - 2) * (i - 1) + (j - 1)] = curv;
+			hme[(size_t)(nxdem - 2) * (size_t)(i - 1) +
+			     (size_t)(j - 1)] = curv;
 		}
 	}
 	free(weight);

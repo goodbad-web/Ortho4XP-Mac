@@ -721,10 +721,13 @@ def _build_mesh(tile):
     max_steiner = max(max_steiner, 2e4)
 
     limit_tris = "S" + str(max_steiner)
-    Tri_option = (
-        "-pq" + "{:.9g}".format(tile.min_angle) + do_refine + 
-        "uYB" + tri_verbosity + output_poly + limit_tris
-    )
+    def make_tri_option(min_angle):
+        return (
+            "-pq" + "{:.9g}".format(min_angle) + do_refine +
+            "uYB" + tri_verbosity + output_poly + limit_tris
+        )
+
+    Tri_option = make_tri_option(tile.min_angle)
 
     weight_array = numpy.ones((1001, 1001), dtype=numpy.float32)
     weight_map_result = build_curv_tol_weight_map(tile, weight_array)
@@ -763,7 +766,7 @@ def _build_mesh(tile):
     UI.vprint(1, "-> Start of the mesh algorithm Triangle4XP.")
     UI.vprint(2, "   Mesh command:", " ".join(mesh_cmd))
     fingers_crossed = subprocess.Popen(
-        mesh_cmd, stdout=subprocess.PIPE, bufsize=0
+        mesh_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0
     )
     while True:
         line = fingers_crossed.stdout.readline()
@@ -784,9 +787,9 @@ def _build_mesh(tile):
             "It will be tempted now with no angle constraint ",
             "(i.e. min_angle=0).",
         )
-        mesh_cmd[-5] = "{:.9g}".format(0)
+        mesh_cmd[1] = make_tri_option(0)
         fingers_crossed = subprocess.Popen(
-            mesh_cmd, stdout=subprocess.PIPE, bufsize=0
+            mesh_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0
         )
         while True:
             line = fingers_crossed.stdout.readline()
