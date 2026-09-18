@@ -99,3 +99,32 @@ def test_global_scenery_dsf_extraction_logs_7zip_failure_and_cleans_up(
     assert "archive error" in diagnostic
     assert errors == [("     ERROR: could not uncompress Global Scenery DSF.",)]
     assert list(tmp_dir.iterdir()) == []
+
+
+def test_global_scenery_dsf_temp_workspace_error_is_localized(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.dsf"
+    source.write_bytes(b"7z compressed archive")
+    _configure_extraction(monkeypatch, tmp_path, source)
+    errors = []
+    monkeypatch.setenv("ORTHO4XP_LANG", "ja")
+    monkeypatch.setattr(
+        DSF.os,
+        "makedirs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("permission denied")),
+    )
+    monkeypatch.setattr(
+        DSF.UI,
+        "exit_message_and_bottom_line",
+        lambda *args: errors.append(args),
+    )
+
+    assert DSF.extract_elevation_and_bathymetry_data(34, 132) is None
+
+    assert errors == [
+        (
+            "     エラー: Global Scenery DSFの一時作業領域を作成できません: "
+            "permission denied",
+        )
+    ]

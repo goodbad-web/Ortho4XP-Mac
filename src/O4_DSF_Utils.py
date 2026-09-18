@@ -735,8 +735,14 @@ def extract_elevation_and_bathymetry_data(lat, lon):
         archive_path = tmp_file + ".7z"
     except OSError as error:
         UI.exit_message_and_bottom_line(
-            "     ERROR: could not create Global Scenery DSF temporary workspace:",
-            error,
+            UI.ui_text(
+                "     ERROR: could not create Global Scenery DSF temporary workspace: {}".format(
+                    error
+                ),
+                "     エラー: Global Scenery DSFの一時作業領域を作成できません: {}".format(
+                    error
+                ),
+            )
         )
         return None
     UI.vprint(2, "     Making a copy of the Global Scenery DSF in tmp dir")
