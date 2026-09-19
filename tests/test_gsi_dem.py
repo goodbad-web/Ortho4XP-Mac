@@ -574,6 +574,85 @@ def test_float32_legacy_geotiff_remains_readable(tmp_path):
     assert read_result[8][1, 0] == -32768
 
 
+def test_custom_dem_directory_finds_covering_gsi_raster(tmp_path):
+    source_dir = tmp_path / "GSI"
+    output = source_dir / "output" / "bbox_34p000000_132p000000_35p000000_133p000000_GSI_1m.tif"
+    region = GSI.GSIRegion("bbox", 34.0, 132.0, 35.0, 133.0)
+    GSI.write_geotiff(
+        output,
+        np.asarray([[123.0]], dtype=np.float32),
+        region,
+        1.0,
+    )
+
+    selected = DEM._find_custom_dem_file(source_dir, 34, 132)
+
+    assert selected == str(output)
+    dem = DEM.DEM(34, 132, str(source_dir), info_only=True)
+    assert (dem.nxdem, dem.nydem) == (1, 1)
+
+
+def test_custom_dem_directory_combines_manifest_outputs_to_tile_aligned_vrt(tmp_path):
+    source_dir = tmp_path / "GSI"
+    output_dir = source_dir / "output"
+    left = output_dir / "left_GSI_1m.tif"
+    right = output_dir / "right_GSI_1m.tif"
+    left_region = GSI.GSIRegion("left", 34.0, 132.0, 35.0, 132.5)
+    right_region = GSI.GSIRegion("right", 34.0, 132.5, 35.0, 133.0)
+    GSI.write_geotiff(left, np.asarray([[10.0], [10.0]], dtype=np.float32), left_region, 0.5)
+    GSI.write_geotiff(right, np.asarray([[20.0], [20.0]], dtype=np.float32), right_region, 0.5)
+    manifest = output_dir / "gsi_dem_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "outputs": [str(left), str(right)],
+                "results": [
+                    {"output": str(left), "resolution": "1m"},
+                    {"output": str(right), "resolution": "1m"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dem = DEM.DEM(34, 132, str(source_dir), fill_nodata=False)
+
+    assert (dem.nxdem, dem.nydem) == (2, 2)
+    assert (dem.x0, dem.y0) == pytest.approx((0.25, 0.25))
+    assert (dem.x1, dem.y1) == pytest.approx((0.75, 0.75))
+    assert np.allclose(dem.alt_dem, [[10.0, 20.0], [10.0, 20.0]])
+
+
+def test_custom_dem_directory_rejects_multiple_partial_gsi_files_without_vrt(tmp_path):
+    source_dir = tmp_path / "GSI"
+    left = source_dir / "left_GSI_1m.tif"
+    right = source_dir / "right_GSI_1m.tif"
+    GSI.write_geotiff(
+        left,
+        np.asarray([[10.0], [10.0]], dtype=np.float32),
+        GSI.GSIRegion("left", 34.0, 132.0, 35.0, 132.5),
+        0.5,
+    )
+    GSI.write_geotiff(
+        right,
+        np.asarray([[20.0], [20.0]], dtype=np.float32),
+        GSI.GSIRegion("right", 34.0, 132.5, 35.0, 133.0),
+        0.5,
+    )
+
+    with pytest.raises(DEM.DEMError, match="Create a VRT"):
+        DEM.DEM(34, 132, str(source_dir), info_only=True)
+
+
+def test_dem_memory_budget_allows_128gb_without_fill_and_rejects_worst_case(monkeypatch):
+    monkeypatch.setattr(DEM, "_physical_memory_bytes", lambda: 128 * 1024**3)
+
+    DEM._check_raster_memory(90_000, 90_000, 0.25, 0.0, False, "allowed.tif")
+    with pytest.raises(DEM.DEMError, match="configured memory budget"):
+        DEM._check_raster_memory(90_000, 90_000, 0.25, 0.0, True, "too-large.tif")
+
+
 def test_compact_range_failure_is_explicit_and_does_not_clip(tmp_path):
     path = tmp_path / "out-of-range.tif"
     region = GSI.GSIRegion("N34E132", 34.0, 132.0, 34.0001, 132.0001)
@@ -608,6 +687,30 @@ def test_vrt_preserves_common_scale_offset_contract_and_rejects_mixed_input(tmp_
 
     with pytest.raises(GSI.GSIError, match="different data type"):
         GSI._build_vrt(tmp_path / "mixed.vrt", [compact_a, legacy], False)
+
+
+def test_vrt_can_be_aligned_to_the_requested_one_degree_tile(tmp_path):
+    from osgeo import gdal
+
+    source = tmp_path / "partial.tif"
+    region = GSI.GSIRegion("partial", 34.25, 132.25, 34.75, 132.75)
+    GSI.write_geotiff(
+        source,
+        np.ones((2, 2), dtype=np.float32),
+        region,
+        0.25,
+    )
+
+    vrt = tmp_path / "aligned.vrt"
+    GSI._build_vrt(vrt, [source], False, output_bounds=(132.0, 34.0, 133.0, 35.0))
+
+    dataset = gdal.Open(str(vrt))
+    assert (dataset.RasterXSize, dataset.RasterYSize) == (4, 4)
+    geo = dataset.GetGeoTransform()
+    assert geo[0] == pytest.approx(132.0)
+    assert geo[3] == pytest.approx(35.0)
+    assert geo[1] == pytest.approx(0.25)
+    assert geo[5] == pytest.approx(-0.25)
 
 
 def test_compact_writer_falls_back_to_deflate_with_reason(tmp_path, monkeypatch):

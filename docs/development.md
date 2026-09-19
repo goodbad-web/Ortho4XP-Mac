@@ -39,7 +39,7 @@ Supportの`Scan input`は増分スキャンとして動作し、catalogに記録
 
 増分スキャンで検査が必要なZIPは最大8プロセスで並列処理する。DEM build側のcandidate ZIP処理は最大10プロセスで並列化する。
 
-生成対象は3次メッシュコードまたは緯度経度の矩形で指定する。`auto`は利用可能な最高解像度を選び、1m出力では1mを優先し、欠損部分を低解像度入力で補完する。VRTは任意、manifestは必須である。
+生成対象は3次メッシュコードまたは緯度経度の矩形で指定する。`auto`は利用可能な最高解像度を選び、1m出力では1mを優先し、欠損部分を低解像度入力で補完する。manifestは必須であり、複数の部分GeoTIFFをタイル生成へ渡す場合は、対象1度タイルの境界まで広げたVRTを使用する。
 
 ```sh
 .venv/bin/python make_gsi_dem.py build --mesh-code 52326600 --resolution auto --make-vrt
@@ -55,7 +55,7 @@ GeoTIFFは既定で`compact_int16`（0.25m刻み、scale/offset付き、ZSTD優�
 
 `compact_int16`の値が表現範囲を超える場合はクリップせず失敗する。ZSTD非対応環境ではDEFLATEへフォールバックし、manifestへ実際の圧縮方式を記録する。
 
-HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
+HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。VRTなしで複数の部分GeoTIFFだけがあるディレクトリは、入力を推測せずエラーにする。DEM読込の推定ワークセットは物理メモリの80%を上限とし、128GB環境では約102GBを超える1m入力を、bbox縮小・低解像度化・NoData補完無効化なしに読み込まない。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
 
 GSI関連の限定検証はリポジトリルートから実行する。
 

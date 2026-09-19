@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -2129,7 +2130,12 @@ def _raster_contract(path: Path) -> dict:
     return contract
 
 
-def _build_vrt(path: Path, sources: list[Path], overwrite: bool) -> dict:
+def _build_vrt(
+    path: Path,
+    sources: list[Path],
+    overwrite: bool,
+    output_bounds: Optional[tuple[float, float, float, float]] = None,
+) -> dict:
     _require_gdal()
     if not sources:
         raise GSIError("Cannot create VRT without GeoTIFF sources")
@@ -2148,6 +2154,8 @@ def _build_vrt(path: Path, sources: list[Path], overwrite: bool) -> dict:
             srcNodata=first_contract["nodata"],
             VRTNodata=first_contract["nodata"],
             resampleAlg="nearest",
+            resolution="highest" if output_bounds else None,
+            outputBounds=output_bounds,
         )
         dataset = gdal.BuildVRT(str(temp_path), [str(source) for source in sources], options=options)
         if dataset is None:
@@ -2567,7 +2575,20 @@ def build_gsi_dem(
     if options.make_vrt and tif_outputs:
         try:
             vrt_path = options.output_dir / "gsi_dem.vrt"
-            vrt_contract = _build_vrt(vrt_path, tif_outputs, options.overwrite)
+            vrt_bounds = None
+            if regions:
+                vrt_bounds = (
+                    math.floor(min(region.west for region in regions)),
+                    math.floor(min(region.south for region in regions)),
+                    math.ceil(max(region.east for region in regions)),
+                    math.ceil(max(region.north for region in regions)),
+                )
+            vrt_contract = _build_vrt(
+                vrt_path,
+                tif_outputs,
+                options.overwrite,
+                output_bounds=vrt_bounds,
+            )
             result.vrt = str(vrt_path)
         except Exception as exc:
             result.failures.append({"stage": "vrt", "error": str(exc)})

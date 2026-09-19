@@ -1,11 +1,14 @@
 import os
 import io
+import json
 import time
 import requests
 import zipfile
 import itertools
 import shutil
 import tempfile
+import uuid
+from pathlib import Path
 from math import sqrt
 import array
 import numpy
@@ -81,6 +84,298 @@ available_sources = (
 )
 
 global_sources = ("View", "SRTM", "ALOS")
+DEM_MEMORY_FRACTION = 0.8
+
+
+class DEMError(RuntimeError):
+    """Raised when an explicitly selected DEM cannot be used safely."""
+
+
+def _physical_memory_bytes():
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return 0
+    if pages <= 0 or page_size <= 0:
+        return 0
+    return pages * page_size
+
+
+def _raster_memory_estimate(width, height, scale, offset, fill_nodata):
+    """Estimate the peak NumPy working set for a GDAL DEM read."""
+    cells = int(width) * int(height)
+    float_bytes = cells * numpy.dtype(numpy.float32).itemsize
+    mask_bytes = cells
+    scale_bytes = float_bytes if scale != 1.0 or offset != 0.0 else 0
+    fill_bytes = 4 * float_bytes if fill_nodata else 0
+    return float_bytes + mask_bytes + scale_bytes + fill_bytes
+
+
+def _check_raster_memory(width, height, scale, offset, fill_nodata, file_name):
+    physical = _physical_memory_bytes()
+    if not physical:
+        return
+    estimated = _raster_memory_estimate(
+        width, height, scale, offset, fill_nodata
+    )
+    limit = int(physical * DEM_MEMORY_FRACTION)
+    if estimated > limit:
+        raise DEMError(
+            "DEM raster is too large for the configured memory budget: "
+            f"estimated={estimated / 1024**3:.1f} GiB, "
+            f"limit={limit / 1024**3:.1f} GiB, file={file_name}. "
+            "Reduce the bbox, use 5m/10m input, or disable NoData filling."
+        )
+
+
+def _raster_bounds(file_name):
+    if not has_gdal:
+        return None
+    try:
+        dataset = gdal.Open(str(file_name), gdal.GA_ReadOnly)
+        if dataset is None:
+            return None
+        geo = dataset.GetGeoTransform()
+        width = dataset.RasterXSize
+        height = dataset.RasterYSize
+        dataset = None
+        if len(geo) != 6 or geo[2] != 0 or geo[4] != 0:
+            return None
+        x_values = (geo[0], geo[0] + geo[1] * width)
+        y_values = (geo[3], geo[3] + geo[5] * height)
+        return (min(x_values), min(y_values), max(x_values), max(y_values))
+    except Exception:
+        return None
+
+
+def _raster_intersects_tile(file_name, lat, lon):
+    bounds = _raster_bounds(file_name)
+    if bounds is None:
+        return False
+    west, south, east, north = bounds
+    return not (
+        east <= lon or west >= lon + 1.0 or north <= lat or south >= lat + 1.0
+    )
+
+
+def _raster_covers_tile(file_name, lat, lon):
+    """Return whether a GDAL raster covers the complete one-degree tile."""
+    bounds = _raster_bounds(file_name)
+    if bounds is None:
+        return False
+    west, south, east, north = bounds
+    epsilon = 1e-9
+    return (
+        west <= lon + epsilon
+        and east >= lon + 1.0 - epsilon
+        and south <= lat + epsilon
+        and north >= lat + 1.0 - epsilon
+    )
+
+
+def _raster_resolution(file_name):
+    """Return raster pixel area for deterministic GSI candidate ordering."""
+    try:
+        dataset = gdal.Open(str(file_name), gdal.GA_ReadOnly)
+        if dataset is None:
+            return float("inf")
+        geo = dataset.GetGeoTransform()
+        dataset = None
+        if len(geo) != 6 or geo[1] == 0 or geo[5] == 0:
+            return float("inf")
+        return abs(geo[1] * geo[5])
+    except Exception:
+        return float("inf")
+
+
+def _raster_contract(file_name):
+    dataset = gdal.Open(str(file_name), gdal.GA_ReadOnly)
+    if dataset is None:
+        raise DEMError(f"Could not open GSI DEM raster: {file_name}")
+    band = dataset.GetRasterBand(1)
+    scale = band.GetScale()
+    offset = band.GetOffset()
+    spatial_ref = dataset.GetSpatialRef()
+    epsg = spatial_ref.GetAuthorityCode(None) if spatial_ref is not None else None
+    contract = (
+        gdal.GetDataTypeName(band.DataType),
+        1.0 if scale is None else float(scale),
+        0.0 if offset is None else float(offset),
+        band.GetNoDataValue(),
+        epsg,
+    )
+    dataset = None
+    return contract
+
+
+def _build_tile_aligned_vrt(sources, lat, lon):
+    if not has_gdal:
+        raise DEMError("GDAL is required to combine split GSI DEM files")
+    sources = [str(source) for source in sources]
+    contracts = [_raster_contract(source) for source in sources]
+    first = contracts[0]
+    if first[3] is None:
+        raise DEMError("GSI DEM sources must advertise a NoData value")
+    if first[4] not in (None, "4326", "4269"):
+        raise DEMError(f"Unsupported GSI DEM CRS EPSG:{first[4]}")
+    if any(contract != first for contract in contracts[1:]):
+        raise DEMError(
+            "Cannot combine GSI DEM files with different data type, "
+            "scale, offset, NoData, or CRS contracts"
+        )
+    vrt_path = f"/vsimem/ortho4xp-gsi-{uuid.uuid4().hex}.vrt"
+    options = gdal.BuildVRTOptions(
+        srcNodata=first[3],
+        VRTNodata=first[3],
+        resampleAlg="nearest",
+        resolution="highest",
+        outputBounds=(lon, lat, lon + 1.0, lat + 1.0),
+    )
+    try:
+        dataset = gdal.BuildVRT(vrt_path, sources, options=options)
+        if dataset is None:
+            raise DEMError("Could not create tile-aligned GSI VRT")
+        dataset.FlushCache()
+        dataset = None
+        if not _raster_covers_tile(vrt_path, lat, lon):
+            raise DEMError("Generated GSI VRT does not cover the requested tile")
+        return vrt_path, lambda: gdal.Unlink(vrt_path)
+    except Exception:
+        gdal.Unlink(vrt_path)
+        raise
+
+
+def _manifest_path(source):
+    candidates = []
+    for root, dirs, files in os.walk(source):
+        dirs.sort()
+        for file_name in sorted(files):
+            if file_name.lower() == "gsi_dem_manifest.json":
+                candidates.append(Path(root) / file_name)
+    return candidates[0] if candidates else None
+
+
+def _manifest_output_paths(manifest_path, manifest):
+    outputs = []
+    for value in manifest.get("outputs", []):
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = manifest_path.parent / candidate
+        candidate = candidate.resolve()
+        if not candidate.is_file():
+            raise DEMError(f"GSI manifest output is missing: {candidate}")
+        if candidate.suffix.lower() == ".tif":
+            outputs.append(candidate)
+    if not outputs:
+        raise DEMError(f"GSI manifest has no readable GeoTIFF outputs: {manifest_path}")
+    return outputs
+
+
+def _resolve_custom_dem_file(source, lat, lon):
+    """Return (path, cleanup, is_gsi) for a custom DEM directory."""
+    source = Path(source)
+    target_hgt = (FNAMES.hem_latlon(lat, lon) + ".hgt").lower()
+    target_tif = (FNAMES.hem_latlon(lat, lon) + ".tif").lower()
+    exact_candidates = []
+    gsi_candidates = []
+    for root, dirs, files in os.walk(source):
+        dirs.sort()
+        for file_name in sorted(files):
+            lower_name = file_name.lower()
+            path = Path(root) / file_name
+            if lower_name in (target_hgt, target_tif):
+                exact_candidates.append(path)
+            if lower_name == "gsi_dem.vrt" or "_gsi_" in lower_name:
+                if lower_name.endswith((".tif", ".vrt")):
+                    gsi_candidates.append(path)
+    if exact_candidates:
+        return str(sorted(exact_candidates)[0]), None, True
+
+    manifest_path = _manifest_path(source)
+    if manifest_path is not None:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            raise DEMError(
+                f"Could not read GSI manifest: {manifest_path}: {error}"
+            ) from error
+        outputs = _manifest_output_paths(manifest_path, manifest)
+        vrt_value = manifest.get("vrt")
+        if vrt_value:
+            manifest_vrt = Path(vrt_value)
+            if not manifest_vrt.is_absolute():
+                manifest_vrt = manifest_path.parent / manifest_vrt
+            manifest_vrt = manifest_vrt.resolve()
+            if not manifest_vrt.is_file():
+                raise DEMError(f"GSI manifest VRT is missing: {manifest_vrt}")
+            if _raster_intersects_tile(manifest_vrt, lat, lon):
+                if _raster_covers_tile(manifest_vrt, lat, lon):
+                    return str(manifest_vrt), None, True
+        overlapping = [
+            path for path in outputs if _raster_intersects_tile(path, lat, lon)
+        ]
+        if not overlapping:
+            raise DEMError(
+                f"GSI manifest has no output overlapping tile {lat:+d}{lon:+d}: "
+                f"{manifest_path}"
+            )
+        results = manifest.get("results", [])
+        result_by_path = {
+            str(path): results[index]
+            for index, path in enumerate(outputs)
+            if index < len(results)
+        }
+
+        def priority(path):
+            result = result_by_path.get(str(path), {})
+            resolution = result.get("resolution", "")
+            try:
+                resolution_value = float(str(resolution).rstrip("m"))
+            except ValueError:
+                resolution_value = float("inf")
+            return resolution_value, outputs.index(path), str(path)
+
+        overlapping.sort(key=priority)
+        if len(overlapping) == 1 and _raster_covers_tile(overlapping[0], lat, lon):
+            return str(overlapping[0]), None, True
+        return (*_build_tile_aligned_vrt(overlapping, lat, lon), True)
+
+    if not gsi_candidates:
+        return None, None, False
+    overlapping = [
+        path for path in gsi_candidates if _raster_intersects_tile(path, lat, lon)
+    ]
+    if not overlapping:
+        raise DEMError(
+            f"GSI DEM files do not overlap tile {lat:+d}{lon:+d} in {source}"
+        )
+    vrt_candidates = [
+        path for path in overlapping if path.name.lower() == "gsi_dem.vrt"
+    ]
+    if vrt_candidates:
+        vrt_path = sorted(vrt_candidates)[0]
+        if _raster_covers_tile(vrt_path, lat, lon):
+            return str(vrt_path), None, True
+        return (*_build_tile_aligned_vrt([vrt_path], lat, lon), True)
+    covering = [path for path in overlapping if _raster_covers_tile(path, lat, lon)]
+    if len(overlapping) > 1 and not covering:
+        raise DEMError(
+            "Multiple partial GSI DEM files were found without gsi_dem.vrt. "
+            "Create a VRT before using this directory."
+        )
+    if covering:
+        return (
+            str(min(covering, key=lambda path: (_raster_resolution(path), str(path)))),
+            None,
+            True,
+        )
+    return (*_build_tile_aligned_vrt(overlapping, lat, lon), True)
+
+
+def _find_custom_dem_file(source, lat, lon):
+    """Compatibility wrapper returning the resolved custom DEM path."""
+    return _resolve_custom_dem_file(source, lat, lon)[0]
 
 ################################################################################
 class DEM:
@@ -94,7 +389,7 @@ class DEM:
         else:
             self.alt = self.alt_nostrict
             self.alt_vec = self.alt_vec_nostrict
-        self.load_data(source, info_only)
+        self.load_data(source, info_only, fill_nodata)
         if info_only:
             return
         if fill_nodata == "to zero":
@@ -119,7 +414,7 @@ class DEM:
             self.alt_dem.mean(),
         )
 
-    def load_data(self, source, info_only=False):
+    def load_data(self, source, info_only=False, fill_nodata=True):
         if not source:
             if os.path.exists(FNAMES.generic_tif(self.lat, self.lon)):
                 source = FNAMES.generic_tif(self.lat, self.lon)
@@ -165,6 +460,7 @@ class DEM:
                         self.lon,
                         info_only,
                         3601,
+                        fill_nodata=fill_nodata,
                     )
                 else:
                     (
@@ -189,19 +485,15 @@ class DEM:
                         numpy.zeros((3601, 3601), dtype=numpy.float32),
                     )
         else:
+            cleanup = None
+            strict_custom = False
             if os.path.isdir(source):
-                file_name = source
-                target_hgt = (FNAMES.hem_latlon(self.lat, self.lon) + ".hgt").lower()
-                target_tif = (FNAMES.hem_latlon(self.lat, self.lon) + ".tif").lower()
-                for root, dirs, files in os.walk(source):
-                    for f in files:
-                        if f.lower() == target_hgt or f.lower() == target_tif:
-                            file_name = os.path.join(root, f)
-                            break
-                    if file_name != source:
-                        UI.vprint(1, "   INFO: Found matching custom DEM in directory:", file_name)
-                        break
-                if file_name == source:
+                file_name, cleanup, strict_custom = _resolve_custom_dem_file(
+                    source, self.lat, self.lon
+                )
+                if file_name is not None:
+                    UI.vprint(1, "   INFO: Found matching custom DEM in directory:", file_name)
+                else:
                     UI.vprint(1, "   INFO: No matching DEM found in", source, ", falling back to default.")
                     if os.path.exists(FNAMES.generic_tif(self.lat, self.lon)):
                         file_name = FNAMES.generic_tif(self.lat, self.lon)
@@ -238,19 +530,28 @@ class DEM:
                     numpy.zeros((3601, 3601), dtype=numpy.float32),
                 )
             else:
-                (
-                    self.epsg,
-                    self.x0,
-                    self.y0,
-                    self.x1,
-                    self.y1,
-                    self.nodata,
-                    self.nxdem,
-                    self.nydem,
-                    self.alt_dem,
-                ) = read_elevation_from_file(
-                    file_name, self.lat, self.lon, info_only
-                )
+                try:
+                    (
+                        self.epsg,
+                        self.x0,
+                        self.y0,
+                        self.x1,
+                        self.y1,
+                        self.nodata,
+                        self.nxdem,
+                        self.nydem,
+                        self.alt_dem,
+                    ) = read_elevation_from_file(
+                        file_name,
+                        self.lat,
+                        self.lon,
+                        info_only,
+                        strict=strict_custom,
+                        fill_nodata=fill_nodata,
+                    )
+                finally:
+                    if cleanup is not None:
+                        cleanup()
         if not local_sources:
             return
         self.subdems = tuple()
@@ -536,7 +837,13 @@ def build_combined_raster(source, lat, lon, info_only):
 
 ################################################################################
 def read_elevation_from_file(
-    file_name, lat, lon, info_only=False, base_if_error=3601
+    file_name,
+    lat,
+    lon,
+    info_only=False,
+    base_if_error=3601,
+    strict=False,
+    fill_nodata=True,
 ):
     alt_dem = None
     if file_name[-4:].lower() == ".hgt":
@@ -560,6 +867,8 @@ def read_elevation_from_file(
                     fill_nodata_values_with_nearest_neighbor(alt_dem, nodata)
                     alt_dem = upsample(alt_dem)
         except Exception as e:
+            if strict:
+                raise DEMError(f"Could not read custom DEM {file_name}: {e}") from e
             print(e)
             UI.lvprint(
                 1,
@@ -586,7 +895,9 @@ def read_elevation_from_file(
                 alt_dem = numpy.asarray(alt, dtype=numpy.float32).reshape(
                     (nxdem, nydem)
                 )[::-1]
-        except:
+        except Exception as error:
+            if strict:
+                raise DEMError(f"Could not read custom DEM {file_name}: {error}") from error
             UI.lvprint(
                 1,
                 "    ERROR: in reading elevation from",
@@ -611,15 +922,24 @@ def read_elevation_from_file(
             offset = rs.GetOffset()
             scale = 1.0 if scale is None else numpy.float32(scale)
             offset = 0.0 if offset is None else numpy.float32(offset)
+            _check_raster_memory(
+                ds.RasterXSize,
+                ds.RasterYSize,
+                scale,
+                offset,
+                bool(fill_nodata) and fill_nodata != "to zero",
+                file_name,
+            )
             if not info_only:
-                alt_dem = rs.ReadAsArray().astype(numpy.float32)
+                alt_dem = rs.ReadAsArray(buf_type=gdal.GDT_Float32)
                 nodata_mask = (
                     alt_dem == numpy.float32(raw_nodata)
                     if raw_nodata is not None
                     else numpy.zeros(alt_dem.shape, dtype=bool)
                 )
                 if scale != 1.0 or offset != 0.0:
-                    alt_dem = alt_dem * scale + offset
+                    alt_dem *= scale
+                    alt_dem += offset
                 if raw_nodata is not None:
                     alt_dem[nodata_mask] = -32768
             (nxdem, nydem) = (ds.RasterXSize, ds.RasterYSize)
@@ -661,7 +981,9 @@ def read_elevation_from_file(
             y1 = geo[3] + 0.5 * geo[5] - lat
             x1 = x0 + (nxdem - 1) * geo[1]
             y0 = y1 + (nydem - 1) * geo[5]
-        except:
+        except Exception as error:
+            if strict:
+                raise DEMError(f"Could not read custom DEM {file_name}: {error}") from error
             UI.lvprint(
                 1,
                 "   ERROR: in reading ",
@@ -678,6 +1000,8 @@ def read_elevation_from_file(
             epsg = 4326
             nodata = -32768
     elif not has_gdal:
+        if strict:
+            raise DEMError(f"GDAL is required to read custom DEM {file_name}")
         UI.lvprint(
             1,
             "   WARNING: unsupported raster (install Gdal):",
