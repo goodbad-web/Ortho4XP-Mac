@@ -8,6 +8,7 @@ import itertools
 import shutil
 import tempfile
 import uuid
+import re
 from pathlib import Path
 from math import sqrt
 import array
@@ -102,22 +103,38 @@ def _physical_memory_bytes():
     return pages * page_size
 
 
-def _raster_memory_estimate(width, height, scale, offset, fill_nodata):
+def _raster_memory_estimate(
+    width, height, scale, offset, fill_nodata, raw_bytes_per_cell=0
+):
     """Estimate the peak NumPy working set for a GDAL DEM read."""
     cells = int(width) * int(height)
     float_bytes = cells * numpy.dtype(numpy.float32).itemsize
     mask_bytes = cells
     scale_bytes = float_bytes if scale != 1.0 or offset != 0.0 else 0
     fill_bytes = 4 * float_bytes if fill_nodata else 0
-    return float_bytes + mask_bytes + scale_bytes + fill_bytes
+    source_bytes = cells * int(raw_bytes_per_cell)
+    return source_bytes + float_bytes + mask_bytes + scale_bytes + fill_bytes
 
 
-def _check_raster_memory(width, height, scale, offset, fill_nodata, file_name):
+def _check_raster_memory(
+    width,
+    height,
+    scale,
+    offset,
+    fill_nodata,
+    file_name,
+    raw_bytes_per_cell=0,
+):
     physical = _physical_memory_bytes()
     if not physical:
         return
     estimated = _raster_memory_estimate(
-        width, height, scale, offset, fill_nodata
+        width,
+        height,
+        scale,
+        offset,
+        fill_nodata,
+        raw_bytes_per_cell=raw_bytes_per_cell,
     )
     limit = int(physical * DEM_MEMORY_FRACTION)
     if estimated > limit:
@@ -209,6 +226,25 @@ def _raster_contract(file_name):
     return contract
 
 
+def _validated_gsi_raster_contract(file_name, expected=None):
+    try:
+        contract = _raster_contract(file_name)
+    except Exception as error:
+        if isinstance(error, DEMError):
+            raise
+        raise DEMError(f"Could not inspect GSI DEM raster: {file_name}: {error}") from error
+    if contract[3] is None:
+        raise DEMError(f"GSI DEM raster has no NoData contract: {file_name}")
+    if contract[4] not in (None, "4326", "4269"):
+        raise DEMError(f"Unsupported GSI DEM CRS EPSG:{contract[4]}")
+    if expected is not None and contract != expected:
+        raise DEMError(
+            "GSI DEM raster contract does not match the manifest sources: "
+            f"{file_name}"
+        )
+    return contract
+
+
 def _build_tile_aligned_vrt(sources, lat, lon):
     if not has_gdal:
         raise DEMError("GDAL is required to combine split GSI DEM files")
@@ -257,19 +293,48 @@ def _manifest_path(source):
 
 
 def _manifest_output_paths(manifest_path, manifest):
+    values = manifest.get("outputs")
+    if not isinstance(values, list):
+        raise DEMError(f"GSI manifest outputs must be a list: {manifest_path}")
     outputs = []
-    for value in manifest.get("outputs", []):
+    for value in values:
+        if not isinstance(value, str):
+            raise DEMError(f"GSI manifest output path is invalid: {manifest_path}")
         candidate = Path(value)
         if not candidate.is_absolute():
             candidate = manifest_path.parent / candidate
         candidate = candidate.resolve()
         if not candidate.is_file():
             raise DEMError(f"GSI manifest output is missing: {candidate}")
-        if candidate.suffix.lower() == ".tif":
+        if candidate.suffix.lower() in (".tif", ".tiff"):
             outputs.append(candidate)
     if not outputs:
         raise DEMError(f"GSI manifest has no readable GeoTIFF outputs: {manifest_path}")
     return outputs
+
+
+def _is_gsi_dem_path(file_name):
+    path = Path(file_name)
+    lower_name = path.name.lower()
+    if path.suffix.lower() == ".vrt":
+        return True
+    if "_gsi_" in lower_name or lower_name == "gsi_dem.vrt":
+        return True
+    return (path.parent / "gsi_dem_manifest.json").is_file()
+
+
+def _manifest_result_date(result):
+    for key in ("source_date", "date", "created_at", "timestamp", "generated_at"):
+        value = result.get(key)
+        if value:
+            digits = "".join(character for character in str(value) if character.isdigit())
+            if len(digits) >= 8:
+                return int(digits[:14].ljust(14, "0"))
+    for value in result.get("inputs", []):
+        match = re.search(r"(?<!\d)(?:19|20)\d{6}(?!\d)", str(value))
+        if match:
+            return int(match.group(0) + "000000")
+    return 0
 
 
 def _resolve_custom_dem_file(source, lat, lon):
@@ -277,6 +342,7 @@ def _resolve_custom_dem_file(source, lat, lon):
     source = Path(source)
     target_hgt = (FNAMES.hem_latlon(lat, lon) + ".hgt").lower()
     target_tif = (FNAMES.hem_latlon(lat, lon) + ".tif").lower()
+    target_tiff = (FNAMES.hem_latlon(lat, lon) + ".tiff").lower()
     exact_candidates = []
     gsi_candidates = []
     for root, dirs, files in os.walk(source):
@@ -284,10 +350,10 @@ def _resolve_custom_dem_file(source, lat, lon):
         for file_name in sorted(files):
             lower_name = file_name.lower()
             path = Path(root) / file_name
-            if lower_name in (target_hgt, target_tif):
+            if lower_name in (target_hgt, target_tif, target_tiff):
                 exact_candidates.append(path)
             if lower_name == "gsi_dem.vrt" or "_gsi_" in lower_name:
-                if lower_name.endswith((".tif", ".vrt")):
+                if lower_name.endswith((".tif", ".tiff", ".vrt")):
                     gsi_candidates.append(path)
     if exact_candidates:
         return str(sorted(exact_candidates)[0]), None, True
@@ -300,15 +366,23 @@ def _resolve_custom_dem_file(source, lat, lon):
             raise DEMError(
                 f"Could not read GSI manifest: {manifest_path}: {error}"
             ) from error
+        if not isinstance(manifest, dict):
+            raise DEMError(f"GSI manifest must contain an object: {manifest_path}")
         outputs = _manifest_output_paths(manifest_path, manifest)
+        source_contract = _validated_gsi_raster_contract(outputs[0])
+        for output in outputs[1:]:
+            _validated_gsi_raster_contract(output, source_contract)
         vrt_value = manifest.get("vrt")
         if vrt_value:
+            if not isinstance(vrt_value, str):
+                raise DEMError(f"GSI manifest VRT path is invalid: {manifest_path}")
             manifest_vrt = Path(vrt_value)
             if not manifest_vrt.is_absolute():
                 manifest_vrt = manifest_path.parent / manifest_vrt
             manifest_vrt = manifest_vrt.resolve()
             if not manifest_vrt.is_file():
                 raise DEMError(f"GSI manifest VRT is missing: {manifest_vrt}")
+            _validated_gsi_raster_contract(manifest_vrt, source_contract)
             if _raster_intersects_tile(manifest_vrt, lat, lon):
                 if _raster_covers_tile(manifest_vrt, lat, lon):
                     return str(manifest_vrt), None, True
@@ -321,11 +395,21 @@ def _resolve_custom_dem_file(source, lat, lon):
                 f"{manifest_path}"
             )
         results = manifest.get("results", [])
-        result_by_path = {
-            str(path): results[index]
-            for index, path in enumerate(outputs)
-            if index < len(results)
-        }
+        if not isinstance(results, list) or any(
+            not isinstance(result, dict) for result in results
+        ):
+            raise DEMError(f"GSI manifest results are invalid: {manifest_path}")
+        result_by_path = {}
+        for result in results:
+            output_value = result.get("output")
+            if isinstance(output_value, str):
+                output_path = Path(output_value)
+                if not output_path.is_absolute():
+                    output_path = manifest_path.parent / output_path
+                result_by_path[str(output_path.resolve())] = result
+        for index, path in enumerate(outputs):
+            if str(path) not in result_by_path and index < len(results):
+                result_by_path[str(path)] = results[index]
 
         def priority(path):
             result = result_by_path.get(str(path), {})
@@ -334,7 +418,13 @@ def _resolve_custom_dem_file(source, lat, lon):
                 resolution_value = float(str(resolution).rstrip("m"))
             except ValueError:
                 resolution_value = float("inf")
-            return resolution_value, outputs.index(path), str(path)
+            date_value = _manifest_result_date(result)
+            # GDAL BuildVRT gives the last overlapping source precedence.
+            # Put lower-quality/older sources first so the preferred source is last.
+            resolution_order = -resolution_value
+            if resolution_value == float("inf"):
+                resolution_order = float("-inf")
+            return resolution_order, date_value, outputs.index(path), str(path)
 
         overlapping.sort(key=priority)
         if len(overlapping) == 1 and _raster_covers_tile(overlapping[0], lat, lon):
@@ -355,6 +445,7 @@ def _resolve_custom_dem_file(source, lat, lon):
     ]
     if vrt_candidates:
         vrt_path = sorted(vrt_candidates)[0]
+        _validated_gsi_raster_contract(vrt_path)
         if _raster_covers_tile(vrt_path, lat, lon):
             return str(vrt_path), None, True
         return (*_build_tile_aligned_vrt([vrt_path], lat, lon), True)
@@ -389,12 +480,13 @@ class DEM:
         else:
             self.alt = self.alt_nostrict
             self.alt_vec = self.alt_vec_nostrict
+        self._preserve_nodata = False
         self.load_data(source, info_only, fill_nodata)
         if info_only:
             return
         if fill_nodata == "to zero":
             self.nodata_to_zero()
-        elif fill_nodata:
+        elif fill_nodata and not self._preserve_nodata:
             if not fill_nodata_values_with_nearest_neighbor(
                 self.alt_dem, self.nodata
             ):
@@ -492,6 +584,9 @@ class DEM:
                     source, self.lat, self.lon
                 )
                 if file_name is not None:
+                    self._preserve_nodata = bool(
+                        strict_custom and str(file_name).lower().endswith(".vrt")
+                    )
                     UI.vprint(1, "   INFO: Found matching custom DEM in directory:", file_name)
                 else:
                     UI.vprint(1, "   INFO: No matching DEM found in", source, ", falling back to default.")
@@ -507,6 +602,10 @@ class DEM:
                             file_name = "" 
             else:
                 file_name = source
+                strict_custom = _is_gsi_dem_path(file_name)
+                self._preserve_nodata = bool(
+                    strict_custom and str(file_name).lower().endswith(".vrt")
+                )
             if not file_name:
                 (
                     self.epsg,
@@ -855,6 +954,15 @@ def read_elevation_from_file(
             if not os.path.isfile(file_name):
                 raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
+            _check_raster_memory(
+                nxdem,
+                nydem,
+                1.0,
+                0.0,
+                bool(fill_nodata) and fill_nodata != "to zero",
+                file_name,
+                raw_bytes_per_cell=2,
+            )
             if not info_only:
                 alt_dem = (
                     numpy.fromfile(file_name, numpy.dtype(">i2"))
@@ -866,6 +974,8 @@ def read_elevation_from_file(
                 if not info_only:
                     fill_nodata_values_with_nearest_neighbor(alt_dem, nodata)
                     alt_dem = upsample(alt_dem)
+        except DEMError:
+            raise
         except Exception as e:
             if strict:
                 raise DEMError(f"Could not read custom DEM {file_name}: {e}") from e
@@ -887,6 +997,15 @@ def read_elevation_from_file(
             if not os.path.isfile(file_name):
                 raise FileNotFoundError
             nxdem = nydem = int(round(sqrt(os.path.getsize(file_name) / 2)))
+            _check_raster_memory(
+                nxdem,
+                nydem,
+                1.0,
+                0.0,
+                bool(fill_nodata) and fill_nodata != "to zero",
+                file_name,
+                raw_bytes_per_cell=2,
+            )
             f = open(file_name, "rb")
             alt = array.array("h")
             alt.fromfile(f, nxdem * nydem)
@@ -895,6 +1014,8 @@ def read_elevation_from_file(
                 alt_dem = numpy.asarray(alt, dtype=numpy.float32).reshape(
                     (nxdem, nydem)
                 )[::-1]
+        except DEMError:
+            raise
         except Exception as error:
             if strict:
                 raise DEMError(f"Could not read custom DEM {file_name}: {error}") from error
@@ -981,6 +1102,8 @@ def read_elevation_from_file(
             y1 = geo[3] + 0.5 * geo[5] - lat
             x1 = x0 + (nxdem - 1) * geo[1]
             y0 = y1 + (nydem - 1) * geo[5]
+        except DEMError:
+            raise
         except Exception as error:
             if strict:
                 raise DEMError(f"Could not read custom DEM {file_name}: {error}") from error

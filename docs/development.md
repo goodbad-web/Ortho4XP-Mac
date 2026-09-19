@@ -55,7 +55,7 @@ GeoTIFFは既定で`compact_int16`（0.25m刻み、scale/offset付き、ZSTD優�
 
 `compact_int16`の値が表現範囲を超える場合はクリップせず失敗する。ZSTD非対応環境ではDEFLATEへフォールバックし、manifestへ実際の圧縮方式を記録する。
 
-HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。VRTなしで複数の部分GeoTIFFだけがあるディレクトリは、入力を推測せずエラーにする。DEM読込の推定ワークセットは物理メモリの80%を上限とし、128GB環境では約102GBを超える1m入力を、bbox縮小・低解像度化・NoData補完無効化なしに読み込まない。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
+HGTは明示的に`--hgt-tile`を指定した場合だけ1度タイルとして生成する。`custom_dem`への反映はSupportのGSI DEMダイアログで出力VRTまたは単一GeoTIFFを選び、明示的にApplyした場合だけ行う。VRTなしで複数の部分GeoTIFFだけがあるディレクトリは、入力を推測せずエラーにする。分割GSI VRTのタイル外側はNoDataのまま保持し、GSI出力を直接指定した場合も読込失敗時に既定DEMやゼロ標高へフォールバックしない。DEM読込の推定ワークセットは物理メモリの80%を上限とし、128GB環境では約102GBを超える1m入力を、bbox縮小・低解像度化・NoData補完無効化なしに読み込まない。CLIおよびGUIのimport/buildはキャンセル可能なバックグラウンド処理で、既存ZIPや旧版・重複ZIPの削除は行わない。
 
 GSI関連の限定検証はリポジトリルートから実行する。
 

@@ -221,6 +221,7 @@ def test_build_one_meter_output_uses_lower_resolution_only_for_nodata(tmp_path):
         "scale": 0.25,
         "offset": 0.0,
         "nodata": -32768.0,
+        "crs": "EPSG:4326",
     }
 
 
@@ -574,6 +575,13 @@ def test_float32_legacy_geotiff_remains_readable(tmp_path):
     assert read_result[8][1, 0] == -32768
 
 
+def test_direct_gsi_file_read_failure_is_strict(tmp_path):
+    missing = tmp_path / "missing_GSI_1m.tif"
+
+    with pytest.raises(DEM.DEMError, match="Could not read custom DEM"):
+        DEM.DEM(34, 132, str(missing), info_only=True)
+
+
 def test_custom_dem_directory_finds_covering_gsi_raster(tmp_path):
     source_dir = tmp_path / "GSI"
     output = source_dir / "output" / "bbox_34p000000_132p000000_35p000000_133p000000_GSI_1m.tif"
@@ -624,6 +632,103 @@ def test_custom_dem_directory_combines_manifest_outputs_to_tile_aligned_vrt(tmp_
     assert np.allclose(dem.alt_dem, [[10.0, 20.0], [10.0, 20.0]])
 
 
+def test_tile_aligned_gsi_vrt_preserves_outer_nodata(tmp_path):
+    source_dir = tmp_path / "GSI"
+    source = source_dir / "partial_GSI_1m.tif"
+    GSI.write_geotiff(
+        source,
+        np.ones((2, 2), dtype=np.float32),
+        GSI.GSIRegion("partial", 34.25, 132.25, 34.75, 132.75),
+        0.25,
+    )
+
+    dem = DEM.DEM(34, 132, str(source_dir), fill_nodata=True)
+
+    assert np.any(dem.alt_dem == dem.nodata)
+    assert np.any(np.isclose(dem.alt_dem, 1.0))
+
+
+def test_manifest_overlap_prefers_resolution_then_date_then_input_order(tmp_path):
+    source_dir = tmp_path / "GSI"
+    output_dir = source_dir / "output"
+    region = GSI.GSIRegion("tile", 34.0, 132.0, 35.0, 133.0)
+    coarse = output_dir / "coarse_GSI_5m.tif"
+    fine_old = output_dir / "fine_old_GSI_1m.tif"
+    fine_new = output_dir / "fine_new_GSI_1m.tif"
+    for path, value in (
+        (coarse, 10.0),
+        (fine_old, 20.0),
+        (fine_new, 30.0),
+    ):
+        GSI.write_geotiff(
+            path,
+            np.full((2, 2), value, dtype=np.float32),
+            region,
+            0.5,
+        )
+    (output_dir / "gsi_dem_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "outputs": [str(fine_new), str(coarse), str(fine_old)],
+                "results": [
+                    {
+                        "output": str(fine_new),
+                        "resolution": "1m",
+                        "source_date": "20250101",
+                    },
+                    {
+                        "output": str(coarse),
+                        "resolution": "5m",
+                        "source_date": "20250101",
+                    },
+                    {
+                        "output": str(fine_old),
+                        "resolution": "1m",
+                        "source_date": "20240101",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dem = DEM.DEM(34, 132, str(source_dir), fill_nodata=False)
+
+    assert np.allclose(dem.alt_dem, 30.0)
+
+
+def test_manifest_rejects_vrt_with_mismatched_contract(tmp_path):
+    source_dir = tmp_path / "GSI"
+    output_dir = source_dir / "output"
+    region = GSI.GSIRegion("tile", 34.0, 132.0, 35.0, 133.0)
+    compact = output_dir / "compact_GSI_1m.tif"
+    legacy = output_dir / "legacy.tif"
+    bad_vrt = output_dir / "gsi_dem.vrt"
+    GSI.write_geotiff(
+        compact,
+        np.ones((2, 2), dtype=np.float32),
+        region,
+        0.5,
+        storage_format="compact_int16",
+    )
+    GSI.write_geotiff(
+        legacy,
+        np.ones((2, 2), dtype=np.float32),
+        region,
+        0.5,
+        storage_format="float32_legacy",
+    )
+    GSI._build_vrt(bad_vrt, [legacy], False)
+    (output_dir / "gsi_dem_manifest.json").write_text(
+        json.dumps({"version": 2, "outputs": [str(compact)], "vrt": str(bad_vrt)}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DEM.DEMError, match="contract"):
+        DEM.DEM(34, 132, str(source_dir), info_only=True)
+
+
 def test_custom_dem_directory_rejects_multiple_partial_gsi_files_without_vrt(tmp_path):
     source_dir = tmp_path / "GSI"
     left = source_dir / "left_GSI_1m.tif"
@@ -653,6 +758,25 @@ def test_dem_memory_budget_allows_128gb_without_fill_and_rejects_worst_case(monk
         DEM._check_raster_memory(90_000, 90_000, 0.25, 0.0, True, "too-large.tif")
 
 
+def test_hgt_memory_budget_is_enforced_before_read(tmp_path, monkeypatch):
+    path = tmp_path / "large.hgt"
+    path.write_bytes(b"\0\0")
+    real_getsize = DEM.os.path.getsize
+    monkeypatch.setattr(DEM, "_physical_memory_bytes", lambda: 128 * 1024**3)
+    monkeypatch.setattr(
+        DEM.os.path,
+        "getsize",
+        lambda value: 90_000 * 90_000 * 2
+        if value == str(path)
+        else real_getsize(value),
+    )
+
+    with pytest.raises(DEM.DEMError, match="configured memory budget"):
+        DEM.read_elevation_from_file(
+            str(path), 34, 132, info_only=True, fill_nodata=True
+        )
+
+
 def test_compact_range_failure_is_explicit_and_does_not_clip(tmp_path):
     path = tmp_path / "out-of-range.tif"
     region = GSI.GSIRegion("N34E132", 34.0, 132.0, 34.0001, 132.0001)
@@ -678,6 +802,7 @@ def test_vrt_preserves_common_scale_offset_contract_and_rejects_mixed_input(tmp_
         "scale": 0.25,
         "offset": 0.0,
         "nodata": -32768.0,
+        "crs": "EPSG:4326",
     }
     read_result = DEM.read_elevation_from_file(
         str(tmp_path / "compact.vrt"), 35.0, 132.0

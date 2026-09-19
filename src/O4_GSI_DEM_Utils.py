@@ -2120,11 +2120,24 @@ def _raster_contract(path: Path) -> dict:
     band = dataset.GetRasterBand(1)
     scale = band.GetScale()
     offset = band.GetOffset()
+    spatial_ref = dataset.GetSpatialRef()
+    authority_name = (
+        spatial_ref.GetAuthorityName(None) if spatial_ref is not None else None
+    )
+    authority_code = (
+        spatial_ref.GetAuthorityCode(None) if spatial_ref is not None else None
+    )
+    crs = (
+        f"{authority_name}:{authority_code}"
+        if authority_name and authority_code
+        else None
+    )
     contract = {
         "data_type": gdal.GetDataTypeName(band.DataType),
         "scale": 1.0 if scale is None else float(scale),
         "offset": 0.0 if offset is None else float(offset),
         "nodata": band.GetNoDataValue(),
+        "crs": crs,
     }
     dataset = None
     return contract
@@ -2171,6 +2184,14 @@ def _build_vrt(
             "scale": 1.0 if band.GetScale() is None else float(band.GetScale()),
             "offset": 0.0 if band.GetOffset() is None else float(band.GetOffset()),
             "nodata": band.GetNoDataValue(),
+            "crs": (
+                f"{check.GetSpatialRef().GetAuthorityName(None)}:"
+                f"{check.GetSpatialRef().GetAuthorityCode(None)}"
+                if check.GetSpatialRef() is not None
+                and check.GetSpatialRef().GetAuthorityName(None)
+                and check.GetSpatialRef().GetAuthorityCode(None)
+                else None
+            ),
         }
         check = None
         if actual_contract != first_contract:
@@ -2442,7 +2463,12 @@ def _build_region(
         )
     return output_path, {
         "region": asdict(region),
+        "output": str(output_path),
         "resolution": resolution_name,
+        "source_date": max(
+            (str(block.date) for block in blocks if block.date),
+            default=None,
+        ),
         "source_resolution_arcsec": arcsec,
         "width": int(raster.shape[1]),
         "height": int(raster.shape[0]),
